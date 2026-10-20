@@ -170,8 +170,10 @@ def make_handler(app: App):
                 if chat:
                     return {"id": rid, "object": kind, "created": created, "model": model,
                             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-                return {"id": rid, "object": kind, "created": created, "model": model,
-                        "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
+                choice = {"index": 0, "text": delta.get("content", ""), "finish_reason": finish}
+                if "token_ids" in delta:                # return_token_ids: this chunk's ids, as vLLM streams them
+                    choice["token_ids"] = delta["token_ids"]
+                return {"id": rid, "object": kind, "created": created, "model": model, "choices": [choice]}
 
             if stream:
                 self.send_response(200)

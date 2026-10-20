@@ -475,6 +475,7 @@ class App:
             return reasoning, answer, raw
 
         serving: list[Any] = [None]
+        ids_stream = bool(body.get("return_token_ids")) and not chat
 
         def on_tokens(new: list[int]) -> bool:
             # True stops the engine after this round; engines that finish on both ranks keep calling and get True
@@ -501,6 +502,8 @@ class App:
                 if len(answer) > sent["content"]:
                     delta["content"] = answer[sent["content"]:]
                     sent["content"] = len(answer)
+                if ids_stream and new:             # vLLM's return_token_ids: each chunk carries its token ids
+                    delta["token_ids"] = [int(t) for t in new]
                 parts = [delta] if delta else []
                 if calls_stream is not None:
                     parts += calls_stream.feed(call_text(raw))
