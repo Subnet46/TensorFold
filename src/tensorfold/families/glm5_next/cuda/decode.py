@@ -308,18 +308,37 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
     return views
 
 
-def save_rows(e: Engine, snap: Snapshot) -> None:
-    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2 caches are not kept."""
-    views = _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0))
+def _drafter_views(drafter, n: int) -> list[torch.Tensor]:
+    """DFlash2's context rows a snapshot of n tokens depends on: its sliding window's keys and values before n (every
+    later query sits at n or past it, and masks older rows), per draft layer."""
+    lo = max(0, n - drafter.window - 1)
+    return [c[:, lo:n] for c in drafter.kc] + [c[:, lo:n] for c in drafter.vc]
+
+
+def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
+    """The rows ``save_rows`` copies: the attention rows, and with ``drafter`` (whose context the snapshot ends at)
+    DFlash2's window rows."""
+    n = len(snap.ids)
+    views = _row_views(e.st, n, max(snap.mtp_len, 0))
+    if drafter is not None and snap.drafter_end == n:
+        views += _drafter_views(drafter, n)
+    return views
+
+
+def save_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
+    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2's
+    context goes with them only given ``drafter`` (TF_GLM_SHARED_PREFIX), otherwise the snapshot no longer fits it."""
+    views = _saved_views(e, snap, drafter)
     snap.rows = [v.clone() for v in views]
     snap.nbytes = sum(r.numel() * r.element_size() for r in snap.rows)
-    snap.drafter_end = -1
-    snap.drafter_rows = None
+    if drafter is None or snap.drafter_end != len(snap.ids):
+        snap.drafter_end = -1
+        snap.drafter_rows = None
 
 
-def row_bytes(e: Engine, snap: Snapshot) -> int:
+def row_bytes(e: Engine, snap: Snapshot, drafter=None) -> int:
     """What ``save_rows`` would copy for this snapshot."""
-    return sum(v.numel() * v.element_size() for v in _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)))
+    return sum(v.numel() * v.element_size() for v in _saved_views(e, snap, drafter))
 
 
 def snapshot_bytes(snap: Snapshot) -> int:
@@ -328,9 +347,12 @@ def snapshot_bytes(snap: Snapshot) -> int:
     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
 
 
-def load_rows(e: Engine, snap: Snapshot) -> None:
-    """Put a saved snapshot's attention rows back into the live caches."""
-    for dst, src in zip(_row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)), snap.rows):
+def load_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
+    """Put a saved snapshot's attention rows (and DFlash2's, when it saved them: the same ``drafter``) back."""
+    views = _saved_views(e, snap, drafter)
+    if len(views) != len(snap.rows):
+        raise ValueError("a saved snapshot's rows do not match the caches they go back to")
+    for dst, src in zip(views, snap.rows):
         dst.copy_(src)
 
 
