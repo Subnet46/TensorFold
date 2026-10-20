@@ -134,6 +134,8 @@ class Buffers:
         self.tap_at: dict[int, list[int]] = {}
         self.experts = c.experts
         self.top_k = c.top_k
+        # TF_GLM_HC_SPLIT: a prompt buffer's row split (``hcsplit.HcSplit``), set by the engine; None runs unsplit
+        self.split = None
 
     def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
         self.tap_at = {}
@@ -255,9 +257,27 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
 
 
-def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor:
-    mm(b, x, q, xs, b.part[:R], f32=True)
-    return gather(w, b, R)
+def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) -> torch.Tensor | None:
+    """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
+    [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
+    and runs hc_post itself (``hcsplit.HcSplit``)."""
+
+    sp = b.split
+    if sp is not None and sp.active:
+        sp.partial(fill)
+        return None
+    fill(0, R)
+    if label is None:
+        return gather(w, b, R)
+    with prof.timed(label):
+        return gather(w, b, R)
+
+
+def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor | None:
+    def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
+        mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
+
+    return partials(w, b, R, fill)
 
 
 def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
@@ -421,26 +441,48 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
             else:
                 exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
         s = m.shared
-        with prof.timed("moe: shared expert"):
-            mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
-            glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
-            mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
-        with prof.timed("moe: combine"):
-            if b.prefill:                # the shared row read from sy where it is (the copy's bits, one pass less)
-                glue.combine_shared(b.ey[:R], b.sy[:R], b.wts[:R], b.part[:R])
-            else:
-                b.ey[:R, c.top_k].copy_(b.sy[:R])
-                glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
-        with prof.timed("moe: all-gather"):
-            return gather(w, b, R)
+
+        def fill(lo: int, hi: int) -> None:
+            with prof.timed("moe: shared expert"):
+                mm(b, b.normed[lo:hi], s.gu, b.xs[lo:hi], b.sgu[lo:hi])
+                glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
+                mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
+            with prof.timed("moe: combine"):
+                if b.prefill:            # the shared row read from sy where it is (the copy's bits, one pass less)
+                    glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+                else:
+                    b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
+                    glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+
+        return partials(w, b, R, fill, "moe: all-gather")
     with prof.timed("moe: gate/up"):
         grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
     with prof.timed("moe: down"):
         grouped.down(b.eact, m.experts, b.plan, b.ey.view(-1, c.hidden), R)
-    with prof.timed("moe: combine"):
-        glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
-    with prof.timed("moe: all-gather"):
-        return gather(w, b, R)
+
+    def fill(lo: int, hi: int) -> None:
+        with prof.timed("moe: combine"):
+            glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+
+    return partials(w, b, R, fill, "moe: all-gather")
+
+
+def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+           sparse_np: int | None) -> torch.Tensor | None:
+    """The layer's KDA or DSA block on b.normed: every rank's partials, or None row-split (``partials``)."""
+
+    if layer.kind == "kda":
+        with prof.timed("kda"):
+            return kda_block(layer, w, st, b, R)
+    di = st.dsa_index[layer.index]
+    with prof.timed("dsa (total)"):
+        return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
+                         st.index[di] if st.index is not None else None, host_pos, sparse_np)
+
+
+def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
+    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+        return mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
 
 
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
@@ -450,22 +492,41 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
     h = layer.attn_hc
     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
-    if layer.kind == "kda":
-        with prof.timed("kda"):
-            g = kda_block(layer, w, st, b, R)
-    else:
-        di = st.dsa_index[layer.index]
-        with prof.timed("dsa (total)"):
-            g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
-                          st.index[di] if st.index is not None else None, host_pos, sparse_np)
+    g = _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
     with prof.timed("hc"):
         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
         h = layer.ffn_hc
         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
-    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
-        g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+    g = _ffn(layer, w, b, R)
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+
+
+def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None) -> None:
+    """Every layer of a prompt chunk with its hyper-connection glue split by rows between the ranks
+    (``hcsplit``): the first hc_pre runs on every row as unsplit, each later one on this rank's rows, and b.normed,
+    the taps and b.hidden come back whole from the peer. The same bits as the unsplit loop and its final mean."""
+
+    c = w.cfg
+    sp = b.split
+    layers = w.layers
+    sp.begin(R)
+    try:
+        Rp = sp.Rp                               # R, or R + 1 with a zero pad row for an odd chunk
+        first, h = layers[0], layers[0].attn_hc
+        glue.hc_pre(b.x[:Rp], h.fn, h.base, h.scale, first.in_norm, b.normed[:Rp], b.xs[:Rp], b.post[:Rp],
+                    b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+        for i, layer in enumerate(layers):
+            _mixer(layer, w, st, b, R, nch, host_pos, None)
+            with prof.timed("hc"):
+                sp.glue(layer.ffn_hc, layer.post_norm)
+            _ffn(layer, w, b, R)
+            nxt = layers[i + 1] if i + 1 < len(layers) else None
+            with prof.timed("hc (layer end)"):
+                sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
+                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None)
+    finally:
+        sp.finish()
 
 
 def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
@@ -500,11 +561,14 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
     if inject is not None:
         rows, features = inject
         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
-    for layer in w.layers:
-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
-        for slot in b.tap_at.get(layer.index, ()):
-            glue.stream_mean(b.x[:R], b.taps[slot][:R])
-    glue.stream_mean(b.x[:R], b.hidden[:R])
+    if b.prefill and b.split is not None and sparse_np is None and b.split.applies(R):
+        split_layers(w, st, b, R, nch, host_pos)             # also leaves the taps and b.hidden[:R]
+    else:
+        for layer in w.layers:
+            layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+            for slot in b.tap_at.get(layer.index, ()):
+                glue.stream_mean(b.x[:R], b.taps[slot][:R])
+        glue.stream_mean(b.x[:R], b.hidden[:R])
     if not logits:
         return None
     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])

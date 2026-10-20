@@ -242,6 +242,24 @@ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: t
                                  num_warps=4)
 
 
+def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torch.Tensor, post: torch.Tensor,
+                 comb: torch.Tensor) -> None:
+    """``hc_post`` of two ranks' fp32 partials [R, D] held apart (rank 0's ``g0``, rank 1's ``g1``): the same kernel
+    with rank 1's rows read at their distance from rank 0's (element offset, may be negative), so the sum (rank 0
+    first) and every bit are hc_post's (TF_GLM_HC_SPLIT)."""
+
+    rows, d = g0.shape
+    if (g1.shape != g0.shape or g0.dtype != torch.float32 or g1.dtype != torch.float32
+            or not (g0.is_contiguous() and g1.is_contiguous())):
+        raise ValueError("hc_post_pair: two contiguous fp32 partials of one shape")
+    if not rows:
+        return
+    s = x.shape[1] // d
+    block = min(1024, d)
+    rs = (g1.data_ptr() - g0.data_ptr()) // g0.element_size()
+    _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
+
+
 @triton.jit
 def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
     """Plain residual (the MTP block): X = bf16(X + bf16(partials summed rank 0 first))."""

@@ -84,8 +84,9 @@ class Engine:
 
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
-                 taps: tuple[int, ...] = (), grid: int = 0) -> None:
-        """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere)."""
+                 taps: tuple[int, ...] = (), grid: int = 0, split=None) -> None:
+        """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere); ``split``: a
+        ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit."""
 
         if grid and prefill_rows % grid:
             raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
@@ -98,6 +99,10 @@ class Engine:
         if taps:
             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
+        if split is not None and split.split:
+            from .hcsplit import HcSplit
+
+            self.pbuf.split = HcSplit(w, self.pbuf, split)
         self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
         self.st = State(w, capacity, max_rows)
         self.last_hidden: torch.Tensor | None = None
