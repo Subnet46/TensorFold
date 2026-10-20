@@ -670,6 +670,13 @@ class GlmEngine:
                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                "every rank the same flags")
         self.cache_bytes = min(row[-1] for row in rows) << 20
+        # launch tables (TF_GLM_TUNE, tune.py): every rank must read the same table file (its tables' checksum)
+        from . import tune as _tune
+
+        tables = [row[0] for row in self._gather_ints([_tune.code()])]
+        if any(t != tables[0] for t in tables):
+            raise RuntimeError(f"the ranks read different launch tables (TF_GLM_TUNE; checksums {tables}): give every "
+                               "rank the same file, or none")
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
             plan[key] = plan[key] + self.cache_bytes

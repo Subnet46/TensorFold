@@ -8,7 +8,7 @@ void kda_chain_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int6
 void kda_chain_wide_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t,
                          const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                          const at::Tensor&, double, double, int64_t, at::Tensor&, at::Tensor&, at::Tensor&,
-                         at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+                         at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t);
 void kda_replay_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      int64_t, at::Tensor&);
 void kda_replay_layers_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -18,7 +18,7 @@ void kda_chain_wide_segments_cuda(const at::Tensor&, int64_t, const at::Tensor&,
                                   int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t, const at::Tensor&,
                                   at::Tensor&, int64_t, int64_t, const at::Tensor&, const at::Tensor&,
                                   const at::Tensor&, double, double, int64_t, at::Tensor&, at::Tensor&, at::Tensor&,
-                                  at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+                                  at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t);
 void kda_replay_layers_segments_cuda(const at::Tensor&, int64_t, at::Tensor&, int64_t, int64_t, int64_t,
                                      const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                      int64_t, int64_t, int64_t, int64_t);
@@ -59,7 +59,7 @@ void chain_wide(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::
                 const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
                 const at::Tensor& norm_w, double eps, double lower, int64_t rows, at::Tensor out,
                 at::Tensor state_out, at::Tensor k_save, at::Tensor v_save, at::Tensor g_save, at::Tensor b_save,
-                at::Tensor q_tmp, at::Tensor y_tmp) {
+                at::Tensor q_tmp, at::Tensor y_tmp, int64_t warps, int64_t tr) {
     check(P, at::kBFloat16, "P");
     check(A, at::kBFloat16, "A");
     check(G, at::kBFloat16, "G");
@@ -84,7 +84,7 @@ void chain_wide(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::
                 y_tmp.numel() >= rows * H * 128 && b_save.numel() >= rows * H, "scratch rows");
     c10::cuda::CUDAGuard guard(P.device());
     kda_chain_wide_cuda(P, p_stride, b_off, A, a_stride, G, g_stride, cs, cw, state_in, a_log, dt_bias, norm_w, eps,
-                        lower, rows, out, state_out, k_save, v_save, g_save, b_save, q_tmp, y_tmp);
+                        lower, rows, out, state_out, k_save, v_save, g_save, b_save, q_tmp, y_tmp, warps, tr);
 }
 
 void replay(const at::Tensor& state_in, const at::Tensor& k_save, const at::Tensor& v_save, const at::Tensor& g_save,
@@ -120,7 +120,7 @@ void chain_wide_segments(const at::Tensor& seg, const at::Tensor& P, int64_t p_s
                          const at::Tensor& conv, const at::Tensor& cw, at::Tensor rec, const at::Tensor& a_log,
                          const at::Tensor& dt_bias, const at::Tensor& norm_w, double eps, double lower, int64_t rows,
                          at::Tensor out, at::Tensor k_save, at::Tensor v_save, at::Tensor g_save, at::Tensor b_save,
-                         at::Tensor q_tmp, at::Tensor y_tmp) {
+                         at::Tensor q_tmp, at::Tensor y_tmp, int64_t warps, int64_t tr) {
     check_segments(seg);
     check(P, at::kBFloat16, "P");
     check(A, at::kBFloat16, "A");
@@ -150,7 +150,7 @@ void chain_wide_segments(const at::Tensor& seg, const at::Tensor& P, int64_t p_s
     c10::cuda::CUDAGuard guard(P.device());
     kda_chain_wide_segments_cuda(seg, seg.size(0), P, p_stride, b_off, A, a_stride, G, g_stride, conv,
                                  conv.stride(0), cw, rec, rec.stride(0), rec.stride(1), a_log, dt_bias, norm_w, eps,
-                                 lower, rows, out, k_save, v_save, g_save, b_save, q_tmp, y_tmp);
+                                 lower, rows, out, k_save, v_save, g_save, b_save, q_tmp, y_tmp, warps, tr);
 }
 
 // rec [slots, 2, layers, H, 128, 128] (each [H, 128, 128] contiguous); segment i with keep < rows replays its

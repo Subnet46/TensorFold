@@ -426,7 +426,7 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
     if b.prefill and isinstance(q, qmm.Q4):
-        return shared.prefill_matmul(x, q, f32=f32, out=out)
+        return shared.prefill_matmul(x, q, f32=f32, out=out, tile=qmm.prefill_tile(q.n, q.k, x.shape[0]))
     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
 
 

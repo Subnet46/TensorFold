@@ -16,8 +16,23 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_kda_v2", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+    return load(name="tensorfold_glm_kda_v2a1", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+
+
+STEP_DEFAULT = (4, 16)      # the step kernels' warps a block and staged rows (GB10's choice; kda.cu STEP_DISPATCH)
+
+
+def step_launch(heads: int, rows: int) -> tuple[int, int]:
+    """(warps, staged rows) of the wide chain's step kernel for ``rows`` rows of ``heads`` heads: STEP_DEFAULT, or a
+    launch table's ``kda_step`` entry (TF_GLM_TUNE). Every setting gives the same bits."""
+
+    from . import tune
+
+    t = tune.pick("kda_step", tune.shape(heads), rows)
+    if not t:
+        return STEP_DEFAULT
+    return int(t.get("warps", STEP_DEFAULT[0])), int(t.get("tr", STEP_DEFAULT[1]))
 
 
 class KDAScratch:
@@ -103,9 +118,10 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
                                  rows, scratch.out, state_out, pos)
     if wide if wide is not None else rows >= WIDE_ROWS:
         q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
+        warps, tr = step_launch(a_log.numel(), int(rows))
         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
                           a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out,
-                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
+                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
         return scratch.out[:rows]
     _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
                  dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out, scratch.k, scratch.v,
@@ -163,9 +179,10 @@ def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tens
     (``chain_wide``) for any window."""
 
     q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
+    warps, tr = step_launch(a_log.numel(), int(rows))
     _ext().chain_wide_segments(seg, p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv, conv_w, rec,
                                a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, scratch.k,
-                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
+                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
     return scratch.out[:rows]
 
 

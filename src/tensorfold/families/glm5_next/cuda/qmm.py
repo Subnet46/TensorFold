@@ -10,6 +10,8 @@ import triton.language as tl
 
 from tensorfold.cuda.kernels import qmm as shared
 
+from . import tune
+
 BN = 64                   # columns per stored tile
 GS = 64                   # inputs per quantization group
 
@@ -344,7 +346,7 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
     if out is not None and (out.shape != (x.shape[0], q.n) or not out.is_contiguous()):
         raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({x.shape[0]}, {q.n})")
     return shared.matmul(x, q, group_sums(x) if xs is None else xs, sk=split_k(q.n, q.k), f32=f32, out=out,
-                         variant=dec_tile(q.n, q.k) if x.shape[0] <= 16 else None)
+                         variant=dec_tile(q.n, q.k, x.shape[0]) if x.shape[0] <= shared.CFG_ROWS else None)
 
 
 # Decode rows (up to 16) of a Q4 matmul on another column tile / warp / stage count (``shared.qmm_cfg``): every
@@ -354,11 +356,18 @@ DEC_TILES: dict[tuple[int, int], int] = {(4096, 4096): 2, (2048, 4096): 2, (8192
 _dec_env: tuple[str, dict] = ("", {})
 
 
-def dec_tile(n: int, k: int) -> int | None:
-    """TF_GLM_Q4_TILE: unset or "table" the table above, "stock" none, a number that config for every shape."""
+def dec_tile(n: int, k: int, m: int = 1) -> int | None:
+    """TF_GLM_Q4_TILE: unset or "table" the table above, "stock" none, a number that config for every shape. A launch
+    table's ``q4_dec`` entry for (n, k) at m rows (TF_GLM_TUNE) takes precedence (-1: the stock tile); without one,
+    windows of more than 16 rows keep the stock tiles."""
 
     import os
 
+    t = tune.pick("q4_dec", tune.shape(n, k), m)
+    if t is not None:
+        return None if t < 0 else int(t)
+    if m > 16:
+        return None
     global _dec_env
     value = os.environ.get("TF_GLM_Q4_TILE", "") or "table"
     if value != _dec_env[0]:
@@ -366,6 +375,14 @@ def dec_tile(n: int, k: int) -> int | None:
         _dec_env = (value, table if table is not None else {"all": int(value)})
     table = _dec_env[1]
     return table.get("all", table.get((n, k)))
+
+
+def prefill_tile(n: int, k: int, m: int) -> int:
+    """The shared prefill matmul's tile for a prompt chunk's (n, k) matmul of m rows: 0 (128x128, 3 stages), or a
+    launch table's ``q4_prefill`` entry (TF_GLM_TUNE); no tile changes a row's bits (qmm_prefill.cu)."""
+
+    t = tune.pick("q4_prefill", tune.shape(n, k), m)
+    return 0 if t is None else int(t)
 
 
 def b16_split_k(n: int, k: int) -> int:
@@ -386,6 +403,10 @@ def _matmul_b16(x: torch.Tensor, q: B16, *, out: torch.Tensor | None, f32: bool,
         raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
     bm = bucket(min(m, 128))              # a prompt chunk runs as 128-row blocks: no bucket changes a row's bits
     warps, stages = B16_CONFIG[bm]
+    if m <= 64:                           # decode windows: a launch table's (warps, stages) (TF_GLM_TUNE), same bits
+        t = tune.pick("b16_dec", tune.shape(q.n, q.k), m)
+        if t:
+            warps, stages = t.get("warps", warps), t.get("stages", stages)
     sk = b16_split_k(q.n, q.k)
     seq = _seq(sk, m, q.n, q.k)
     if out is None:
@@ -502,6 +523,10 @@ def _matmul_f8(x: torch.Tensor, q: F8, *, out: torch.Tensor | None, f32: bool,
     sk = b16_split_k(q.n, q.k)
     seq = _seq(sk, m, q.n, q.k)
     bn = F8_BN_DECODE if bm == 16 else F8_BN
+    if m <= 64:                           # decode windows: a launch table's (warps, stages, bn) (TF_GLM_TUNE), same bits
+        t = tune.pick("f8_dec", tune.shape(q.n, q.k), m)
+        if t:
+            warps, stages, bn = t.get("warps", warps), t.get("stages", stages), t.get("bn", bn)
     cfg = _prompt_cfg(sk, m, q.n, q.k)
     if cfg is not None:
         bm, bn, warps, stages, seq = cfg
