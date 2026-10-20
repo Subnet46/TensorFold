@@ -37,6 +37,40 @@ def vision_workspace() -> int:
     return int(value) * 2**20
 
 
+GRIDS = (16, 32, 64, 128)             # TF_GLM_PROMPT_GRID's values besides 0 (off)
+
+
+def prompt_grid(prefill_rows: int, value: str | None = None) -> int:
+    """TF_GLM_PROMPT_GRID: 0 (off, the default) or G in ``GRIDS``, which ``prefill_rows`` must be a multiple of.
+
+    With G set, every prompt chunk starts on a multiple of G and a kept prompt state sits at the last multiple of G
+    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly."""
+
+    value = os.environ.get("TF_GLM_PROMPT_GRID", "") if value is None else value
+    value = value.strip()
+    if value in ("", "0"):
+        return 0
+    if not value.isdecimal() or int(value) not in GRIDS:
+        raise ValueError(f"TF_GLM_PROMPT_GRID: 0 or one of {', '.join(map(str, GRIDS))}, not {value!r}")
+    grid = int(value)
+    if prefill_rows % grid:
+        raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: prompt chunks of {prefill_rows} rows (TF_GLM_PREFILL_ROWS) "
+                         f"must be a multiple of it")
+    return grid
+
+
+def grid_point(n: int, cut: int, grid: int) -> int | None:
+    """Where a drafted request of an n-token prompt resumed at ``cut`` keeps its prompt state, or None for nowhere.
+
+    Off (grid 0) and on-grid prompts: at n. Otherwise at B = floor(n / grid) * grid, when B lies past ``cut`` (so
+    B > 0); the request then prefills up to B, keeps that state, and resumes from it to n."""
+
+    if not grid or n % grid == 0:
+        return n
+    point = n // grid * grid
+    return point if point > cut else None
+
+
 def encode_policy(spec: str) -> list[int]:
     """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
 
@@ -186,6 +220,8 @@ class GlmEngine:
         prefill_rows = int(prefill_rows)
         if not 64 <= prefill_rows <= 16384 or prefill_rows % 64:
             raise ValueError(f"prefill rows: a multiple of 64 from 64 to 16,384, not {prefill_rows}")
+        # TF_GLM_PROMPT_GRID=G: prompt chunks start on multiples of G and kept prompt states sit on them
+        self.grid = prompt_grid(prefill_rows)
         vision = bool(vision) and rank == 0
         workspace = vision_workspace() if vision else 0
         if vision:                           # the tower's bf16 weights, which the split rule drops
@@ -211,7 +247,8 @@ class GlmEngine:
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows] + (self.copy.code() if self.copy is not None else [0, 0]) + [int(self.mtp_on), int(DRAFT_RING)]
+                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + \
+            [int(self.mtp_on), int(DRAFT_RING)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -219,7 +256,8 @@ class GlmEngine:
         both = self._gather_ints(mine + [spare >> 20])
         if both[0][:-1] != both[1][:-1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
-                               "TF_GLM_LATENT, TF_GLM_COPY_*, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                               "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, TF_GLM_MTP, "
+                               "TF_GLM_DRAFT_RING): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -248,7 +286,11 @@ class GlmEngine:
 
             self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
-                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
+                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
+                        grid=self.grid)
+        if rank == 0 and self.grid:
+            print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
+                  f"(TF_GLM_PROMPT_GRID)", flush=True)
         if self.drafter is not None:
             self.drafter.capture()
         self.costs = self._calibrate()
@@ -426,6 +468,7 @@ class GlmEngine:
         best = None
         for snap in self.cache:
             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
+            fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
             if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
                     best is None or len(snap.ids) > len(best.ids)):
                 best = snap
@@ -499,7 +542,7 @@ class GlmEngine:
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
                   feed=None) -> dict[str, Any]:
-        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
+        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
         from .drafter_choice import DrafterChoice, auto_decode
 
         auto, use_mtp, use_dflash = self._drafters(code)
@@ -515,9 +558,26 @@ class GlmEngine:
             hit.rows, hit.nbytes = None, 0            # live again
         # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
         self.live = list(prompt) if feed is None else []
-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit, feed=feed,
-                        keep_at=max(1, len(prompt) - 1) if draft and feed is None else None, keep=self._remember)
+        # a drafted text prompt keeps its state at ``point``: its end, or with TF_GLM_PROMPT_GRID the last grid
+        # multiple in it. Short of the end, the prompt prefills to the point as a prompt of that length would (no
+        # first token), keeps that state, and resumes from it as a later request would: so any prompt extending
+        # prompt[:point] passes through the same state there, fresh or resumed. Both ranks decide alike
+        point = grid_point(len(prompt), cut, self.grid) if draft and feed is None else None
+        resume, kept = hit, None
+        if point is not None and point < len(prompt):
+            head = list(prompt[:point])
+            prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=hit, sample=False)
+            kept = resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                          drafter=drafter)
+        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed)
         prefill_s = time.perf_counter() - t0
+        if point == len(prompt):
+            kept = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                 drafter=drafter)
+        if kept is not None:
+            self._remember(kept)
+        elif draft and feed is None and hit is not None:     # the resume point is the grid point: keep it newest
+            self.cache = [c for c in self.cache if c is not hit] + [hit]
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
