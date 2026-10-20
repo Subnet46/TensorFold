@@ -6,23 +6,28 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
-from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
+from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+from tensorfold.families.glm5_next.prompts import agent_history, clear_thinking, thinking_off
 from tensorfold.server.errors import CONTEXT_LIMIT
 
 
 class ThinkingOffTemplate:
-    """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``), with earlier
-    turns' reasoning kept unless the request's ``chat_template_kwargs.clear_thinking`` says otherwise
-    (``prompts.clear_thinking``)."""
+    """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
+    (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
+    (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
+    ``kept_reasoning.KeptReasoning``; None: off)."""
 
-    def __init__(self, inner, clear: bool | None = None) -> None:
+    def __init__(self, inner, kept: KeptReasoning | None = None, clear: bool | None = None) -> None:
         self.inner = inner
         self.efforts = getattr(inner, "efforts", frozenset())
+        self.kept = kept
         self.clear = clear_thinking() if clear is None else clear
 
     def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
         extra = {"clear_thinking": self.clear, **(extra or {})}
-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
+        if self.kept is not None:
+            messages = self.kept.restore(messages)
+        text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
                                  allow_images=allow_images)
         return text if enable_thinking else thinking_off(text)
 
@@ -53,7 +58,7 @@ class GlmApp(App):
         super().__init__(engine, model_dir, served, **kwargs)
         if self.vision is not None:
             media_template(self.template, Path(model_dir))
-        self.template = ThinkingOffTemplate(self.template)
+        self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env())
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
@@ -83,4 +88,9 @@ class GlmApp(App):
         model = str(body.get("model") or "")
         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
-        return super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+        result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+        kept = getattr(self.template, "kept", None)
+        if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":
+            # the calls' reasoning, for a client that will not send it back
+            kept.remember(body.get("messages"), result["calls"], result.get("reasoning"))
+        return result

@@ -74,6 +74,11 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
         elif not isinstance(content, str):
             raise RequestError("message content must be text or an array of text parts")
         item = message if content is message.get("content") else {**message, "content": content}
+        if (role == "assistant" and not isinstance(message.get("reasoning_content"), str)
+                and isinstance(message.get("reasoning"), str)):
+            # vLLM's newer replies and OpenRouter's name a step's reasoning ``reasoning``; templates read
+            # ``reasoning_content``, and without it a tool step's reasoning is dropped from the resent history
+            item = {**item, "reasoning_content": message["reasoning"]}
         if role in ("system", "developer"):
             if not out:
                 instructions.append(item)

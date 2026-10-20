@@ -184,6 +184,8 @@ def make_handler(app: App):
                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
                 if result["final"]:
                     emit(result["final"])
+                for delta in result.get("call_deltas") or ():      # the end of calls streamed as they were written
+                    emit(delta)
                 if result["calls"]:
                     for i, call in enumerate(result["calls"]):
                         if i < result.get("calls_streamed", 0):      # sent as deltas already

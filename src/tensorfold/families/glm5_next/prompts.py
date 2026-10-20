@@ -4,7 +4,10 @@ line and no opened think block."""
 from __future__ import annotations
 
 import os
+import json
 from typing import Any
+
+from tensorfold.server.errors import RequestError
 
 EFFORT_LINE = "<|system|>Reasoning Effort: Max"
 OPENED = "<|assistant|><think>"
@@ -27,6 +30,50 @@ def clear_thinking() -> bool:
     return value == "1"
 
 
+def _call_id(message: Any) -> Any:
+    """The id GLM's template matches a tool result or call by (its ``id_of``)."""
+
+    return message.get("tool_call_id") or message.get("id") if isinstance(message, dict) else None
+
+
+def agent_history(messages: Any) -> Any:
+    """A chat as GLM-5.3's template can render every part of it: a call's arguments sent as "" or null are no
+    arguments (the template reads them as a mapping), and results whose ids match none of their calls' ids are
+    rendered in the order sent (the template sorts results by id and silently drops one it cannot place)."""
+
+    if not isinstance(messages, list):
+        return messages
+    out = list(messages)
+    for i, message in enumerate(out):
+        calls = message.get("tool_calls") if isinstance(message, dict) and message.get("role") == "assistant" else None
+        if not isinstance(calls, list) or not calls:
+            continue
+        fixed = []
+        for j, call in enumerate(calls):
+            function = call.get("function") if isinstance(call, dict) else None
+            arguments = function.get("arguments") if isinstance(function, dict) else {}
+            if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
+                call = {**call, "function": {**function, "arguments": {}}}
+            elif isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments)
+                except ValueError:
+                    parsed = None
+                if not isinstance(parsed, dict):
+                    raise RequestError(f"messages[{i}].tool_calls[{j}].function.arguments must be a JSON object "
+                                       f"(or empty), not {arguments[:80]!r}")
+            fixed.append(call)
+        out[i] = {**message, "tool_calls": fixed}
+        end = i + 1
+        while end < len(out) and isinstance(out[end], dict) and out[end].get("role") == "tool":
+            end += 1
+        known = {_call_id(call) for call in fixed}
+        if any(_call_id(result) and _call_id(result) not in known for result in out[i + 1:end]):
+            out[i + 1:end] = [{k: v for k, v in result.items() if k not in ("tool_call_id", "id")}
+                              for result in out[i + 1:end]]
+    return out
+
+
 def thinking_off(text: str) -> str:
     """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block."""
 
@@ -47,6 +94,7 @@ class GlmTokenizer:
 
     def apply_chat_template(self, messages: Any, *args: Any, tokenize: bool = True, **kwargs: Any) -> Any:
         kwargs.setdefault("clear_thinking", self._clear)
+        messages = agent_history(messages)
         if kwargs.get("enable_thinking", True) is not False:
             return self._inner.apply_chat_template(messages, *args, tokenize=tokenize, **kwargs)
         text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs))
