@@ -56,6 +56,16 @@ def _int(env, name: str, default: int, lo: int, hi: int) -> int:
     return int(value)
 
 
+def pad_rows(rows: int, world: int) -> int:
+    """Rows a prompt buffer of ``rows`` rows holds past them for the split's pad rows: a chunk of ``rows`` rows rounded
+    up to whole shares a rank (``HcSplit.padded``). 0 at two and four ranks (prompt chunks are a multiple of 64 rows);
+    1 at three, where a 2,048-row chunk splits as 3 x 683 = 2,049 rows: without that row every full chunk failed
+    ``applies`` and ran unsplit (an all-gather of every rank's whole partial at each of the 90 sites, the glue on
+    every row, no overlap)."""
+
+    return -int(rows) % int(world)
+
+
 @dataclass(frozen=True)
 class SplitSettings:
     """What TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP ask for; both ranks must agree (the startup comparison)."""
@@ -155,7 +165,8 @@ class HcSplit:
         return -(-R // self.world) * self.world
 
     def applies(self, R: int) -> bool:
-        return R >= self.settings.min_rows and self.padded(R) <= self.b.rows
+        """Whether a chunk of R rows runs split: long enough, and its pad rows fit the buffers (``pad_rows``)."""
+        return R >= self.settings.min_rows and self.padded(R) <= getattr(self.b, "alloc_rows", self.b.rows)
 
     def warm(self) -> None:
         """Open the NCCL send/receive connections to the peers at startup (every rank calls this together)."""

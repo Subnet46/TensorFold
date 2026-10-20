@@ -683,6 +683,9 @@ class GlmEngine:
             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
             if rank == 0:
                 print(f"[tensorfold] {self.split.describe()}", flush=True)
+                if not self.e.pbuf.split.applies(prefill_rows):      # e.g. TF_GLM_HC_SPLIT_MIN_ROWS past a chunk
+                    print(f"[tensorfold] note: a full {prefill_rows}-row prompt chunk runs unsplit at {world} ranks "
+                          "(only shorter ones split)", flush=True)
         c = self.copy
         if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
             print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "

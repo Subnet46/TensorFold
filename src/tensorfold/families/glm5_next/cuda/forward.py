@@ -37,7 +37,7 @@ def prompt_split_k(w: Weights) -> bool:
 class Buffers:
     """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
 
-    def __init__(self, w: Weights, rows: int, capacity: int = 2560, *, prefill: bool = False) -> None:
+    def __init__(self, w: Weights, rows: int, capacity: int = 2560, *, prefill: bool = False, pad: int = 0) -> None:
         c = w.cfg
         dev = w.device
         bf, f32 = torch.bfloat16, torch.float32
@@ -45,6 +45,9 @@ class Buffers:
         HL = tp.of(w).heads
         LL = tp.of(w).lin_heads
         self.rows, self.prefill = rows, prefill
+        # ``pad``: rows held past the largest window, for the row split's pad rows (TF_GLM_HC_SPLIT past two ranks: a
+        # chunk rounded up to whole shares a rank, ``hcsplit.pad_rows``); every buffer below holds them
+        self.alloc_rows = rows = rows + int(pad)
         head_rows = 1 if prefill else rows
         self.world = w.world
         self.ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
@@ -162,7 +165,8 @@ class Buffers:
         self.tap_at = {}
         for i, layer in enumerate(layers):
             self.tap_at.setdefault(layer, []).append(i)
-        self.taps = [torch.empty((self.rows, hidden), dtype=torch.bfloat16, device=self.ids.device) for _ in layers]
+        self.taps = [torch.empty((self.alloc_rows, hidden), dtype=torch.bfloat16, device=self.ids.device)
+                     for _ in layers]
 
     def parents(self, R: int) -> torch.Tensor:
         p = self._parents.get(R)
