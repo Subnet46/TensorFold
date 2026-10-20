@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -56,6 +57,8 @@ def replay_layers(state_in: torch.Tensor, scratch: KDAScratchSet, rows: int, sta
 
 
 WIDE_ROWS = 64          # windows of this many rows or more (prefill chunks) run the chain in three kernels
+# prompt chunks in chunked (WY) form, 64-row sub-chunks at absolute positions (kda_chunked.py): close, not the same bits
+CHUNKED = os.environ.get("TF_GLM_KDA_CHUNKED", "0") == "1"
 _tmp: dict = {}
 
 
@@ -73,9 +76,14 @@ def _wide_scratch(rows: int, heads: int, device) -> tuple[torch.Tensor, torch.Te
 def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
-          state_out: torch.Tensor, *, wide: bool | None = None) -> torch.Tensor:
-    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits."""
+          state_out: torch.Tensor, *, wide: bool | None = None, pos: int | None = None) -> torch.Tensor:
+    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits; a prompt chunk (``pos``: its first row's position) takes the chunked form under TF_GLM_KDA_CHUNKED=1 (scratch's k/v/g/b are not written)."""
 
+    if CHUNKED and pos is not None:
+        from . import kda_chunked
+
+        return kda_chunked.chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower,
+                                 rows, scratch.out, state_out, pos)
     if wide if wide is not None else rows >= WIDE_ROWS:
         q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
