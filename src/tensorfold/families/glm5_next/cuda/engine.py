@@ -809,6 +809,7 @@ class GlmEngine:
                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
                       f"{self.multi.tune.describe()}", flush=True)
+                print(f"[tensorfold] --parallel {parallel}: {self.scheduler.prio.describe(parallel)}", flush=True)
                 if self.multi.row_ms is not None:
                     print("[tensorfold] --parallel batched window ms by rows: " +
                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
@@ -1174,8 +1175,9 @@ class GlmEngine:
         return stats
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None, *, vision=None, background: bool = False) -> dict[str, Any]:
-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them."""
+                 constraint=None, *, vision=None, background: bool = False,
+                 priority: int | None = None) -> dict[str, Any]:
+        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them; ``priority``: under --parallel, the request's class (``tensorfold.cuda.priority``, patch 0141; None: from ``background``)."""
 
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
@@ -1191,7 +1193,8 @@ class GlmEngine:
                 raise ValueError("image inputs require starting this server with --vision")
             stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
-                                          background=background, glm={"code": code, "spec": spec})
+                                          background=background, glm={"code": code, "spec": spec},
+                                          priority=priority)
             stats.update(policy=spec, drafts=draft)
             return stats
         positions: list[int] = []

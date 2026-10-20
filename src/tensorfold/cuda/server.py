@@ -132,6 +132,13 @@ class App:
             return "this model's CUDA engine has no serial switch (\"draft\": false)"
         if not isinstance(body.get("messages", []), list):
             return "messages must be a list"
+        if _concurrent_priority(self.engine):          # patch 0141: a malformed class is refused, never guessed
+            from tensorfold.cuda import priority as prio
+
+            try:
+                prio.parse(body.get("priority"))
+            except ValueError as exc:
+                return str(exc)
         problem = grammar.refusal(body)                 # a malformed grammar field, or one beside a required call
         if problem is None and grammar.request_spec(body) and "constraint" not in inspect.signature(
                 self.engine.generate).parameters:
@@ -520,10 +527,19 @@ class App:
         budget = self._think_budget(prepared, think_end)
         # background: the request's own priority, else --name-priority's default for its id; title requests always
         by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
-        background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
+        title = chat and is_title_request(body.get("messages"), tools)
+        background = body.get("priority") == "background" or by_name or title
         concurrent = getattr(self.engine, "concurrent", False)
         turns = None if concurrent else self._turns()
-        if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
+        if _concurrent_priority(self.engine):
+            # patch 0141: priority lanes, the request's class (realtime, interactive, normal, background) to the
+            # engine's scheduler, which orders admission, prompt chunks and rounds by it (``tensorfold.cuda.priority``)
+            from tensorfold.cuda import priority as prio
+
+            klass = prio.request_class(body, default=prio.BACKGROUND if by_name else None, title=title)
+            background = klass >= prio.BACKGROUND
+            options["priority"] = klass
+        elif concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
             options["background"] = True            # the engine's scheduler orders its lanes and prompts
         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
@@ -674,6 +690,17 @@ class App:
         return CallGate.after_prompt(prompt, self.tok.token_to_id(opener), blank, think_open=think[0],
                                      think_end=think[1], text=text, lead=lead or "", names=names, tail=tail or "",
                                      encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
+
+
+def _concurrent_priority(engine) -> bool:
+    """Whether requests go to ``engine`` with their priority class (patch 0141): an engine whose scheduler orders
+    concurrent requests (``concurrent``) and takes ``priority``, with TENSORFOLD_PRIORITY on (the default)."""
+
+    if not getattr(engine, "concurrent", False):
+        return False
+    from tensorfold.cuda import priority as prio
+
+    return prio.enabled() and "priority" in inspect.signature(engine.generate).parameters
 
 
 def token_sha(tokens: list[int]) -> str:
