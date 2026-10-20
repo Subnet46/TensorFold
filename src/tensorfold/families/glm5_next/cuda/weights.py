@@ -581,6 +581,9 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
         w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head, tp=lay)
         w.meta.update(layers=which, exl3_route=route)
+        from . import moe_glue                  # GLM-route-only glue: told the route before any buffer is made
+
+        moe_glue.exl3_route(route)
     finally:
         rd.close()
     torch.cuda.empty_cache()

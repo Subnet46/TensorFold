@@ -46,7 +46,12 @@ class Rendered:
     state: Any
     reused: int = 0
 
-    def seed(self, salt: int = 0) -> int:
+    def seed(self, salt: int | None = None) -> int:
+        """engine.exact_sampling.seed_for(self.ids, salt) from the kept hash state (``salt``: TENSORFOLD_SEED_SALT by
+        default, as seed_for's)."""
+
+        if salt is None:
+            from tensorfold.engine.exact_sampling import SEED_SALT as salt
         state = self.state.copy()
         state.update(f"|{salt}".encode())
         return int.from_bytes(state.digest()[:8], "little") & ((1 << 63) - 1)

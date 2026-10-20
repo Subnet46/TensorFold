@@ -244,9 +244,11 @@ class NCCL:
         if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
             raise ValueError("exchange: one receive per send, from another rank")
         for s, r in zip(sends, recvs):
-            if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
-                raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
-        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce
+            if s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+                raise ValueError("exchange: each send and receive must be contiguous and alike in dtype")
+        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce needs symmetric buffers
+            if any(s.numel() != r.numel() for s, r in zip(sends, recvs)):
+                raise ValueError("copy-engine exchange requires equal send and receive sizes")
             return self.ce.exchange(sends, recvs, peer)
         stream = torch.cuda.current_stream().cuda_stream
         x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
@@ -255,6 +257,7 @@ class NCCL:
             for s, r in zip(sends, recvs):
                 if s.numel():
                     self._check(x.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, xc, stream), x)
+                if r.numel():
                     self._check(x.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, xc, stream), x)
         finally:
             self._check(x.ncclGroupEnd(), x)

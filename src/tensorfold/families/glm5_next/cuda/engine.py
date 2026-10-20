@@ -810,6 +810,8 @@ class GlmEngine:
             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
         if rank == 0 and moe_glue_mod.on():
             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+        elif rank == 0 and moe_glue_mod.not_used():
+            print(f"[tensorfold] {moe_glue_mod.not_used()}", flush=True)
         if rank == 0 and (lane_inputs_mod.wanted() or lane_inputs_mod.direct_wanted()):
             print(f"[tensorfold] {lane_inputs_mod.describe(world, lane_inputs_added)}", flush=True)
         if rank == 0 and _lane_partials.on():

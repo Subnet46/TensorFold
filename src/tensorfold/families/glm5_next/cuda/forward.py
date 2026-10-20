@@ -914,10 +914,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
 
         if l2pf.ACTIVE is not None and done is None:
             # TF_GLM_L2PF_EXPERT_MB (exl3_stream): the routed experts' first MiB into L2 on the prefetcher's side
-            # stream while the shared expert runs (it only reads)
-            from . import exl3_stream
+            # stream while the shared expert runs (it only reads); GLM's own route only (it reads GLM's plan and
+            # trellis words: the universal route has neither)
+            if b.plan is not None:
+                from . import exl3_stream
 
-            exl3_stream.prefetch_experts(l2pf.ACTIVE, b.plan, m.experts, R)
+                exl3_stream.prefetch_experts(l2pf.ACTIVE, b.plan, m.experts, R)
             # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
             # bits), while the L2 still holds what site "a" prefetched for it
             shared_front(layer, w, b, 0, R)
