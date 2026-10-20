@@ -60,7 +60,8 @@ def replay_layers(state_in: torch.Tensor, scratch: KDAScratchSet, rows: int, sta
 # chain_kernel's bits). TF_GLM_KDA_WIDE_ROWS, default 1: every window (decode windows measured 4-36% faster at 1-8
 # rows on GB10); 64: the one-block chain below 64 rows, as before.
 WIDE_ROWS = int(os.environ.get("TF_GLM_KDA_WIDE_ROWS", "1"))
-# prompt chunks in chunked (WY) form, 64-row sub-chunks at absolute positions (kda_chunked.py): close, not the same bits
+# prompt chunks in chunked (WY) form, 32-row sub-chunks at absolute positions (kda_chunked.py, kda_chunk.cu): close to
+# the serial kernels, not their bits; the engine then puts prompt chunks on a 64-token grid (TF_GLM_PROMPT_GRID)
 CHUNKED = os.environ.get("TF_GLM_KDA_CHUNKED", "0") == "1"
 _tmp: dict = {}
 _outgrown: list = []

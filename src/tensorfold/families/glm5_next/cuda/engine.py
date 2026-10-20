@@ -84,19 +84,34 @@ def vision_workspace() -> int:
 GRIDS = (16, 32, 64, 128)             # TF_GLM_PROMPT_GRID's values besides 0 (off)
 
 
-def prompt_grid(prefill_rows: int, value: str | None = None) -> int:
+def kda_chunked_on() -> bool:
+    from .kda import CHUNKED
+
+    return CHUNKED
+
+
+def prompt_grid(prefill_rows: int, value: str | None = None, chunked: bool | None = None) -> int:
     """TF_GLM_PROMPT_GRID: 0 (off, the default) or G in ``GRIDS``, which ``prefill_rows`` must be a multiple of.
 
     With G set, every prompt chunk starts on a multiple of G and a kept prompt state sits at the last multiple of G
-    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly."""
+    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly.
+    ``chunked`` (default: TF_GLM_KDA_CHUNKED): the chunked KDA prompt path, whose rows depend on the alignment of its
+    32-row sub-chunks, needs G a multiple of 32; unset or 0 then means 64."""
 
+    if chunked is None:
+        chunked = kda_chunked_on()
     value = os.environ.get("TF_GLM_PROMPT_GRID", "") if value is None else value
     value = value.strip()
     if value in ("", "0"):
-        return 0
+        if not chunked:
+            return 0
+        value = "64"
     if not value.isdecimal() or int(value) not in GRIDS:
         raise ValueError(f"TF_GLM_PROMPT_GRID: 0 or one of {', '.join(map(str, GRIDS))}, not {value!r}")
     grid = int(value)
+    if chunked and grid % 32:
+        raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: TF_GLM_KDA_CHUNKED=1 runs prompt chunks in 32-row sub-chunks at "
+                         f"absolute positions, so prompt chunks must start on a grid of 32, 64 or 128 (0: 64)")
     if prefill_rows % grid:
         raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: prompt chunks of {prefill_rows} rows (TF_GLM_PREFILL_ROWS) "
                          f"must be a multiple of it")
@@ -619,6 +634,9 @@ class GlmEngine:
         if rank == 0 and self.grid:
             print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
                   f"(TF_GLM_PROMPT_GRID)", flush=True)
+        if rank == 0 and kda_chunked_on():
+            print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
+                  "(close to the serial kernel, not its bits; decode keeps the serial kernel)", flush=True)
         # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point)
         self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
         if rank == 0 and self.shared:

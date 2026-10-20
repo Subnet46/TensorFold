@@ -1,64 +1,39 @@
-"""GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form: sub-chunks of 64 rows at absolute positions, the
-intra-chunk part as matmuls, the 128 x 128 state carried from sub-chunk to sub-chunk.
+"""GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form (kda_chunk.cu): 32-row sub-chunks at absolute positions,
+one CUDA block per head carrying the 128 x 128 state from sub-chunk to sub-chunk in registers.
 
-Per row the definition is kda.cu's (conv + SiLU rounded to bf16, fp32 L2 norms, q times 128^-0.5, beta =
-bf16(sigmoid(b)), log-decay l = lower * sigmoid(exp(A_log) * (a + dt_bias)) per key channel, the delta rule
-S <- S diag(e^l); S <- S + beta (v - S k) k^T; o = S q, o rounded to bf16, then the gated RMSNorm). The state S is
-[value, key] as in kda.cu.
+Per row the inputs are kda.cu's (conv + SiLU rounded to bf16, fp32 L2 norms, q times 128^-0.5, beta =
+bf16(sigmoid(b)), the per-channel decay g = e^l, l = lower * sigmoid(exp(A_log) * (a + dt_bias))); the delta rule
+S <- S diag(g); S <- S + beta (v - S k) k^T; o = S q, o rounded to bf16, then the gated RMSNorm. S is [value, key].
 
-Sub-chunk of rows 0..63 (T = 64), entering state S0, G = cumsum(l) within the sub-chunk (per key channel, <= 0 and
-decreasing: every l is in (lower, 0) = (-5, 0)):
+A sub-chunk of rows 0..31 entering state S0, E(t -> s) = g_{t+1} ... g_s per key channel (empty: 1):
 
-    L[s, j]  = beta_s sum_c k_s[c] k_j[c] e^(G_s[c] - G_j[c])      j < s          (strictly lower)
-    M[s, j]  =        sum_c q_s[c] k_j[c] e^(G_s[c] - G_j[c])      j <= s
-    T        = (I + L)^-1                                           (unit lower triangular)
-    W        = T (beta * k * e^G),   U = T (beta * v)               the WY / UT transform
-    V'       = U - W S0^T                                           the corrected values ("v_new")
-    O        = (q * e^G) S0^T + M V'
-    S_end    = S0 diag(e^G_63) + V'^T (k * e^(G_63 - G))
+    L[s, t]  = beta_s sum_c k_s k_t E(t -> s)      t < s          M[s, t] = sum_c q_s k_t E(t -> s)     t <= s
+    T        = (I + L)^-1                           Y = beta (v - (k E(0 -> row)) S0^T),   V' = T Y
+    O        = (q E(0 -> row)) S0^T + M V'           S_end = S0 diag(E(0 -> 31)) + V'^T (k E(row -> 31))
 
-Every exponent above is <= 0 except inside L and M, which are formed as matmuls of row and column factors about a
-reference row p: e^(G_s - G_j) = e^(G_s - G_p) e^(G_p - G_j). Each exponent is summed outward from its reference
-(forward from p, backward from p, backward from the sub-chunk's end for k e^(G_63 - G)), never taken as a difference
-of G's: all l have one sign, so a partial sum's rounding error is a few ulps of the partial sum itself, while G
-reaches -320 in a sub-chunk and a difference of two G's would carry ulp(320) = 3e-5 into decays near 1 (the first
-version did: 10x the error of kda.cu's chain). For the rows of 16-row block b against earlier blocks p = the
-block's first row (both factors <= 1: errors a few ulps of the decay's own exponent); inside the diagonal tile p =
-the first row of the row's 4-row group (column factors <= e^15 for the rows after p: errors a few ulps of 30). Only
-blocks j <= b are formed. T is inverted per 16-row diagonal block by forward substitution, then block rows are
-joined with matmuls (T_bj = -T_bb sum L_bm T_mj). Everything is fp32; the matmuls take tl.dot's
-``input_precision`` (TF_GLM_KDA_PREC, default tf32x3, about fp32: read-outs ~3e-7 relative against float64 on the
-tests' inputs, kda.cu's chain ~1e-7; "tf32" is faster and ~5e-4, half a bf16 step).
+Every decay is a running product of per-row decays <= 1, multiplied in row order as the serial chain decays its state
+(no exponent of a difference of cumulative sums: G reaches -160 in a sub-chunk, and ulp(160) = 1.5e-5 would land on
+decays near 1). All products run in fp32 FMAs in a fixed order, so the kernel is deterministic, and a row's bits
+depend only on its sub-chunk's rows and the entering state: the same whichever prefill chunk the row came in, as long
+as prompt chunks start on multiples of the sub-chunk (TF_GLM_PROMPT_GRID, which TF_GLM_KDA_CHUNKED=1 sets to 64).
+Rows outside the prompt chunk (a short first or last sub-chunk) are zero rows: decay 1, no key, no value, beta 0.
+It is not kda.cu's arithmetic (different sums, so bf16 outputs may round the other way and states differ at fp32
+rounding); its error against the float64 delta rule is the serial kernel's order (tests/cuda/test_glm_kda_chunked.py).
 
-Kernels (``chain``): _kda_lm (sub-chunk, head, block): the conv, norms, beta and decays of its rows, L and M rows,
-q e^G; _kda_solve (sub-chunk, head): T and the sub-chunk's total log-decay; _kda_wu (sub-chunk, head, block): W, U
-and the keys decayed to the sub-chunk's end; _kda_state (head, 16 value rows): the only sequential part, sub-chunk
-after sub-chunk, V' and the state entering each sub-chunk; _kda_out (sub-chunk, head): O, bf16, the gated RMSNorm.
-q, k, v, G are recomputed from the projection rows where needed rather than kept (registers) or stored (traffic).
-
-Sub-chunks start at absolute positions that are multiples of 64 (``pos`` gives the first row's position); a
-prompt chunk that starts mid-sub-chunk takes a short first sub-chunk (padded rows are zero rows: no decay, no
-key). A row's output depends only on its sub-chunk's rows and the state entering it, so it is the same whichever
-prefill chunk it came in, as long as chunk boundaries are multiples of 64 (a short last sub-chunk included).
-
-The torch functions (``*_reference``) are the CPU references of the tests; ``chain`` runs the Triton kernels.
+The torch functions (``*_reference``) are the CPU references of the tests; ``chain`` runs the CUDA kernel.
 """
 
 from __future__ import annotations
 
 import math
-import os
+from functools import lru_cache
+from pathlib import Path
 
 import torch
-import triton
-import triton.language as tl
-from triton.language.extra import libdevice
 
 DK = DV = 128
 TAPS = 4
-CHUNK = 64              # rows of a sub-chunk (the state is carried between sub-chunks)
-BLOCK = 16              # rows of a block inside a sub-chunk (the tiles of L, M and T)
-GROUP = 4               # rows about one reference row inside a diagonal tile
+CHUNK = 32              # rows of a sub-chunk (the state is carried between sub-chunks); kda_chunk.cu's BT
 SCALE = 1.0 / math.sqrt(DK)
 
 
@@ -114,28 +89,9 @@ def recurrent_reference(q, k, v, lg, beta, state, dtype=torch.float64):
     return out, S
 
 
-def tf32(x: torch.Tensor) -> torch.Tensor:
-    """fp32 -> TF32 (10 mantissa bits, round to nearest, ties away: cvt.rna.tf32.f32), as fp32."""
-
-    i = x.float().contiguous().view(torch.int32)
-    return ((i + 0x1000) & ~0x1FFF).view(torch.float32)
-
-
-def _tri_inverse(Ld: torch.Tensor) -> torch.Tensor:
-    """(I + Ld)^-1 for strictly lower Ld [..., n, n], by forward substitution a row at a time."""
-
-    n = Ld.shape[-1]
-    T = torch.eye(n, dtype=Ld.dtype, device=Ld.device).expand(Ld.shape).clone()
-    for s in range(1, n):
-        T[..., s, :] = -(Ld[..., s, :, None] * T).sum(-2)
-        T[..., s, s] = 1.0
-    return T
-
-
-def chunked_reference(q, k, v, lg, beta, state, pos: int = 0, dtype=torch.float64, mm_round=None, state_round=...):
-    """The chunked algorithm as the kernels run it (sub-chunks at absolute positions, reference blocks, the block
-    triangular inverse): read-outs [rows, H, 128] and the final state. ``mm_round`` rounds matmul inputs (``tf32``
-    emulates tl.dot's TF32 path), ``state_round`` those of the products with the state (default: ``mm_round``)."""
+def chunked_reference(q, k, v, lg, beta, state, pos: int = 0, dtype=torch.float64):
+    """The chunked algorithm as the kernel runs it (sub-chunks of CHUNK rows at absolute positions, decays as running
+    products, T by forward substitution): read-outs [rows, H, 128] and the final state [H, 128, 128]."""
 
     rows, H, _ = q.shape
     dev = q.device
@@ -143,78 +99,42 @@ def chunked_reference(q, k, v, lg, beta, state, pos: int = 0, dtype=torch.float6
     nc = -(-(rows + off) // CHUNK)
     total = nc * CHUNK
 
-    def pad(t):
+    def pad(t, fill=0.0):
         t = t.to(dtype)
-        z = torch.zeros((total,) + tuple(t.shape[1:]), dtype=dtype, device=dev)
+        z = torch.full((total,) + tuple(t.shape[1:]), fill, dtype=dtype, device=dev)
         z[off:off + rows] = t
-        return z.view((nc, CHUNK) + tuple(t.shape[1:])).transpose(1, 2)     # [nc, H, 64, ...]
+        return z.view((nc, CHUNK) + tuple(t.shape[1:])).transpose(1, 2)     # [nc, H, CHUNK, ...]
 
-    qc, kc, vc, lc, bc = pad(q), pad(k), pad(v), pad(lg), pad(beta)
-    rnd = mm_round or (lambda x: x)
-    srnd = rnd if state_round is ... else (state_round or (lambda x: x))
-
-    def mm(x, y):
-        return rnd(x) @ rnd(y)
-
-    def mms(x, y):
-        return srnd(x) @ srnd(y)
-
-    t = torch.arange(CHUNK, device=dev)
-    lower_strict = t[:, None] > t[None, :]
-    lower_incl = t[:, None] >= t[None, :]
-    nb = CHUNK // BLOCK
-    i = torch.arange(BLOCK, device=dev)[None, :, None]
+    qc, kc, vc, bc = pad(q), pad(k), pad(v), pad(beta)
+    gc = pad(torch.exp(lg.to(dtype)), 1.0)
     S = state.to(dtype).clone()                     # [H, V, K]
     out = torch.empty((total, H, DV), dtype=dtype, device=dev)
-
-    def rcumsum(x):
-        return torch.flip(torch.cumsum(torch.flip(x, [1]), 1), [1])
-
     for c in range(nc):
-        qx, kx, vx, lx, bx = qc[c], kc[c], vc[c], lc[c], bc[c]     # [H, 64, 128] (beta [H, 64])
-        G = torch.cumsum(lx, dim=1)
-        Akk = torch.zeros((H, CHUNK, CHUNK), dtype=dtype, device=dev)
-        Aqk = torch.zeros_like(Akk)
-        for b in range(nb):
-            rs = slice(b * BLOCK, (b + 1) * BLOCK)
-            lb = lx[:, rs]
-            for g in range(BLOCK // GROUP):                           # the diagonal tile, about each group's row
-                p = g * GROUP
-                fwd = torch.cumsum(torch.where(i > p, lb, 0.0), 1)
-                back = rcumsum(torch.where(i <= p, lb, 0.0)) - lb
-                rf = torch.where((i >= p) & (i < p + GROUP), torch.exp(fwd), 0.0)
-                cf = torch.where(i < p, torch.exp(back), torch.where(i < p + GROUP, torch.exp(-fwd), 0.0))
-                kt = (kx[:, rs] * cf).transpose(1, 2)
-                Akk[:, rs, rs] += mm(kx[:, rs] * rf, kt)
-                Aqk[:, rs, rs] += mm(qx[:, rs] * rf, kt)
-            rf = torch.exp(torch.cumsum(torch.where(i > 0, lb, 0.0), 1))   # earlier blocks, about the block's row 0
-            carry = lb[:, :1]
-            for j in range(b - 1, -1, -1):
-                cs = slice(j * BLOCK, (j + 1) * BLOCK)
-                rev = rcumsum(lx[:, cs])
-                kt = (kx[:, cs] * torch.exp(carry + (rev - lx[:, cs]))).transpose(1, 2)
-                Akk[:, rs, cs] = mm(kx[:, rs] * rf, kt)
-                Aqk[:, rs, cs] = mm(qx[:, rs] * rf, kt)
-                carry = carry + rev[:, :1]
-        L = torch.where(lower_strict, bx[:, :, None] * Akk, torch.zeros_like(Akk))
-        M = torch.where(lower_incl, Aqk, torch.zeros_like(Aqk))
-        T = torch.zeros_like(L)
-        for b in range(nb):
-            rs = slice(b * BLOCK, (b + 1) * BLOCK)
-            Tbb = _tri_inverse(L[:, rs, rs])
-            X = mm(L[:, rs, :b * BLOCK], T[:, :b * BLOCK, :]) if b else torch.zeros_like(T[:, rs])
-            T[:, rs] = -mm(Tbb, X)
-            T[:, rs, rs] = Tbb
-        eG = torch.exp(G)
-        W = mm(T, bx[:, :, None] * kx * eG)
-        U = mm(T, bx[:, :, None] * vx)
-        gl = G[:, -1:, :]
-        Ke = kx * torch.exp(rcumsum(lx) - lx)                      # GL - G, summed backward from the end
-        Qt = qx * eG
+        qx, kx, vx, gx, bx = qc[c], kc[c], vc[c], gc[c], bc[c]     # [H, T, 128] (beta [H, T])
+        E = torch.zeros((H, CHUNK, CHUNK, DK), dtype=dtype, device=dev)   # E[:, s, t] = E(t -> s), t <= s
+        for t in range(CHUNK):
+            e = torch.ones((H, DK), dtype=dtype, device=dev)
+            E[:, t, t] = e
+            for s in range(t + 1, CHUNK):
+                e = e * gx[:, s]
+                E[:, s, t] = e
+        Akk = torch.einsum("hsc,htc,hstc->hst", kx, kx, E)
+        Aqk = torch.einsum("hsc,htc,hstc->hst", qx, kx, E)
+        tri = torch.ones((CHUNK, CHUNK), dtype=torch.bool, device=dev)
+        L = torch.where(torch.tril(tri, -1), bx[:, :, None] * Akk, torch.zeros_like(Akk))
+        M = torch.where(torch.tril(tri), Aqk, torch.zeros_like(Aqk))
+        T = torch.eye(CHUNK, dtype=dtype, device=dev).expand(L.shape).clone()
+        for s in range(1, CHUNK):
+            T[:, s, :] = -(L[:, s, :, None] * T).sum(-2)
+            T[:, s, s] = 1.0
+        fwd = torch.cumprod(gx, dim=1)                              # E(0 -> row)
+        back = torch.cat([torch.flip(torch.cumprod(torch.flip(gx[:, 1:], [1]), 1), [1]),
+                          torch.ones_like(gx[:, :1])], 1)
         ST = S.transpose(1, 2)                                      # [H, K, V]
-        Vn = U - mms(W, ST)
-        out[c * CHUNK:(c + 1) * CHUNK] = (mms(Qt, ST) + mm(M, Vn)).transpose(0, 1)
-        S = S * torch.exp(gl) + mms(Vn.transpose(1, 2), Ke)
+        Y = bx[:, :, None] * (vx - (kx * fwd) @ ST)
+        Vn = T @ Y
+        out[c * CHUNK:(c + 1) * CHUNK] = ((qx * fwd) @ ST + M @ Vn).transpose(0, 1)
+        S = S * fwd[:, -1:, :] + Vn.transpose(1, 2) @ (kx * back)
     return out[off:off + rows], S
 
 
@@ -240,418 +160,37 @@ def chain_reference(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias
     return gate_norm_reference(y, g, norm_w, eps), S.float(), y
 
 
-# -- Triton kernels ---------------------------------------------------------------------------------------------
-# The per-row values rounded to bf16 (conv + SiLU, beta) must be kda.cu's bits: a value rounded the other way at a
-# bf16 tie moves a key by 2^-8 in one channel, a beta by 2^-8 of the whole update, far above fp32 noise (and the
-# read-out of a row whose RMSNorm is eps-dominated carries it into the output). kda.cu is built with --fmad=false and
-# uses CUDA's expf and IEEE division: the kernels that compute these values launch with enable_fp_fusion=False and
-# take libdevice's expf (the same algorithm) and div_rn. Triton's interpreter has no libdevice: it takes tl.exp.
-_PRECISE = tl.constexpr(os.environ.get("TRITON_INTERPRET", "0") != "1")
+def chain_reference(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows, *,
+                    pos: int = 0, chunked: bool = True, dtype=torch.float32):
+    """A whole prompt chunk: (out bf16 [rows, H * 128], final state fp32 [H, 128, 128], read-outs y [rows, H, 128])."""
 
-
-@triton.jit
-def _expf(x):
-    """CUDA's expf (libdevice) on the GPU, tl.exp under the interpreter."""
-    if _PRECISE:
-        return libdevice.exp(x)
+    q, k, v, lg, beta = prep_reference(p, b_off, a, conv_state, conv_w, a_log, dt_bias, lower, rows)
+    if chunked:
+        y, S = chunked_reference(q, k, v, lg, beta, state_in, pos, dtype=dtype)
     else:
-        return tl.exp(x)
+        y, S = recurrent_reference(q, k, v, lg, beta, state_in, dtype=dtype)
+    return gate_norm_reference(y, g, norm_w, eps), S.float(), y
 
 
-@triton.jit
-def _sigmoid_f(x):
-    """kda.cu's sigmoidf_: 1 / (1 + expf(-x)), IEEE division."""
-    return tl.math.div_rn(1.0, 1.0 + _expf(-x))
+# -- the CUDA kernel --------------------------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _ext():
+    from tensorfold.cuda.build import load
 
-
-@triton.jit
-def _bf16(x):
-    """fp32 rounded to bf16 (to nearest even), as fp32: bit arithmetic, so Triton's CPU interpreter (which truncates
-    in casts) rounds as the GPU does."""
-    b = x.to(tl.uint32, bitcast=True)
-    b = (b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000
-    return b.to(tl.float32, bitcast=True)
-
-
-@triton.jit
-def _conv_act(P, p_stride, CS, CW, r, valid, ch, C3, BT: tl.constexpr, DK_: tl.constexpr, TAPS_: tl.constexpr):
-    """Depthwise conv over [conv state; P rows] of channels ch for rows r, SiLU, rounded to bf16: [BT, DK] fp32."""
-
-    acc = tl.zeros((BT, DK_), dtype=tl.float32)
-    for tap in tl.static_range(TAPS_):
-        at = r + (tap - (TAPS_ - 1))                        # P row (negative: conv state row at + TAPS - 1)
-        from_p = valid & (at >= 0)
-        from_s = valid & (at < 0)
-        xp = tl.load(P + at.to(tl.int64)[:, None] * p_stride + ch[None, :], mask=from_p[:, None], other=0.0)
-        xs = tl.load(CS + (at + (TAPS_ - 1)).to(tl.int64)[:, None] * C3 + ch[None, :], mask=from_s[:, None],
-                     other=0.0)
-        x = tl.where(from_s[:, None], xs.to(tl.float32), xp.to(tl.float32))
-        wt = tl.load(CW + ch * TAPS_ + tap).to(tl.float32)
-        acc = acc + wt[None, :] * x
-    act = tl.math.div_rn(acc, 1.0 + _expf(-acc))
-    return _bf16(act)
-
-
-@triton.jit
-def _l2(x):
-    ss = tl.sum(x * x, axis=1)
-    return x * tl.math.div_rn(1.0, tl.sqrt_rn(ss + 1e-6))[:, None]
-
-
-@triton.jit
-def _row(x, t, s):
-    """Row s of x [n, N] as [N] (a sum with zeros: exact)."""
-    return tl.sum(tl.where((t == s)[:, None], x, 0.0), axis=0)
-
-
-@triton.jit
-def _tri_inv(Ld, BC: tl.constexpr):
-    """(I + Ld)^-1 of a strictly lower [BC, BC] block by forward substitution."""
-
-    i = tl.arange(0, BC)
-    T = tl.where(i[:, None] == i[None, :], 1.0, 0.0)
-    for s in range(1, BC):
-        lrow = tl.sum(tl.where((i == s)[:, None], Ld, 0.0), axis=0)          # Ld[s, :]
-        trow = -tl.sum(lrow[:, None] * T, axis=0)                           # -sum_m Ld[s, m] T[m, :]
-        T = tl.where((i == s)[:, None], trow[None, :] + tl.where(i == s, 1.0, 0.0)[None, :], T)
-    return T
-
-
-@triton.jit
-def _dot_k(a, b, NS: tl.constexpr, PREC: tl.constexpr):
-    """a [M, K] @ b [K, N] as a batched dot over NS slices of K, summed: with M = N = 16 a warp then holds a slice of
-    the operands instead of all of K."""
-    M: tl.constexpr = a.shape[0]
-    K: tl.constexpr = a.shape[1]
-    N: tl.constexpr = b.shape[1]
-    a3 = tl.permute(tl.reshape(a, (M, NS, K // NS)), (1, 0, 2))
-    b3 = tl.reshape(b, (NS, K // NS, N))
-    return tl.sum(tl.dot(a3, b3, input_precision=PREC), axis=0)
-
-
-@triton.jit
-def _logdecay(A, a_stride, r, valid, hd, ch, rate, dtb, lower):
-    """The log-decays l of rows r [BC, DK] (in (lower, 0)); zero rows outside the chunk."""
-    av = tl.load(A + r.to(tl.int64)[:, None] * a_stride + hd + ch[None, :], mask=valid[:, None], other=0.0)
-    lg = lower * _sigmoid_f(rate * (av.to(tl.float32) + dtb[None, :]))
-    return tl.where(valid[:, None], lg, 0.0)
-
-
-@triton.jit
-def _gates(A, a_stride, r, valid, hd, ch, rate, dtb, lower, carry):
-    """G for rows r: carry (the running log-decay before them) + their running sum; zero rows outside the chunk."""
-    return carry[None, :] + tl.cumsum(_logdecay(A, a_stride, r, valid, hd, ch, rate, dtb, lower), axis=0)
-
-
-@triton.jit
-def _beta(P, p_stride, b_off, h, r, valid):
-    braw = tl.load(P + r.to(tl.int64) * p_stride + b_off + h, mask=valid, other=0.0).to(tl.float32)
-    return tl.where(valid, _bf16(_sigmoid_f(braw)), 0.0)
-
-
-@triton.jit
-def _kda_lm(P, p_stride, b_off, A, a_stride, CS, CW, ALOG, DTB, lower, rows, off, H, QT, L, M,
-            DK_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, GR: tl.constexpr, TAPS_: tl.constexpr,
-            KSPLIT: tl.constexpr, PREC: tl.constexpr):
-    """Program (sub-chunk, head, 16-row block b): block b's rows of L (beta k k decays, strictly lower) and M (q k
-    decays, with the diagonal) against blocks j <= b, and its decayed q (QT = q e^G). Rows outside the prompt chunk
-    are zero rows (no decay, no key).
-
-    A decay e^(G_s - G_j) is formed as e^(G_s - G_p) e^(G_p - G_j) about a reference row p, each exponent summed
-    outward from p (its rounding error a few ulps of its own size, never of G's): p = the block's first row for
-    earlier blocks (both factors <= 1: the error is a few ulps of the decay's own exponent), p = the first row of s's
-    GR-row group inside the diagonal tile (column factors <= e^(5 (GR - 1)), errors a few ulps of 10 (GR - 1))."""
-
-    c = tl.program_id(0)
-    h = tl.program_id(1)
-    b = tl.program_id(2)
-    i = tl.arange(0, BC)
-    ch = tl.arange(0, DK_)
-    C3 = 3 * H * DK_
-    hd = h * DK_
-    rate = _expf(tl.load(ALOG + h))
-    dtb = tl.load(DTB + hd + ch)
-    r0 = c * BT - off
-    tile = (c.to(tl.int64) * H + h) * BT * BT + (b * BC + i)[:, None] * BT + i[None, :]    # + j * BC: tile (b, j)
-
-    r = r0 + b * BC + i
-    valid = (r >= 0) & (r < rows)
-    lb = _logdecay(A, a_stride, r, valid, hd, ch, rate, dtb, lower)
-    k = _l2(_conv_act(P, p_stride, CS, CW, r, valid, H * DK_ + hd + ch, C3, BC, DK_, TAPS_))
-    q = _l2(_conv_act(P, p_stride, CS, CW, r, valid, hd + ch, C3, BC, DK_, TAPS_)) * 0.08838834764831845
-    beta = _beta(P, p_stride, b_off, h, r, valid)
-
-    # the diagonal tile in GR-row groups: rows s of group g about p = the group's first row
-    akk = tl.zeros((BC, BC), dtype=tl.float32)
-    aqk = tl.zeros((BC, BC), dtype=tl.float32)
-    for g in tl.static_range(BC // GR):
-        fwd = tl.cumsum(tl.where(i[:, None] > g * GR, lb, 0.0), axis=0)                          # G_t - G_p, t >= p
-        back = tl.cumsum(tl.where(i[:, None] <= g * GR, lb, 0.0), axis=0, reverse=True) - lb     # G_p - G_t, t < p
-        rf = tl.where(((i >= g * GR) & (i < g * GR + GR))[:, None], tl.exp(fwd), 0.0)
-        cf = tl.where((i < g * GR)[:, None], tl.exp(back), tl.where((i < g * GR + GR)[:, None], tl.exp(-fwd), 0.0))
-        col = tl.trans(k * cf)
-        akk += _dot_k(k * rf, col, KSPLIT, PREC)
-        aqk += _dot_k(q * rf, col, KSPLIT, PREC)
-    tl.store(L + tile + b * BC, tl.where(i[:, None] > i[None, :], beta[:, None] * akk, 0.0))
-    tl.store(M + tile + b * BC, tl.where(i[:, None] >= i[None, :], aqk, 0.0))
-
-    # earlier blocks, nearest first, about p = the block's first row
-    fwd = tl.cumsum(tl.where(i[:, None] > 0, lb, 0.0), axis=0)                                   # G_s - G_p
-    rf = tl.exp(fwd)
-    rk = k * rf
-    rq = q * rf
-    carry = _row(lb, i, 0)                                    # G_p - G_t for t = the previous block's last row
-    for jj in range(0, b):
-        j = b - 1 - jj
-        rj = r0 + j * BC + i
-        vj = (rj >= 0) & (rj < rows)
-        lj = _logdecay(A, a_stride, rj, vj, hd, ch, rate, dtb, lower)
-        rev = tl.cumsum(lj, axis=0, reverse=True)
-        kj = _l2(_conv_act(P, p_stride, CS, CW, rj, vj, H * DK_ + hd + ch, C3, BC, DK_, TAPS_))
-        col = tl.trans(kj * tl.exp(carry[None, :] + (rev - lj)))                  # e^(G_p - G_t) <= 1, [DK, BC]
-        tl.store(L + tile + j * BC, beta[:, None] * _dot_k(rk, col, KSPLIT, PREC))
-        tl.store(M + tile + j * BC, _dot_k(rq, col, KSPLIT, PREC))
-        carry += _row(rev, i, 0)
-    # carry = G_p, the running log-decay through the block's first row
-    rowbase = (r.to(tl.int64) * H + h) * DK_
-    tl.store(QT + rowbase[:, None] + ch[None, :], q * tl.exp(carry[None, :] + fwd), mask=valid[:, None])
-
-
-@triton.jit
-def _kda_solve(A, a_stride, ALOG, DTB, lower, rows, off, H, L, T, GL,
-               DK_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, PREC: tl.constexpr):
-    """Program (sub-chunk, head): T = (I + L)^-1 in 16-row blocks (T_bb by forward substitution, T_bj = -T_bb
-    sum_{j<=m<b} L_bm T_mj), and the sub-chunk's total log-decay GL."""
-
-    NB: tl.constexpr = BT // BC
-    c = tl.program_id(0)
-    h = tl.program_id(1)
-    i = tl.arange(0, BC)
-    ch = tl.arange(0, DK_)
-    hd = h * DK_
-    base = (c.to(tl.int64) * H + h) * BT * BT
-    Ts = ()
-    for b in tl.static_range(NB):
-        Lrow = ()
-        for j in tl.static_range(b + 1):
-            Lrow = Lrow + (tl.load(L + base + (b * BC + i)[:, None] * BT + j * BC + i[None, :]),)
-        Tbb = _tri_inv(Lrow[b], BC)
-        Trow = ()
-        for j in tl.static_range(b):
-            X = tl.zeros((BC, BC), dtype=tl.float32)
-            for m in tl.static_range(j, b):
-                X += tl.dot(Lrow[m], Ts[m][j], input_precision=PREC)
-            Trow = Trow + (-tl.dot(Tbb, X, input_precision=PREC),)
-        Trow = Trow + (Tbb,)
-        Ts = Ts + (Trow,)
-        for j in tl.static_range(b + 1):
-            tl.store(T + base + (b * BC + i)[:, None] * BT + j * BC + i[None, :], Trow[j])
-    rate = _expf(tl.load(ALOG + h))
-    dtb = tl.load(DTB + hd + ch)
-    carry = tl.zeros((DK_,), dtype=tl.float32)
-    for b in range(0, NB):
-        r = c * BT - off + b * BC + i
-        carry = _row(_gates(A, a_stride, r, (r >= 0) & (r < rows), hd, ch, rate, dtb, lower, carry), i, BC - 1)
-    tl.store(GL + (c.to(tl.int64) * H + h) * DK_ + ch, carry)
-
-
-@triton.jit
-def _kda_wu(P, p_stride, b_off, A, a_stride, CS, CW, ALOG, DTB, lower, rows, off, H, T, W, U, KE,
-            DK_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, TAPS_: tl.constexpr, PREC: tl.constexpr):
-    """Program (sub-chunk, head, 16-row block b): W_b = sum_{j<=b} T_bj (beta k e^G)_j, U_b = sum_{j<=b} T_bj
-    (beta v)_j (the WY / UT transform), and block b's keys decayed to the sub-chunk's end (KE = k e^(GL - G), the
-    exponent summed backward from the end: a few ulps of its own size)."""
-
-    NB: tl.constexpr = BT // BC
-    c = tl.program_id(0)
-    h = tl.program_id(1)
-    b = tl.program_id(2)
-    i = tl.arange(0, BC)
-    ch = tl.arange(0, DK_)
-    C3 = 3 * H * DK_
-    hd = h * DK_
-    rate = _expf(tl.load(ALOG + h))
-    dtb = tl.load(DTB + hd + ch)
-    r0 = c * BT - off
-    tbase = (c.to(tl.int64) * H + h) * BT * BT + (b * BC + i)[:, None] * BT + i[None, :]
-    rb = r0 + b * BC + i
-    vb = (rb >= 0) & (rb < rows)
-    rowbase = (rb.to(tl.int64) * H + h) * DK_
-    later = tl.zeros((DK_,), dtype=tl.float32)                   # log-decay of the blocks after b, last first
-    for jj in range(0, NB - 1 - b):
-        rj = r0 + (NB - 1 - jj) * BC + i
-        later += tl.sum(_logdecay(A, a_stride, rj, (rj >= 0) & (rj < rows), hd, ch, rate, dtb, lower), axis=0)
-    wv = tl.zeros((BC, DK_), dtype=tl.float32)
-    uv = tl.zeros((BC, DK_), dtype=tl.float32)
-    carry = tl.zeros((DK_,), dtype=tl.float32)
-    for j in range(0, b + 1):
-        rj = r0 + j * BC + i
-        vj = (rj >= 0) & (rj < rows)
-        lj = _logdecay(A, a_stride, rj, vj, hd, ch, rate, dtb, lower)
-        Gj = carry[None, :] + tl.cumsum(lj, axis=0)
-        carry = _row(Gj, i, BC - 1)
-        kj = _l2(_conv_act(P, p_stride, CS, CW, rj, vj, H * DK_ + hd + ch, C3, BC, DK_, TAPS_))
-        if j == b:
-            ke = kj * tl.exp(later[None, :] + (tl.cumsum(lj, axis=0, reverse=True) - lj))     # GL - G
-            tl.store(KE + rowbase[:, None] + ch[None, :], ke, mask=vb[:, None])
-        bj = _beta(P, p_stride, b_off, h, rj, vj)
-        vv = _conv_act(P, p_stride, CS, CW, rj, vj, 2 * H * DK_ + hd + ch, C3, BC, DK_, TAPS_)
-        tbj = tl.load(T + tbase + j * BC)
-        wv += tl.dot(tbj, bj[:, None] * kj * tl.exp(Gj), input_precision=PREC)
-        uv += tl.dot(tbj, bj[:, None] * vv, input_precision=PREC)
-    tl.store(W + rowbase[:, None] + ch[None, :], wv, mask=vb[:, None])
-    tl.store(U + rowbase[:, None] + ch[None, :], uv, mask=vb[:, None])
-
-
-@triton.jit
-def _kda_state(S_IN, S_OUT, W, U, KE, GL, HB, rows, off, NC, H,
-               DK_: tl.constexpr, DV_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BV: tl.constexpr,
-               PREC: tl.constexpr):
-    """Program (head, value tile): the state S [BV value rows, K] from sub-chunk to sub-chunk (the only sequential
-    part), BC rows at a time: V'^T = U^T - S W^T (written over U), S <- S diag(e^GL) + V'^T KE. Saves each
-    sub-chunk's entering state (HB [NC, H, V, K], the state's layout)."""
-
-    h = tl.program_id(0)
-    v0 = tl.program_id(1) * BV
-    ki = tl.arange(0, DK_)
-    vi = v0 + tl.arange(0, BV)
-    i = tl.arange(0, BC)
-    sbase = h.to(tl.int64) * DV_ * DK_
-    S = tl.load(S_IN + sbase + vi[:, None] * DK_ + ki[None, :])               # [BV, K]
-    for c in range(NC):
-        cb = (c * H + h).to(tl.int64)
-        tl.store(HB + cb * DV_ * DK_ + vi[:, None] * DK_ + ki[None, :], S)
-        nxt = S * tl.exp(tl.load(GL + cb * DK_ + ki))[None, :]
-        for b in tl.static_range(BT // BC):
-            r = c * BT - off + b * BC + i
-            valid = (r >= 0) & (r < rows)
-            rowbase = (r.to(tl.int64) * H + h) * DK_
-            wb = tl.load(W + rowbase[:, None] + ki[None, :], mask=valid[:, None], other=0.0)     # [BC, K]
-            ub = tl.load(U + rowbase[:, None] + vi[None, :], mask=valid[:, None], other=0.0)     # [BC, BV]
-            vnt = tl.trans(ub) - tl.dot(S, tl.trans(wb), input_precision=PREC)                 # [BV, BC]
-            tl.store(U + rowbase[:, None] + vi[None, :], tl.trans(vnt), mask=valid[:, None])
-            kb = tl.load(KE + rowbase[:, None] + ki[None, :], mask=valid[:, None], other=0.0)     # [BC, K]
-            nxt += tl.dot(vnt, kb, input_precision=PREC)
-        S = nxt
-    tl.store(S_OUT + sbase + vi[:, None] * DK_ + ki[None, :], S)
-
-
-@triton.jit
-def _kda_out(QT, U, M, HB, G, g_stride, NW, eps, OUT, rows, off, H,
-             DK_: tl.constexpr, DV_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, KS: tl.constexpr,
-             PREC: tl.constexpr):
-    """Program (sub-chunk, head): read-outs O = QT S0^T + M V' rounded to bf16, then the gated RMSNorm."""
-
-    c = tl.program_id(0)
-    h = tl.program_id(1)
-    t = tl.arange(0, BT)
-    i = tl.arange(0, BC)
-    ks = tl.arange(0, KS)
-    vi = tl.arange(0, DV_)
-    r = c * BT - off + t
-    valid = (r >= 0) & (r < rows)
-    rowbase = (r.to(tl.int64) * H + h) * DK_
-    cb = (c * H + h).to(tl.int64)
-    o = tl.zeros((BT, DV_), dtype=tl.float32)
-    for k0 in tl.static_range(0, DK_, KS):
-        qt = tl.load(QT + rowbase[:, None] + k0 + ks[None, :], mask=valid[:, None], other=0.0)     # [BT, KS]
-        hs = tl.load(HB + cb * DV_ * DK_ + vi[:, None] * DK_ + k0 + ks[None, :])                   # [DV, KS]
-        o += tl.dot(qt, tl.trans(hs), input_precision=PREC)
-    for j in tl.static_range(BT // BC):
-        mq = tl.load(M + cb * BT * BT + t[:, None] * BT + (j * BC + i)[None, :], mask=(t >= j * BC)[:, None],
-                     other=0.0)                                                   # tiles above the diagonal: 0
-        rj = c * BT - off + j * BC + i
-        vn = tl.load(U + ((rj.to(tl.int64) * H + h) * DK_)[:, None] + vi[None, :],
-                     mask=((rj >= 0) & (rj < rows))[:, None], other=0.0)
-        o += tl.dot(mq, vn, input_precision=PREC)
-    y = _bf16(o)
-    rinv = tl.math.div_rn(1.0, tl.sqrt_rn(tl.sum(y * y, axis=1) * (1.0 / DV_) + eps))
-    yw = tl.load(NW + vi).to(tl.float32)[None, :] * (y * rinv[:, None])
-    gate = tl.load(G + r.to(tl.int64)[:, None] * g_stride + h * DV_ + vi[None, :], mask=valid[:, None], other=0.0)
-    res = yw * _sigmoid_f(gate.to(tl.float32))
-    tl.store(OUT + r.to(tl.int64)[:, None] * (H * DV_) + h * DV_ + vi[None, :], _bf16(res).to(tl.bfloat16),
-             mask=valid[:, None])
-
-
-# -- launcher ---------------------------------------------------------------------------------------------------
-PREC = os.environ.get("TF_GLM_KDA_PREC", "tf32x3")      # tl.dot input precision: tf32x3 (~fp32), tf32, ieee
-BV = int(os.environ.get("TF_GLM_KDA_BV", "16"))          # value rows of the state per sequential program
-STATE_ROWS = int(os.environ.get("TF_GLM_KDA_STATE_ROWS", "32"))   # rows per step of the sequential kernel
-KSPLIT = int(os.environ.get("TF_GLM_KDA_KSPLIT", "4"))   # K slices of the 16 x 16 x 128 products (1: one dot)
-# (num_warps, num_stages) per kernel. One stage everywhere: GB10 (sm_121) gives a block 99 KiB of shared memory
-# (101,376 B), and pipelined loads of the per-block loops need up to 154 KiB.
-LAUNCH = {"lm": (8, 1), "solve": (4, 1), "wu": (8, 1), "state": (8, 1), "out": (8, 1)}
-_EXACT = dict(enable_fp_fusion=False, enable_reflect_ftz=False)   # kda.cu's arithmetic (see _PRECISE)
-_scratch: dict = {}
-
-
-class ChunkScratch:
-    """Intermediates of a prompt chunk of up to ``rows`` rows (one set per head count and device, shared by layers)."""
-
-    def __init__(self, rows: int, heads: int, device) -> None:
-        f32 = torch.float32
-        nc = -(-(rows + CHUNK - 1) // CHUNK)          # room for a short first sub-chunk
-        self.rows, self.nc = rows, nc
-        self.qt = torch.empty((rows, heads, DK), dtype=f32, device=device)
-        self.w = torch.empty((rows, heads, DK), dtype=f32, device=device)
-        self.u = torch.empty((rows, heads, DV), dtype=f32, device=device)
-        self.ke = torch.empty((rows, heads, DK), dtype=f32, device=device)
-        self.m = torch.empty((nc, heads, CHUNK, CHUNK), dtype=f32, device=device)
-        self.l = torch.empty((nc, heads, CHUNK, CHUNK), dtype=f32, device=device)
-        self.t = torch.empty((nc, heads, CHUNK, CHUNK), dtype=f32, device=device)
-        self.gl = torch.empty((nc, heads, DK), dtype=f32, device=device)
-        self.hb = torch.empty((nc, heads, DV, DK), dtype=f32, device=device)
-
-
-def scratch_for(rows: int, heads: int, device) -> ChunkScratch:
-    key = (heads, str(device))
-    s = _scratch.get(key)
-    if s is None or s.rows < rows:
-        s = ChunkScratch(max(rows, CHUNK), heads, device)
-        _scratch[key] = s
-    return s
+    here = Path(__file__).parent
+    return load(name="tensorfold_glm_kda_chunk", sources=[str(here / "kda_chunk.cpp"), str(here / "kda_chunk.cu")],
+                extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
 def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
           norm_w: torch.Tensor, eps: float, lower: float, rows: int, out: torch.Tensor, state_out: torch.Tensor,
-          pos: int = 0, *, prec: str | None = None, bv: int | None = None) -> torch.Tensor:
+          pos: int = 0) -> torch.Tensor:
     """kda.chain for a prompt chunk in chunked form: projection rows p [q | k | v | ... | b at b_off ...], bf16 gate
     rows a (decay) and g (output gate), conv state [3, 3 H 128] (read, not shifted), state_in -> state_out
     [H, 128, 128]; ``pos`` is the first row's absolute position. Writes out[:rows] (bf16 [rows, H * 128])."""
 
-    H = a_log.numel()
     rows = int(rows)
-    if rows < 1 or p.shape[0] < rows or out.shape[0] < rows:
-        raise ValueError("rows")
-    if conv_w.shape != (3 * H * DK, TAPS) or conv_state.shape[0] != TAPS - 1:
-        raise ValueError("the chunked KDA path is written for 4-tap convolutions of 3 x H x 128 channels")
-    for x in (conv_state, conv_w, state_in, state_out, out, dt_bias, a_log, norm_w):
-        if not x.is_contiguous():
-            raise ValueError("conv state, conv weight, states, out and the per-head weights must be contiguous")
-    if p.stride(1) != 1 or a.stride(1) != 1 or g.stride(1) != 1:
-        raise ValueError("projection and gate rows must be contiguous along the channels")
-    prec = prec or PREC
-    bv = bv or BV
-    off = int(pos) % CHUNK
-    nc = -(-(rows + off) // CHUNK)
-    s = scratch_for(rows, H, p.device)
-    nb = CHUNK // BLOCK
-    _kda_lm[(nc, H, nb)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, float(lower),
-                         rows, off, H, s.qt, s.l, s.m,
-                         DK_=DK, BT=CHUNK, BC=BLOCK, GR=GROUP, TAPS_=TAPS, KSPLIT=KSPLIT, PREC=prec,
-                         num_warps=LAUNCH["lm"][0], num_stages=LAUNCH["lm"][1], **_EXACT)
-    _kda_solve[(nc, H)](a, a.stride(0), a_log, dt_bias, float(lower), rows, off, H, s.l, s.t, s.gl,
-                        DK_=DK, BT=CHUNK, BC=BLOCK, PREC=prec, num_warps=LAUNCH["solve"][0],
-                        num_stages=LAUNCH["solve"][1], **_EXACT)
-    _kda_wu[(nc, H, nb)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, float(lower),
-                         rows, off, H, s.t, s.w, s.u, s.ke,
-                         DK_=DK, BT=CHUNK, BC=BLOCK, TAPS_=TAPS, PREC=prec, num_warps=LAUNCH["wu"][0],
-                         num_stages=LAUNCH["wu"][1], **_EXACT)
-    _kda_state[(H, DV // bv)](state_in, state_out, s.w, s.u, s.ke, s.gl, s.hb, rows, off, nc, H,
-                              DK_=DK, DV_=DV, BT=CHUNK, BC=STATE_ROWS, BV=bv, PREC=prec,
-                              num_warps=LAUNCH["state"][0], num_stages=LAUNCH["state"][1])
-    _kda_out[(nc, H)](s.qt, s.u, s.m, s.hb, g, g.stride(0), norm_w, float(eps), out, rows, off, H,
-                      DK_=DK, DV_=DV, BT=CHUNK, BC=BLOCK, KS=32, PREC=prec, num_warps=LAUNCH["out"][0],
-                      num_stages=LAUNCH["out"][1], **_EXACT)
+    _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
+                 dt_bias, norm_w, float(eps), float(lower), rows, int(pos) % CHUNK, out, state_out)
     return out[:rows]
