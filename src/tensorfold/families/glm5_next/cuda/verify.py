@@ -97,7 +97,9 @@ class BatchedVerify:
         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
         kda_layers = [l for l in w.layers if l.kind == "kda"]
         n = len(kda_layers)
-        LL = c.lin_heads // w.world
+        from .tp import of as layout_of
+
+        LL = layout_of(w).lin_heads
         width = kda_layers[0].kda.proj.n if kda_layers else 0
         self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
         self.dsa_index = {l.index: i for i, l in enumerate(l for l in w.layers if l.kind == "dsa")}

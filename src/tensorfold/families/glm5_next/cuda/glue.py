@@ -280,6 +280,23 @@ def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torc
     _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
 
 
+def hc_post_ranks(x: torch.Tensor, xout: torch.Tensor, first: torch.Tensor, stride: int, world: int,
+                  post: torch.Tensor, comb: torch.Tensor) -> None:
+    """``hc_post`` of ``world`` ranks' fp32 partials [R, D] that sit ``stride`` elements apart from rank 0's
+    (``first``): rows of one all-gathered [world, R', D] buffer (stride R' x D), the sum rank 0 first and every bit
+    hc_post's (TF_GLM_HC_SPLIT past two ranks)."""
+
+    rows, d = first.shape
+    if first.dtype != torch.float32 or not first.is_contiguous():
+        raise ValueError("hc_post_ranks: contiguous fp32 partials")
+    if not rows:
+        return
+    s = x.shape[1] // d
+    block = min(1024, d)
+    _hc_post[(rows, d // block)](x, xout, first, post, comb, int(stride), D=d, S=s, WORLD=int(world), BLOCK=block,
+                                 num_warps=4)
+
+
 @triton.jit
 def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
     """Plain residual (the MTP block): X = bf16(X + bf16(partials summed rank 0 first))."""

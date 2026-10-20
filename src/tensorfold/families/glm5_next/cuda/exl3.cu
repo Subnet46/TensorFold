@@ -989,20 +989,19 @@ void exl3_down_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// Decode windows (items of up to 16 pairs): ``dec_kernel`` with NT 8, 4 warps and 16 k steps a warp (both of GLM's
-// expert matmuls: gate/up K 4096 in 4 splits, down K 1024 in 1). fuse 0: Z as exl3_grouped_cuda; 1: Y (down); 2: Xd
-// (gate/up; ``done`` holds max_items * N / 128 zeroed ints).
-void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
-                   const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
-                   int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
-                   int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
-                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
-    constexpr int NT = 8, W = 4, STEPS = 16;
-    TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
-    TORCH_CHECK(K % (16 * SK * W) == 0 && K / (16 * SK * W) == STEPS && N % (16 * NT) == 0,
-                "decode expert kernel: 16 k steps a warp");
-    TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
-    TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
+// Decode windows (items of up to 16 pairs): ``dec_kernel`` with NT 8, 4 warps and K / 64 k steps a warp: gate/up K
+// 4096 in 4 splits (16 steps), down K = the rank's expert width in 1 (16 steps at two ranks' 1024; 8, 10 and 12 for
+// the 512 / 640 / 768 of three and four ranks: the grouped kernel's chains at that width, so the same bits as
+// TF_GLM_EXL3_DEC=0). fuse 0: Z as exl3_grouped_cuda; 1: Y (down); 2: Xd (gate/up; ``done`` holds max_items * N / 128
+// zeroed ints). The 16-byte loads run PD steps ahead where PD divides the steps (10 steps: at most 2).
+template <int STEPS>
+static void dec_launch(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
+                       const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
+                       int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
+                       int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
+                       const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
+    constexpr int NT = 8, W = 4;
+    constexpr int PD4 = STEPS % 4 == 0 ? 4 : 2;
     dim3 grid((unsigned)max_items, (unsigned)(N / (16 * NT)), (unsigned)(mats * SK));
     auto stream = at::cuda::getCurrentCUDAStream();
     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
@@ -1016,12 +1015,39 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
     if (ld == 0) DEC1(F_, XR_, 0, 1);                                                                             \
     else if (ld == 1) DEC1(F_, XR_, 1, 1);                                                                        \
     else if (ld == 2) DEC1(F_, XR_, 1, 2);                                                                        \
-    else DEC1(F_, XR_, 1, 4)
-    if (fuse == 0) { if (xrow) { DEC(0, true); } else { DEC(0, false); } }
-    else if (fuse == 1) { if (xrow) { DEC(1, true); } else { DEC(1, false); } }
-    else { if (xrow) { DEC(2, true); } else { DEC(2, false); } }
+    else DEC1(F_, XR_, 1, PD4)
+    if constexpr (STEPS == 16) {                     // every matrix: gate/up (fuse 0 / 2, xrow) and two ranks' down
+        if (fuse == 0) { if (xrow) { DEC(0, true); } else { DEC(0, false); } }
+        else if (fuse == 1) { if (xrow) { DEC(1, true); } else { DEC(1, false); } }
+        else { if (xrow) { DEC(2, true); } else { DEC(2, false); } }
+    } else {                                         // only the down projection of 3 or 4 ranks (one matrix)
+        TORCH_CHECK(mats == 1 && !xrow && fuse != 2, "decode expert kernel: ", STEPS,
+                    " k steps a warp only for the down projection");
+        if (fuse == 0) { DEC(0, false); } else { DEC(1, false); }
+    }
 #undef DEC
 #undef DEC1
+}
+
+void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
+                   const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
+                   int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
+                   int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
+                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
+    constexpr int NT = 8, W = 4;
+    TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
+    TORCH_CHECK(K % (16 * SK * W) == 0 && N % (16 * NT) == 0, "decode expert kernel: whole k steps a warp");
+    TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
+    TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
+    const int64_t steps = K / (16 * SK * W);
+#define ARGS X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow, sv0, sv1, \
+             su2, out, limit, done, ld
+    if (steps == 16) dec_launch<16>(ARGS);
+    else if (steps == 12) dec_launch<12>(ARGS);
+    else if (steps == 10) dec_launch<10>(ARGS);
+    else if (steps == 8) dec_launch<8>(ARGS);
+    else TORCH_CHECK(false, "decode expert kernel: 8, 10, 12 or 16 k steps a warp, not ", steps);
+#undef ARGS
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

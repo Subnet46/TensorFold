@@ -200,17 +200,21 @@ def memory_fraction(ram_bytes: int) -> float | None:
 
 # the CUDA engine's kernels read MLX affine weights of this (bits, group size); EXL3 checkpoints are checked above
 CUDA_QUANTIZATION = (4, 64)
+CUDA_TP = (2, 3, 4)                    # GPUs (one per machine) the CUDA engine splits over
 
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
-    """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
+    """Build the N-rank engine (N = 2, 3 or 4) with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
 
-    if int(tp) != 2:
-        raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
-                         "with --tp 2 --rank R --master ADDRESS on both (rank 1 first)")
+    tp = int(tp)
+    if tp not in CUDA_TP:
+        raise ValueError("GLM-5.3-Flash needs two GPUs or more (2, 3 or 4), one per machine: run the same "
+                         "`tensorfold serve` command with --tp N --rank R --master ADDRESS on each (rank 0 last)")
     if not master:
-        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+        raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
+    if not 0 <= int(rank) < tp:
+        raise ValueError(f"--rank {rank}: 0 to {tp - 1} with --tp {tp}")
     from .cuda.engine import DEFAULT_POLICY, DFLASH_POLICY, GlmEngine
 
     if mtp_drafts is None:
@@ -219,7 +223,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         policy = DFLASH_POLICY          # no MTP drafts: every round still verifies DFlash2's drafts
     else:
         policy = str(int(mtp_drafts))
-    return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
+    return GlmEngine(Path(model_dir), rank=int(rank), world=tp, master=master, port=int(master_port), policy=policy,
                      drafter=Path(drafter) if drafter and not no_drafts else None,
                      context=options.get("context"), context_explicit=options.get("context_explicit"),
                      serial_only=bool(no_drafts), vision=bool(options.get("vision", False)),

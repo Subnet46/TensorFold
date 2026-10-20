@@ -233,9 +233,13 @@ class Drafter:
         self.D = int(cfg["hidden_size"])
         self.hd = int(cfg["head_dim"])
         heads, kv_heads = int(cfg["num_attention_heads"]), int(cfg["num_key_value_heads"])
-        if heads % self.world or kv_heads % self.world:
-            raise ValueError("drafter heads must split evenly over the ranks")
-        self.heads, self.kvh = heads // self.world, kv_heads // self.world
+        from .tp import draft_parts
+
+        # KV heads in whole query groups over the ranks (32 / 8 over 3: 12/12/8 query heads, 3/3/2 KV heads), the MLP
+        # in units of 128 (``tp.draft_parts``); two ranks: halves
+        qs, kvs, mlps = draft_parts(heads, kv_heads, int(cfg["intermediate_size"]), self.world)
+        self.heads, self.kvh = qs[self.rank], kvs[self.rank]
+        q0, kv0 = sum(qs[:self.rank]), sum(kvs[:self.rank])
         self.eps = float(cfg["rms_norm_eps"])
         theta = float(cfg["rope_parameters"]["rope_theta"])
         self.mask_id = int(dc["mask_token_id"])
@@ -247,11 +251,9 @@ class Drafter:
         self.tap_layers = tuple(int(i) for i in dc["target_layer_ids"])
         self.window = int(cfg["sliding_window"]) - 1
         self.causal = bool(cfg.get("is_causal", True))
-        inter = int(cfg["intermediate_size"])
-        if inter % self.world:
-            raise ValueError("drafter MLP must split evenly over the ranks")
-        self.inter = inter // self.world
-        r, H, KV, hd = self.rank, self.heads, self.kvh, self.hd
+        self.inter = mlps[self.rank]
+        m0 = sum(mlps[:self.rank])
+        H, KV, hd = self.heads, self.kvh, self.hd
         dev = self.dev
 
         def gpu(t: torch.Tensor) -> torch.Tensor:
@@ -272,13 +274,13 @@ class Drafter:
             self.layers: list[DraftLayer] = []
             for i in range(int(cfg["num_hidden_layers"])):
                 p = f"layers.{i}."
-                q = get(p + "self_attn.q_proj.weight")[r * H * hd:(r + 1) * H * hd]
-                k = get(p + "self_attn.k_proj.weight")[r * KV * hd:(r + 1) * KV * hd]
-                v = get(p + "self_attn.v_proj.weight")[r * KV * hd:(r + 1) * KV * hd]
-                o = get(p + "self_attn.o_proj.weight")[:, r * H * hd:(r + 1) * H * hd]
-                g = get(p + "mlp.gate_proj.weight")[r * self.inter:(r + 1) * self.inter]
-                u = get(p + "mlp.up_proj.weight")[r * self.inter:(r + 1) * self.inter]
-                dn = get(p + "mlp.down_proj.weight")[:, r * self.inter:(r + 1) * self.inter]
+                q = get(p + "self_attn.q_proj.weight")[q0 * hd:(q0 + H) * hd]
+                k = get(p + "self_attn.k_proj.weight")[kv0 * hd:(kv0 + KV) * hd]
+                v = get(p + "self_attn.v_proj.weight")[kv0 * hd:(kv0 + KV) * hd]
+                o = get(p + "self_attn.o_proj.weight")[:, q0 * hd:(q0 + H) * hd]
+                g = get(p + "mlp.gate_proj.weight")[m0:m0 + self.inter]
+                u = get(p + "mlp.up_proj.weight")[m0:m0 + self.inter]
+                dn = get(p + "mlp.down_proj.weight")[:, m0:m0 + self.inter]
                 for conv in ("attention_conv", "mlp_conv"):
                     if tuple(get(p + conv + ".base_kernel").shape) != (2, 2, self.D):
                         raise ValueError(f"unexpected {conv} base kernel shape")

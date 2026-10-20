@@ -229,10 +229,17 @@ class Weights:
     comm: Any = None
     meta: dict = field(default_factory=dict)
     draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose)
+    tp: Any = None                    # the rank's ``tp.Layout`` (None: made from cfg, rank and world)
+
+    def __post_init__(self) -> None:
+        if self.tp is None:
+            from .tp import Layout
+
+            self.tp = Layout.from_config(self.cfg, self.rank, self.world)
 
     @property
     def vocab_offset(self) -> int:
-        return self.rank * (self.cfg.vocab // self.world)
+        return self.tp.vocab_offset
 
     def nbytes(self) -> int:
         total = 0
@@ -355,21 +362,23 @@ def exl3_route(model_dir: str, rank: int, world: int) -> str:
     return route
 
 
-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
-    """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
+def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cuda", mtp: bool = True) -> Weights:
+    """Rank ``rank`` of ``world`` from a checkpoint or rank folder (``tp.Layout``'s shares), MTP included unless
+    ``mtp`` is False, with its rows of the head."""
 
     from .split import RankReader
+    from .tp import Layout
 
-    world = 2
     cfg = Config.read(model_dir)
+    lay = Layout.from_config(cfg, rank, world)
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
     dev = torch.device(device)
     route = exl3_route(str(model_dir), rank, world) if exl3 else ""
-    rd = RankReader(model_dir, rank)
-    HL = cfg.heads // world
-    LL = cfg.lin_heads // world
+    rd = RankReader(model_dir, rank, world)
+    HL = lay.heads
+    LL = lay.lin_heads
 
     def t(name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
         x = rd.get(PREFIX + name)
@@ -555,23 +564,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     try:                                          # a failed load still cancels the reads queued ahead
         which = list(range(cfg.layers))
         built = [layer(i) for i in which]
-        vl = cfg.vocab // world
+        v0, v1 = lay.vocab_offset, lay.vocab_offset + lay.vocab
         draft_head = None
         if exl3:
-            raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
+            raw = rd.get("lm_head.weight")[v0:v1].to(dev)
             head = dense(raw)
             # Draft steps use a 4-bit copy (TF_GLM_DRAFT_QUANT: minmax or mse ranges); verification keeps the head.
             draft_head = draft_quantize4(raw)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
-            head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
-                           hb[rank * vl:(rank + 1) * vl].to(dev))
+            head = make_q4(as_i32(hw[v0:v1]).to(dev), hs[v0:v1].to(dev), hb[v0:v1].to(dev))
         mtpw = None
         if cfg.mtp_layers and mtp:
             i = cfg.layers
             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
-        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
+        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head, tp=lay)
         w.meta.update(layers=which, exl3_route=route)
     finally:
         rd.close()

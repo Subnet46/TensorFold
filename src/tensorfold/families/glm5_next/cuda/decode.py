@@ -12,7 +12,7 @@ import torch
 from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
-from . import glue, prof, qmm
+from . import glue, prof, qmm, tp
 from .forward import Buffers, State, chunks_for, commit, compute, stage
 from .mtp import mtp_compute, mtp_forward, mtp_stage
 from .sparse import pool_bucket
@@ -111,7 +111,7 @@ class Engine:
         if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
             from . import kda as kda_mod
 
-            kda_mod.reserve(max(max_rows, prefill_rows), w.cfg.lin_heads // w.world, w.device)
+            kda_mod.reserve(max(max_rows, prefill_rows), tp.of(w).lin_heads, w.device)
         self.buf = Buffers(w, max_rows, capacity)
         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
         if taps:

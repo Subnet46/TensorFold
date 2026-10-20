@@ -141,6 +141,30 @@ class NCCL:
         finally:
             self._check(self.lib.ncclGroupEnd())
 
+    def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
+        """One NCCL group on the current stream with several peers: every ``sends[p][i]`` to peer p and
+        ``recvs[p][i]`` from it (an all-to-all of row blocks; each peer's matching call names this rank with the
+        same sizes and dtypes in the same order)."""
+
+        if set(sends) != set(recvs) or any(p == self.rank or not 0 <= p < self.world for p in sends):
+            raise ValueError("exchange_all: sends and receives with the same other ranks")
+        for p in sends:
+            if len(sends[p]) != len(recvs[p]):
+                raise ValueError("exchange_all: one receive per send")
+            for s, r in zip(sends[p], recvs[p]):
+                if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+                    raise ValueError("exchange_all: each send and receive must be contiguous and alike")
+        stream = torch.cuda.current_stream().cuda_stream
+        self._check(self.lib.ncclGroupStart())
+        try:
+            for p in sorted(sends):
+                for s, r in zip(sends[p], recvs[p]):
+                    if s.numel():
+                        self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], p, self.comm, stream))
+                        self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], p, self.comm, stream))
+        finally:
+            self._check(self.lib.ncclGroupEnd())
+
     def barrier(self) -> None:
         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")

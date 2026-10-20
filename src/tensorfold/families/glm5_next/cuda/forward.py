@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse
+from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 
@@ -42,8 +42,8 @@ class Buffers:
         dev = w.device
         bf, f32 = torch.bfloat16, torch.float32
         D, S = c.hidden, c.streams
-        HL = c.heads // w.world
-        LL = c.lin_heads // w.world
+        HL = tp.of(w).heads
+        LL = tp.of(w).lin_heads
         self.rows, self.prefill = rows, prefill
         head_rows = 1 if prefill else rows
         self.world = w.world
@@ -95,13 +95,13 @@ class Buffers:
         self.igr = torch.empty((rows, c.index_dim), dtype=f32, device=dev)
         self.qi = torch.empty((rows, c.index_heads * c.index_dim), dtype=bf, device=dev)
         # dense MLP
-        dl = c.dense_width // w.world
+        dl = tp.of(w).dense
         self.gu = torch.empty((rows, 2 * dl), dtype=bf, device=dev)
         self.act = torch.empty((rows, dl), dtype=bf, device=dev)
         self.xs_act = torch.empty((rows, dl // 64), dtype=f32, device=dev)
         # MoE
         slots = c.top_k + 1
-        ml = c.moe_width // w.world
+        ml = tp.of(w).moe
         self.mlog = torch.empty((rows, c.experts), dtype=f32, device=dev)
         self.pick = torch.empty((rows, slots), dtype=torch.int32, device=dev)
         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
@@ -114,7 +114,7 @@ class Buffers:
         self.exl3 = None
         prompt = False
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
-            sl = c.shared_width // w.world
+            sl = tp.of(w).shared
             if universal:
                 shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
                 self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
@@ -198,7 +198,7 @@ class Caches:
 
         c = w.cfg
         dev = w.device
-        HL = c.heads // w.world
+        HL = tp.of(w).heads
         dsa = len([l for l in w.layers if l.kind == "dsa"])
         self.latent = latent.ENABLED
         if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
@@ -287,7 +287,7 @@ class Slots:
     def __init__(self, w: Weights, count: int, rows: int) -> None:
         c = w.cfg
         dev = w.device
-        LL = c.lin_heads // w.world
+        LL = tp.of(w).lin_heads
         kda_layers = [l for l in w.layers if l.kind == "kda"]
         n = len(kda_layers)
         width = kda_layers[0].kda.proj.n if kda_layers else 0
@@ -309,7 +309,7 @@ def slot_bytes(w: Weights, rows: int) -> int:
     """Device bytes one more stream slot takes (``Slots``), without allocating it."""
 
     c = w.cfg
-    LL = c.lin_heads // w.world
+    LL = tp.of(w).lin_heads
     kda_layers = [l for l in w.layers if l.kind == "kda"]
     n = len(kda_layers)
     width = kda_layers[0].kda.proj.n if kda_layers else 0

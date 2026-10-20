@@ -1,6 +1,10 @@
 // Adapted from b12x (https://github.com/local-inference-lab/b12x), b12x/comm/roce/_roce_proxy.c at commit
 // 8a99d639410e39d5f39cb4037675331beceea1d4: "RoCEnante", Copyright the b12x contributors, Apache License 2.0
-// (http://www.apache.org/licenses/LICENSE-2.0). Unchanged except this header. Used by tensorfold/cuda/roce.py.
+// (http://www.apache.org/licenses/LICENSE-2.0). Used by tensorfold/cuda/roce.py. Changes from b12x's file (TensorFold,
+// 2026-10-01, ABI 5): up to 4 HCAs, a GID index per HCA, and routes: each peer's stripes go over chosen (local HCA,
+// peer HCA) pairs (roce_set_route; default HCA h to the peer's HCA h, every HCA), so ranks cabled to each other
+// directly (a triangle of Sparks: one /24 and two rails a pair) reach each peer over its own rails only. Flags are
+// indexed by stripe (``n_flag`` stripes a peer, the same for every peer).
 
 // RDMA proxy for the b12x RoCE one-shot all-reduce.
 //
@@ -40,12 +44,12 @@
 #include <time.h>
 
 #define ROCE_MAX_PEERS 16
-#define ROCE_MAX_HCAS 2
+#define ROCE_MAX_HCAS 4
 #define ROCE_SLOTS 2
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 256
-#define ROCE_ABI_VERSION 4
+#define ROCE_ABI_VERSION 5
 // Model graphs leave sub-millisecond gaps between collectives.  Keep the
 // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
 // every collective on the graph's critical path.
@@ -78,8 +82,13 @@ typedef struct {
     int world;
     int rank;
     int n_hca;
-    int gid_index;
+    int gid_index[ROCE_MAX_HCAS];
     int traffic_class;
+    // routes: stripe s to peer p leaves on local HCA stripe_hca[p][s] for the peer's HCA stripe_remote[p][s]
+    int n_stripe[ROCE_MAX_PEERS];
+    int stripe_hca[ROCE_MAX_PEERS][ROCE_MAX_HCAS];
+    int stripe_remote[ROCE_MAX_PEERS][ROCE_MAX_HCAS];
+    int n_flag;                      // stripes (flags) a peer, the same for every peer and on every rank
     roce_hca_t hca[ROCE_MAX_HCAS];
     uint8_t *region;
     size_t region_bytes;
@@ -90,7 +99,7 @@ typedef struct {
     size_t ctrl_off;
     int started;
     uint64_t peer_addr[ROCE_MAX_PEERS];
-    uint32_t peer_rkey[ROCE_MAX_HCAS][ROCE_MAX_PEERS];
+    uint32_t peer_rkey[ROCE_MAX_HCAS][ROCE_MAX_PEERS];   // by stripe
     pthread_t thread;
     atomic_int running;
     atomic_int failed;
@@ -179,7 +188,7 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
     }
     hca->lid = port.lid;
     hca->mtu = port.active_mtu;
-    if (ibv_query_gid(hca->ctx, ROCE_PORT, c->gid_index, &hca->gid) != 0) {
+    if (ibv_query_gid(hca->ctx, ROCE_PORT, c->gid_index[h], &hca->gid) != 0) {
         set_err(c, "ibv_query_gid", errno);
         return -1;
     }
@@ -235,7 +244,7 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
 }
 
 roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n_hca,
-                        int gid_index, int traffic_class, void *region, uint64_t region_bytes,
+                        const int *gid_index, int traffic_class, void *region, uint64_t region_bytes,
                         uint64_t slot_bytes, char *err, uint64_t err_len) {
     uint64_t layout[7];
     if (roce_layout(world, slot_bytes, layout) != 0 || layout[4] > region_bytes ||
@@ -252,7 +261,17 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
     c->world = world;
     c->rank = rank;
     c->n_hca = n_hca;
-    c->gid_index = gid_index;
+    for (int h = 0; h < n_hca; h++) {
+        c->gid_index[h] = gid_index[h];
+    }
+    for (int p = 0; p < world; p++) {           // default routes: HCA h to the peer's HCA h, every HCA
+        c->n_stripe[p] = p == rank ? 0 : n_hca;
+        for (int h = 0; h < n_hca; h++) {
+            c->stripe_hca[p][h] = h;
+            c->stripe_remote[p][h] = h;
+        }
+    }
+    c->n_flag = n_hca;
     c->traffic_class = traffic_class;
     c->region = region;
     c->region_bytes = region_bytes;
@@ -269,6 +288,26 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
         }
     }
     return c;
+}
+
+int roce_set_routes(roce_ctx_t *c, int peer, int n, const int *local, const int *remote, int n_flag) {
+    // before roce_connect: peer's stripes (n of them) over (local[s], remote[s]); n_flag: the stripes every peer has
+    if (c->started || peer < 0 || peer >= c->world || peer == c->rank || n < 1 || n > ROCE_MAX_HCAS ||
+        n != n_flag || n_flag > ROCE_MAX_HCAS) {
+        snprintf(c->err, sizeof(c->err), "invalid RoCE route to rank %d (%d stripes, %d a peer)", peer, n, n_flag);
+        return -1;
+    }
+    for (int s = 0; s < n; s++) {
+        if (local[s] < 0 || local[s] >= c->n_hca || remote[s] < 0 || remote[s] >= ROCE_MAX_HCAS) {
+            snprintf(c->err, sizeof(c->err), "invalid RoCE route to rank %d: stripe %d", peer, s);
+            return -1;
+        }
+        c->stripe_hca[peer][s] = local[s];
+        c->stripe_remote[peer][s] = remote[s];
+    }
+    c->n_stripe[peer] = n;
+    c->n_flag = n_flag;
+    return 0;
 }
 
 int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
@@ -291,23 +330,24 @@ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
     return 0;
 }
 
-static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer) {
+static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer, int rh) {
+    // local HCA h's QP for peer p <-> the peer's HCA rh's QP for this rank
     roce_hca_t *hca = &c->hca[h];
     struct ibv_qp_attr rtr;
     memset(&rtr, 0, sizeof(rtr));
     rtr.qp_state = IBV_QPS_RTR;
-    rtr.path_mtu = (enum ibv_mtu)(peer->mtu[h] < (uint32_t)hca->mtu ? peer->mtu[h] : (uint32_t)hca->mtu);
-    rtr.dest_qp_num = peer->qp_num[h][c->rank];
+    rtr.path_mtu = (enum ibv_mtu)(peer->mtu[rh] < (uint32_t)hca->mtu ? peer->mtu[rh] : (uint32_t)hca->mtu);
+    rtr.dest_qp_num = peer->qp_num[rh][c->rank];
     rtr.rq_psn = 0;
     rtr.max_dest_rd_atomic = 1;
     rtr.min_rnr_timer = 12;
     rtr.ah_attr.is_global = 1;
-    rtr.ah_attr.dlid = peer->lid[h];
+    rtr.ah_attr.dlid = peer->lid[rh];
     rtr.ah_attr.sl = 0;
     rtr.ah_attr.src_path_bits = 0;
     rtr.ah_attr.port_num = ROCE_PORT;
-    memcpy(rtr.ah_attr.grh.dgid.raw, peer->gid[h], 16);
-    rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index;
+    memcpy(rtr.ah_attr.grh.dgid.raw, peer->gid[rh], 16);
+    rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index[h];
     rtr.ah_attr.grh.hop_limit = 64;
     rtr.ah_attr.grh.traffic_class = (uint8_t)c->traffic_class;
     rtr.ah_attr.grh.flow_label = 0;
@@ -347,9 +387,15 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
             continue;
         }
         c->peer_addr[p] = all[p].region_addr;
-        for (int h = 0; h < c->n_hca; h++) {
-            c->peer_rkey[h][p] = all[p].rkey[h];
-            if (connect_qp(c, h, p, &all[p]) != 0) {
+        if (c->n_stripe[p] != c->n_flag) {
+            snprintf(c->err, sizeof(c->err), "rank %d has %d stripes, every peer needs %d", p, c->n_stripe[p],
+                     c->n_flag);
+            return -1;
+        }
+        for (int s = 0; s < c->n_stripe[p]; s++) {
+            const int h = c->stripe_hca[p][s], rh = c->stripe_remote[p][s];
+            c->peer_rkey[s][p] = all[p].rkey[rh];
+            if (connect_qp(c, h, p, &all[p], rh) != 0) {
                 return -1;
             }
         }
@@ -395,7 +441,9 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
             continue;
         }
         uint32_t pack_offset = 0;
-        for (int h = 0; h < c->n_hca; h++) {
+        const int n_stripe = c->n_stripe[p];
+        for (int s = 0; s < n_stripe; s++) {
+            const int h = c->stripe_hca[p][s];
             roce_hca_t *hca = &c->hca[h];
             // Two work requests per stripe; keep the queue at most a quarter
             // full so a provider that needs extra entries can never fail a post.
@@ -413,8 +461,8 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
                     return -1;
                 }
             }
-            uint32_t stripe_packs = total_packs / (uint32_t)c->n_hca;
-            if ((uint32_t)h < total_packs % (uint32_t)c->n_hca) {
+            uint32_t stripe_packs = total_packs / (uint32_t)n_stripe;
+            if ((uint32_t)s < total_packs % (uint32_t)n_stripe) {
                 stripe_packs += 1;
             }
             uint32_t stripe_bytes = stripe_packs * 16;
@@ -434,9 +482,9 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
             flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
             flag_wr.wr.rdma.remote_addr =
                 remote + c->flag_off +
-                (((uint64_t)c->rank * ROCE_SLOTS + slot) * (uint64_t)c->n_hca +
-                 (uint64_t)h) * ROCE_FLAG_STRIDE;
-            flag_wr.wr.rdma.rkey = c->peer_rkey[h][p];
+                (((uint64_t)c->rank * ROCE_SLOTS + slot) * (uint64_t)c->n_flag +
+                 (uint64_t)s) * ROCE_FLAG_STRIDE;
+            flag_wr.wr.rdma.rkey = c->peer_rkey[s][p];
 
             struct ibv_send_wr data_wr;
             struct ibv_sge data_sge;
@@ -457,7 +505,7 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
                     remote + c->recv_off +
                     ((uint64_t)c->rank * ROCE_SLOTS + slot) * c->slot_bytes +
                     byte_offset;
-                data_wr.wr.rdma.rkey = c->peer_rkey[h][p];
+                data_wr.wr.rdma.rkey = c->peer_rkey[s][p];
                 first_wr = &data_wr;
             }
             struct ibv_send_wr *bad = NULL;

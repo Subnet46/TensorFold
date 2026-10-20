@@ -466,9 +466,10 @@ class MultiDecoder:
         if ready is not None:
             ready.record()
         comm = self.g.comm
-        got = torch.empty((2,), dtype=torch.int32, device=dev)
+        world = self.g.world
+        got = torch.empty((world,), dtype=torch.int32, device=dev)
         comm.all_gather(length, got)
-        allv = torch.empty((2 * n,), dtype=torch.int32, device=dev)
+        allv = torch.empty((world * n,), dtype=torch.int32, device=dev)
         comm.all_gather(vals[:n], allv)
 
     def _time_rows(self, reps: int = 5) -> list[float]:
@@ -480,9 +481,10 @@ class MultiDecoder:
             raise ValueError("TF_GLM_MULTI_DEPTH=joint needs the batched verify window's graphs "
                              "(TF_GLM_MULTI_VERIFY=batched, TF_GLM_MULTI_GRAPHS=1)")
         mine = torch.tensor(v.time_rows(reps), dtype=torch.float32, device=self.w.device)
-        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device=self.w.device)
+        world = self.g.world
+        got = torch.empty((world * mine.numel(),), dtype=torch.float32, device=self.w.device)
         self.g.comm.all_gather(mine, got)
-        return [float(x) for x in got.view(2, -1).max(dim=0).values.tolist()]
+        return [float(x) for x in got.view(world, -1).max(dim=0).values.tolist()]
 
     def _compare_paths(self, reps: int = 5) -> None:
         """TF_GLM_MULTI_PROFILE (at startup, on both ranks: the graphs all-gather; rank 0 prints): a lone stream's

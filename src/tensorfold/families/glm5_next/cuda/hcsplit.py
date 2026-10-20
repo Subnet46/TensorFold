@@ -1,4 +1,4 @@
-"""TF_GLM_HC_SPLIT=1: a prompt chunk's hyper-connection glue split by rows between the two ranks (decode untouched).
+"""TF_GLM_HC_SPLIT=1: a prompt chunk's hyper-connection glue split by rows between the ranks (decode untouched).
 
 Unsplit, each exchange site (after the attention block and after the MLP/MoE block) all-gathers both ranks' fp32
 partials [R, D], and both ranks run hc_post and the next hc_pre over all R rows. Split, rank r owns rows
@@ -109,15 +109,29 @@ class SplitSettings:
 
 
 class HcSplit:
-    """One prompt buffer's row split: rows, pieces, the second stream and its events."""
+    """One prompt buffer's row split: rows, pieces, the second stream and its events.
+
+    Past two ranks (``world`` N): rank r owns rows [r H, r H + H), H = ceil(R / N) (pad rows zero, never read).
+    p2p: each rank sends every peer its partial of that peer's rows and receives each peer's partial of its own rows
+    into a [N, n, D] staging block a piece (its own partial copied into its slot), summed rank 0 first by hc_post
+    (``exchange_all``: one NCCL group, every pair a send and a receive, so it needs every pair connected); its glued
+    rows go to every peer the same way. gather (for fabrics without every pair, e.g. a ring): the unsplit all-gather
+    of every rank's whole partial, glue on own rows (``glue.hc_post_ranks``), then the in-place all-gather of the
+    rows. Either way the partial sums are hc_post's, rank 0 first: the unsplit bits."""
 
     def __init__(self, w, b, settings: SplitSettings) -> None:
-        if w.world != 2 or w.comm is None or (settings.exchange == "p2p" and not hasattr(w.comm, "exchange")):
-            raise ValueError("TF_GLM_HC_SPLIT needs two ranks and a communicator with exchange (send/receive), "
-                             "or TF_GLM_HC_EXCHANGE=gather")
+        world = int(getattr(w, "world", 2))
+        two = world == 2
+        p2p = settings.exchange == "p2p"
+        if world < 2 or w.comm is None or (p2p and not hasattr(w.comm, "exchange" if two else "exchange_all")):
+            raise ValueError("TF_GLM_HC_SPLIT needs two ranks or more and a communicator with exchange "
+                             "(send/receive), or TF_GLM_HC_EXCHANGE=gather")
         self.w, self.b, self.settings = w, b, settings
-        self.rank, self.peer = w.rank, 1 - w.rank
-        self.gather = settings.exchange == "gather"
+        self.world = world
+        self.rank = w.rank
+        self.peer = 1 - w.rank if two else None
+        self.peers = [r for r in range(world) if r != w.rank]
+        self.gather = not p2p
         # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
         self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
         self.active = False
@@ -136,38 +150,52 @@ class HcSplit:
             self.ev_glue = [torch.cuda.Event() for _ in range(n)]
             self.ev_done = torch.cuda.Event()
 
+    def padded(self, R: int) -> int:
+        """R rounded up to a whole share a rank (two ranks: an odd chunk gets one pad row)."""
+        return -(-R // self.world) * self.world
+
     def applies(self, R: int) -> bool:
-        return R >= self.settings.min_rows and R + (R & 1) <= self.b.rows
+        return R >= self.settings.min_rows and self.padded(R) <= self.b.rows
 
     def warm(self) -> None:
-        """Open the NCCL send/receive connection to the peer at startup (both ranks call this together)."""
+        """Open the NCCL send/receive connections to the peers at startup (every rank calls this together)."""
 
         if self.gather:
             return
         a = torch.zeros((1,), dtype=torch.float32, device="cuda")
         z = torch.empty_like(a)
-        self.w.comm.exchange([a], [z], self.peer)
+        if self.world == 2:
+            self.w.comm.exchange([a], [z], self.peer)
+        else:
+            outs = {p: [torch.empty_like(a)] for p in self.peers}
+            self.w.comm.exchange_all({p: [a] for p in self.peers}, outs)
         torch.cuda.synchronize()
 
     # -- per chunk ------------------------------------------------------------------------------------------------
     def begin(self, R: int) -> None:
         b = self.b
-        self.R, self.Rp = R, R + (R & 1)
-        self.H = H = self.Rp // 2
+        self.R, self.Rp = R, self.padded(R)
+        self.H = H = self.Rp // self.world
         n = self.settings.piece_count()
         size = -(-H // n)
         if size > 64:                                 # whole 64-row tiles for the glue kernels where possible
             size = min(H, -(-size // 64) * 64)
         self.pieces = [(off, min(size, H - off)) for off in range(0, H, size)]
-        # where the peer's partial of each piece of this rank's rows lands: [n, D] fp32 in the all-gather buffer,
-        # unused while split (gather: the peer's slot of the piece's [2, n, D])
+        # where the peers' partials of each piece of this rank's rows land, in the all-gather buffer (unused while
+        # split). Two ranks: [n, D] fp32 a piece (gather: the peer's slot of the piece's [2, n, D]); more: a [N, n, D]
+        # block a piece (p2p), or every rank's whole partial [N, Rp, D] (gather, one piece)
         d = b.part.shape[1]
-        if self.gather:
+        N = self.world
+        if N == 2 and self.gather:
             self.got = [b.gath[(2 * off + self.peer * n) * d:(2 * off + self.peer * n + n) * d].view(n, d)
                         for off, n in self.pieces]
-        else:
+        elif N == 2:
             self.got = [b.gath[off * d:(off + n) * d].view(n, d) for off, n in self.pieces]
-        if self.Rp > R:                                # the pad row: zero streams and partials, never read
+        elif self.gather:
+            self.got = [b.gath[:N * self.Rp * d].view(N, self.Rp, d)]
+        else:
+            self.got = [b.gath[N * off * d:N * (off + n) * d].view(N, n, d) for off, n in self.pieces]
+        if self.Rp > R:                                # the pad rows: zero streams and partials, never read
             b.x[R:self.Rp].zero_()
             b.part[R:self.Rp].zero_()
         if self.stream is not None:
@@ -191,41 +219,64 @@ class HcSplit:
             fill(lo, hi)
 
     def _swap_partial(self, j: int) -> None:
-        """Piece j: this rank's partial of the peer's rows out, the peer's partial of this rank's rows in."""
+        """Piece j: this rank's partial of the peers' rows out, the peers' partials of this rank's rows in."""
 
         off, n = self.pieces[j]
+        b = self.b
+        if self.world > 2:
+            if self.gather:                             # every rank's whole partial (one piece)
+                self.all_gather(b.part[:self.Rp].reshape(-1), self.got[0].reshape(-1))
+                return
+            self.w.comm.exchange_all({p: [b.part[p * self.H + off:p * self.H + off + n]] for p in self.peers},
+                                     {p: [self.got[j][p]] for p in self.peers})
+            return
         lo = self.theirs() + off
-        send = self.b.part[lo:lo + n]
+        send = b.part[lo:lo + n]
         if self.gather:
             d = send.shape[1]
-            self.all_gather(send.reshape(-1), self.b.gath[2 * off * d:2 * (off + n) * d])
+            self.all_gather(send.reshape(-1), b.gath[2 * off * d:2 * (off + n) * d])
         else:
             self.w.comm.exchange([send], [self.got[j]], self.peer)
 
     def _swap_rows(self, j: int, outs: list[torch.Tensor]) -> None:
-        """Piece j of bf16 row buffers: this rank's rows out, the peer's rows in (gather: in place, whole halves)."""
+        """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares)."""
 
         off, n = self.pieces[j]
-        mine, theirs = self.mine() + off, self.theirs() + off
+        mine = self.mine() + off
         if self.gather:                                 # one piece: rank order is row order
             for t in outs:
                 self.all_gather(t[mine:mine + n].reshape(-1), t[:self.Rp].reshape(-1))
             return
+        if self.world > 2:
+            self.w.comm.exchange_all({p: [t[mine:mine + n] for t in outs] for p in self.peers},
+                                     {p: [t[p * self.H + off:p * self.H + off + n] for t in outs] for p in self.peers})
+            return
+        theirs = self.theirs() + off
         self.w.comm.exchange([t[mine:mine + n] for t in outs], [t[theirs:theirs + n] for t in outs], self.peer)
 
     def partial(self, fill: Callable[[int, int], None]) -> None:
-        """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peer's rows sent to it and its
-        partial of this rank's rows received (``got``)."""
+        """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peers' rows sent to them and
+        their partials of this rank's rows received (``got``)."""
 
-        theirs, mine = self.theirs(), self.mine()
-        if self.stream is None:
+        mine = self.mine()
+        if self.stream is None or (self.world > 2 and self.gather):
             fill(0, self.R)
-            for j in range(len(self.pieces)):
-                self._swap_partial(j)
+            if self.stream is None:
+                for j in range(len(self.pieces)):
+                    self._swap_partial(j)
+                return
+            main = torch.cuda.current_stream()          # past two ranks, gather: the whole partial, then its gather
+            self.ev_fill[0].record(main)
+            with torch.cuda.stream(self.stream):
+                self.stream.wait_event(self.ev_fill[0])
+                self._swap_partial(0)
+                self.ev_part[0].record(self.stream)
             return
         main = torch.cuda.current_stream()
+        others = [self.theirs()] if self.world == 2 else [p * self.H for p in self.peers]
         for j, (off, n) in enumerate(self.pieces):
-            self._fill(fill, theirs + off, theirs + off + n)
+            for start in others:
+                self._fill(fill, start + off, start + off + n)
             self.ev_fill[j].record(main)
             with torch.cuda.stream(self.stream):
                 self.stream.wait_event(self.ev_fill[j])
@@ -234,17 +285,36 @@ class HcSplit:
         self._fill(fill, mine, mine + self.H)
 
     def own(self) -> tuple[int, int]:
-        """This rank's rows of the chunk, [lo, hi) (the pad row left out)."""
+        """This rank's rows of the chunk, [lo, hi) (the pad rows left out)."""
 
         return self.mine(), min(self.mine() + self.H, self.R)
+
+    def _post(self, j: int, lo: int, hi: int) -> None:
+        """hc_post of this rank's rows lo .. hi (piece j): every rank's partial of them summed rank 0 first."""
+
+        b = self.b
+        x = b.x[lo:hi]
+        own = b.part[lo:hi]
+        if self.world == 2:
+            got = self.got[j]
+            g0, g1 = (own, got) if self.rank == 0 else (got, own)
+            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
+        elif self.gather:
+            whole = self.got[0]
+            glue.hc_post_ranks(x, x, whole[0, lo:hi], self.Rp * whole.shape[2], self.world, b.post[lo:hi],
+                               b.comb[lo:hi])
+        else:
+            block = self.got[j]
+            block[self.rank].copy_(own)
+            glue.hc_post(x, x, block, b.post[lo:hi], b.comb[lo:hi])
 
     def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
              front: Callable[[int, int], None] | None = None) -> None:
         """hc_post of this rank's rows, then (in order) the layer's DFlash2 taps, the final stream mean (``final``)
-        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peer's. ``front(lo, hi)``
+        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peers'. ``front(lo, hi)``
         (TF_GLM_PREFILL_OVERLAP=2): the next block's row-independent start on this rank's rows of each piece, on the
         main stream right after the piece's glue, while its swap (and the later pieces' partials) are on the wire;
-        the caller runs it on the peer's rows (``own`` is what was done) after this returns."""
+        the caller runs it on the peers' rows (``own`` is what was done) after this returns."""
 
         b, c = self.b, self.w.cfg
         mine = self.mine()
@@ -253,11 +323,9 @@ class HcSplit:
         for j, (off, n) in enumerate(self.pieces):
             lo, hi = mine + off, mine + off + n
             if self.stream is not None:
-                main.wait_event(self.ev_part[j])
-            own, got = b.part[lo:hi], self.got[j]
-            g0, g1 = (own, got) if self.rank == 0 else (got, own)
+                main.wait_event(self.ev_part[0 if self.world > 2 and self.gather else j])
+            self._post(j, lo, hi)
             x = b.x[lo:hi]
-            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
             for slot in taps:
                 glue.stream_mean(x, b.taps[slot][lo:hi])
             if final:

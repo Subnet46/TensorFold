@@ -74,13 +74,15 @@ def proxy_library() -> ctypes.CDLL:
     for name, res, args in (
             ("roce_abi_version", i, []), ("roce_layout", i, [i, u64, ctypes.POINTER(u64)]),
             ("roce_blob_bytes", u64, []),
-            ("roce_create", p, [i, i, ctypes.POINTER(ctypes.c_char_p), i, i, i, p, u64, u64, ctypes.c_char_p, u64]),
+            ("roce_create", p, [i, i, ctypes.POINTER(ctypes.c_char_p), i, ctypes.POINTER(i), i, p, u64, u64,
+                                ctypes.c_char_p, u64]),
+            ("roce_set_routes", i, [p, i, i, ctypes.POINTER(i), ctypes.POINTER(i), i]),
             ("roce_local_blob", i, [p, p, u64]), ("roce_connect", i, [p, p, u64]), ("roce_start", i, [p]),
             ("roce_stop", None, [p]), ("roce_failed", i, [p]), ("roce_error", ctypes.c_char_p, [p]),
             ("roce_stat", u64, [p, i]), ("roce_hca_stat", u64, [p, i, i]), ("roce_destroy", None, [p])):
         fn = getattr(lib, name)
         fn.restype, fn.argtypes = res, args
-    if lib.roce_abi_version() != 4:
+    if lib.roce_abi_version() != 5:
         raise RuntimeError("unexpected RoCE proxy ABI version")
     return lib
 
@@ -94,19 +96,96 @@ def _ext():
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
-def _hcas() -> list[str]:
+MAX_HCAS = 4                             # roce_proxy.c's ROCE_MAX_HCAS
+_SYS = Path("/sys/class/infiniband")
+
+
+def _hcas(world: int = 2) -> list[str]:
+    """The HCAs the transport uses: TF_ROCE_HCA (or NCCL_IB_HCA), else every ACTIVE one; two ranks take the first
+    two (their one cable's rails), more ranks up to four (a triangle's two rails a peer)."""
+
     raw = os.environ.get("TF_ROCE_HCA") or os.environ.get("NCCL_IB_HCA") or ""
     names = [x.strip().lstrip("=^").split(":")[0] for x in raw.split(",") if x.strip()]
     if not names:
-        root = Path("/sys/class/infiniband")
-        names = [d.name for d in sorted(root.glob("*")) if "ACTIVE" in (d / "ports/1/state").read_text()]
-    return names[:2]
+        names = [d.name for d in sorted(_SYS.glob("*")) if "ACTIVE" in (d / "ports/1/state").read_text()]
+    return names[:2] if world == 2 else names[:MAX_HCAS]
+
+
+def _ipv4_gid(hca: str) -> tuple[int, int, int] | None:
+    """(GID index, IPv4 as an int, prefix length) of ``hca``'s first RoCE v2 IPv4 GID (sysfs and ``ip``), or None."""
+
+    import ipaddress
+
+    port = _SYS / hca / "ports" / "1"
+    entries = []
+    for path in (port / "gids").glob("*"):
+        try:
+            gid = path.read_text().strip()
+            kind = (port / "gid_attrs" / "types" / path.name).read_text().strip()
+        except OSError:
+            continue
+        if "v2" not in kind.lower() or not gid.replace(":", "").lower().startswith("0" * 20 + "ffff"):
+            continue
+        raw = bytes.fromhex(gid.replace(":", ""))
+        if raw == bytes(16):
+            continue
+        entries.append((int(path.name), int(ipaddress.IPv4Address(raw[12:])), path))
+    if not entries:
+        return None
+    index, ip, path = min(entries)
+    prefix = 24
+    try:
+        dev = (port / "gid_attrs" / "ndevs" / path.name).read_text().strip()
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", dev], capture_output=True, text=True).stdout
+        for word in out.split():
+            if "/" in word and word.split("/")[0] == str(ipaddress.IPv4Address(ip)):
+                prefix = int(word.split("/")[1])
+    except (OSError, ValueError):
+        pass
+    return index, ip, prefix
+
+
+def plan_routes(addrs: list[list[tuple[int, int] | None]]) -> tuple[dict, int]:
+    """Every rank's (IPv4, prefix) a listed HCA (None: unknown) -> ({(rank, peer): [(local HCA, peer HCA), ...]},
+    stripes a peer). HCAs pair when they share a subnet, each HCA once a peer, in name order on both sides (so the
+    two ends of a pair list the same pairs mirrored); every pair of ranks gets the fewest stripes any pair has,
+    which must be at least one."""
+
+    world = len(addrs)
+
+    def net(a):
+        return None if a is None else (a[0] >> (32 - a[1]) if a[1] else 0, a[1])
+
+    pairs: dict = {}
+    for r in range(world):
+        for p in range(world):
+            if p == r:
+                continue
+            used, got = set(), []
+            for h, a in enumerate(addrs[r]):
+                for rh, b in enumerate(addrs[p]):
+                    if rh not in used and net(a) is not None and net(a) == net(b):
+                        used.add(rh)
+                        got.append((h, rh))
+                        break
+            pairs[(r, p)] = got
+    if world < 2:
+        return pairs, 0
+    least = min(len(v) for v in pairs.values())
+    if least == 0:
+        missing = ", ".join(f"{r}-{p}" for (r, p), v in sorted(pairs.items()) if not v and r < p)
+        raise RuntimeError(f"RoCE: no HCA of rank(s) {missing} shares a subnet with the peer's: every pair of ranks "
+                           "needs a direct path (a cable or a switch); use TF_GLM_COMM=nccl on a ring")
+    return {k: v[:least] for k, v in pairs.items()}, least
 
 
 class RoceGather:
     """One rank's side of the exchange: the pinned region, the proxy thread and the gather launches."""
 
     def __init__(self, comm, rank: int, world: int, max_bytes: int = 256 << 10) -> None:
+        """Two ranks: every listed HCA to the peer's of the same index (b12x's striping), GID index TF_ROCE_GID_INDEX
+        (or NCCL_IB_GID_INDEX, 3). More ranks: each HCA's own RoCE v2 IPv4 GID (unless TF_ROCE_GID_INDEX) and routes
+        by subnet (``plan_routes``), so a triangle of direct cables reaches each peer over that pair's rails."""
         lib = proxy_library()
         self.lib, self.rank, self.world, self.max_bytes = lib, rank, world, int(max_bytes)
         self.slot_bytes = -(-self.max_bytes // SLOT_ALIGN) * SLOT_ALIGN
@@ -121,24 +200,39 @@ class RoceGather:
         self.classes = BLOCKS.bit_length()
         # epoch, stage arrivals and tail arrivals by power-of-two grid, poison
         self.counters = torch.zeros(2 + 2 * self.classes, dtype=torch.int32, device="cuda")
-        self.hcas = _hcas()
-        gid = int(os.environ.get("TF_ROCE_GID_INDEX") or os.environ.get("NCCL_IB_GID_INDEX") or 3)
+        self.hcas = _hcas(world)
+        fixed = os.environ.get("TF_ROCE_GID_INDEX") or os.environ.get("NCCL_IB_GID_INDEX")
+        found = [None] * len(self.hcas) if world == 2 else [_ipv4_gid(h) for h in self.hcas]
+        if world == 2 or fixed:
+            gids = [int(fixed or 3)] * len(self.hcas)
+        else:
+            gids = [f[0] if f is not None else 3 for f in found]
+        self.addrs = [None if f is None else (f[1], f[2]) for f in found]
         tc = int(os.environ.get("NCCL_IB_TC", "0"), 0)
         names = (ctypes.c_char_p * len(self.hcas))(*[n.encode() for n in self.hcas])
         err = ctypes.create_string_buffer(512)
-        self.ctx = lib.roce_create(world, rank, names, len(self.hcas), gid, tc, ctypes.c_void_p(base), total,
-                                   self.slot_bytes, err, len(err))
+        self.ctx = lib.roce_create(world, rank, names, len(self.hcas), (ctypes.c_int * len(gids))(*gids), tc,
+                                   ctypes.c_void_p(base), total, self.slot_bytes, err, len(err))
         failed = 0 if self.ctx else 1
         blob_len = int(lib.roce_blob_bytes())
         blob = ctypes.create_string_buffer(blob_len)
         if not failed and lib.roce_local_blob(self.ctx, blob, blob_len) != 0:
             failed = 1
-        # both ranks' verdict, geometry and connection blob through the existing communicator
+        # every rank's verdict, geometry and connection blob through the existing communicator (more than two ranks:
+        # each HCA's IPv4 and prefix too, for the routes)
         words = -(-blob_len // 4)
-        mine = torch.zeros(4 + words, dtype=torch.int32)
-        mine[:4] = torch.tensor([failed, len(self.hcas), self.slot_bytes >> 12, self.flag_stride])
+        extra = 0 if world == 2 else 2 * MAX_HCAS
+        mine = torch.zeros(4 + extra + words, dtype=torch.int32)
+        n_hca = len(self.hcas) if world == 2 else 0
+        mine[:4] = torch.tensor([failed, n_hca, self.slot_bytes >> 12, self.flag_stride])
+        if extra:                                        # (IPv4 as int32 bits, prefix) a slot; prefix -1: none
+            mine[4:4 + extra] = torch.tensor([0, -1] * MAX_HCAS, dtype=torch.int32)
+            for h, a in enumerate(self.addrs):
+                if a is not None:
+                    mine[4 + 2 * h] = a[0] - (1 << 32) if a[0] >= 1 << 31 else a[0]
+                    mine[5 + 2 * h] = a[1]
         raw = torch.frombuffer(bytearray(blob.raw.ljust(words * 4, b"\0")), dtype=torch.int32)
-        mine[4:] = raw
+        mine[4 + extra:] = raw
         got = torch.empty(world * mine.numel(), dtype=torch.int32, device="cuda")
         comm.all_gather(mine.cuda(), got)
         rows = got.view(world, -1).cpu()
@@ -146,7 +240,27 @@ class RoceGather:
             why = err.value.decode(errors="replace") if not self.ctx else "the ranks' RoCE geometry differs"
             self.close()
             raise RuntimeError(f"RoCE all-gather setup failed on some rank: {why}")
-        blobs = b"".join(bytes(r[4:].numpy().tobytes())[:blob_len] for r in rows)
+        self.n_flag = len(self.hcas)                     # stripes a peer: every HCA at two ranks
+        if extra:
+            addrs = [[None if int(r[5 + 2 * h]) < 0 else (int(r[4 + 2 * h]) & 0xFFFFFFFF, int(r[5 + 2 * h]))
+                      for h in range(MAX_HCAS)] for r in rows]
+            try:
+                routes, self.n_flag = plan_routes(addrs)
+            except RuntimeError:
+                self.close()
+                raise
+            for p in range(world):
+                if p == rank:
+                    continue
+                local, remote = zip(*routes[(rank, p)])
+                n = len(local)
+                if lib.roce_set_routes(self.ctx, p, n, (ctypes.c_int * n)(*local), (ctypes.c_int * n)(*remote),
+                                       self.n_flag) != 0:
+                    why = lib.roce_error(self.ctx).decode(errors="replace")
+                    self.close()
+                    raise RuntimeError(f"RoCE routes: {why}")
+            self.routes = {p: routes[(rank, p)] for p in range(world) if p != rank}
+        blobs = b"".join(bytes(r[4 + extra:].numpy().tobytes())[:blob_len] for r in rows)
         self.spin = spin_limit()
         _ext()                      # its first build (tens of seconds) here, before the verdict all-gather below
         ok = lib.roce_connect(self.ctx, blobs, len(blobs)) == 0 and lib.roce_start(self.ctx) == 0
@@ -175,7 +289,7 @@ class RoceGather:
         c = self.counters.data_ptr()
         _ext().gather(send, recv, packs, nbytes, packs, self.recv, self.flag, self.send, self.ctrl, self.slot_bytes,
                       c, c + 4 * (1 + klass), c + 4 * (1 + self.classes + klass), c + 4 * (1 + 2 * self.classes),
-                      self.spin, self.world, self.rank, self.slots, self.flag_stride, len(self.hcas), grid, THREADS)
+                      self.spin, self.world, self.rank, self.slots, self.flag_stride, self.n_flag, grid, THREADS)
         if not torch.cuda.is_current_stream_capturing():
             self.check()
 

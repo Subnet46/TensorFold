@@ -11,6 +11,9 @@ import torch
 
 from tensorfold.cuda import experts as grouped
 
+# a rank's expert widths the decode kernel (``dec``) takes: two ranks' 1024, four ranks' 512, three ranks' 768 / 640
+# (its down projection's K / 64 k steps a warp: 16, 8, 12, 10); others run the grouped kernel (the same bits)
+DEC_WIDTHS = (1024, 768, 640, 512)
 # Gate/up and down tile counts, warps, and K splits stay fixed across row counts to preserve each row's bits.
 GATEUP_CFG = (8, 4, 4)
 DOWN_CFG = (8, 4, 1)
@@ -73,7 +76,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v19", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v20", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -204,7 +207,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
         raise ValueError("the EXL3 kernel takes items of 16 pairs")
     items = grouped.max_items(R * slots, plan.experts)
     dec, fuse, xrow = dec_settings()
-    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI == 1024:
+    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI in DEC_WIDTHS:
         xrow = xrow and ex.shared_suh is not None
         if xrow:                                     # one rotated input a row, read by all its pairs' gate and up
             ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
