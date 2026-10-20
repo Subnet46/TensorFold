@@ -539,6 +539,10 @@ class GlmEngine:
         # TF_GLM_KVB=fp8/q4 (an EXL3 checkpoint, latent cache): kv_b as the absorb and expand kernels read it
         kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
         weights_estimate = kvb_weights(weights_estimate, kvb)
+        # TF_GLM_LANE_INPUTS (patch 0183): every rank's slice of the chosen output projections on each rank
+        from . import lane_inputs as lane_inputs_mod
+
+        weights_estimate = lane_inputs_mod.weights(weights_estimate, cfg, world)
         # TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows (``kv8``), half the bytes
         from .kv8 import KINDS as KV_KINDS, kv_kind
 
@@ -712,7 +716,7 @@ class GlmEngine:
         mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
                 quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1),
                 quiet(_exl3_stream.code),
-                quiet(_segprof.code)]
+                quiet(_segprof.code), quiet(lane_inputs_mod.mask)]
         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
         tables = [row[0] for row in got]
         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
@@ -724,7 +728,8 @@ class GlmEngine:
             why = "; ".join(w for _, w in mine if w)
             raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
                                "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1, "
-                               "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF* by rank "
+                               "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF*, "
+                               "TF_GLM_LANE_INPUTS and TF_GLM_LANE_DIRECT (as a mask) by rank "
                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
                                + ": give every rank the same valid values")
         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
@@ -764,6 +769,9 @@ class GlmEngine:
         w.comm = self.comm
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
         self.comm.barrier()
+        # TF_GLM_LANE_INPUTS: the other ranks' slices of the chosen output projections (a collective; the estimate
+        # counted them); before the prompt buffers' split sizes its copy-engine arena by them
+        lane_inputs_added = lane_inputs_mod.gather(w)
         self.w = w
         if rank == 0 and cfg.mtp_layers and not self.mtp_on:
             print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
@@ -793,6 +801,8 @@ class GlmEngine:
             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
         if rank == 0 and moe_glue_mod.on():
             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+        if rank == 0 and (lane_inputs_mod.wanted() or lane_inputs_mod.direct_wanted()):
+            print(f"[tensorfold] {lane_inputs_mod.describe(world, lane_inputs_added)}", flush=True)
         if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
             print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:

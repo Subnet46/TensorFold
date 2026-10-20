@@ -195,14 +195,27 @@ class HcSplit:
         if self.ce_mode:
             from .ce import CeExchange
 
+            from .lane_inputs import direct, row_bytes
             from .moe_glue import narrow_bytes
 
             b = self.b
             taps = max((len(v) for v in getattr(b, "tap_at", {}).values()), default=0)
             store = getattr(self.w.comm, "nccl", self.w.comm).store
-            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it)
-            self.ce = CeExchange(self.rank, self.world, store, getattr(b, "alloc_rows", b.rows), b.part.shape[1],
-                                 taps + 1, narrow=narrow_bytes())
+            rows = getattr(b, "alloc_rows", b.rows)
+            # TF_GLM_LANE_DIRECT: the normed rows (and rowsplit's picks and weights) live in the arena, where the
+            # peers write their rows of them in place (``ce.CeExchange.rows(direct=True)``, prompt lanes)
+            homes = {}
+            if direct(self.world):
+                homes["normed"] = b.normed.numel() * b.normed.element_size()
+                if narrow_bytes():
+                    homes.update(pick=b.pick.numel() * b.pick.element_size(), wts=b.wts.numel() * b.wts.element_size())
+            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it);
+            # TF_GLM_LANE_INPUTS: an input staging of the widest chosen projection input (0 bytes without it)
+            self.ce = CeExchange(self.rank, self.world, store, rows, b.part.shape[1],
+                                 taps + 1, narrow=narrow_bytes(), inputs=row_bytes(self.w), homes=homes)
+            for name in homes:                   # the buffers move into the arena (nothing holds the old ones)
+                old = getattr(b, name)
+                setattr(b, name, self.ce.home(name, old.dtype, tuple(old.shape)))
             return
         if self.gather:
             return
@@ -296,7 +309,8 @@ class HcSplit:
         off, n = self.pieces[j]
         mine = self.mine() + off
         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
-            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow)
+            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow,
+                         direct=getattr(self, "direct", False))       # TF_GLM_LANE_DIRECT: prompt lanes only
             return
         if narrow:
             raise RuntimeError("narrow rows travel with the copy-engine exchange only (TF_GLM_HC_EXCHANGE=ce)")

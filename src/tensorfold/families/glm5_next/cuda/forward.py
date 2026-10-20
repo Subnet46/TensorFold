@@ -466,6 +466,9 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
     def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
         mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
 
+    ranks = getattr(q, "ranks", None)            # TF_GLM_LANE_INPUTS: every rank's slice is here (lane_inputs.py);
+    if ranks is not None and b.prefill:          # a prompt lane then swaps the inputs (lanes.LaneSplit._inputs)
+        fill.inputs, fill.ranks = x, ranks
     return partials(w, b, R, fill, site=site)
 
 

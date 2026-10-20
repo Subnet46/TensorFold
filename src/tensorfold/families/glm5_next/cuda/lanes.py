@@ -28,7 +28,11 @@ rank at TP4) through the lane's 32-row sub-chunks in order, so the GPU is mostly
 recurrence waits for lane A's (it starts from the state lane A leaves). With the setting, the recurrences run on a
 stream of their own: lane A's beside lane B's input projections, lane B's beside lane A's output projection (1), and
 with 2 also lane B's output projection follows on that stream while the main stream runs lane A's MLP / MoE block.
-The same calls on the same rows and states in the same order on every buffer (``kda_lanes``): the same bits."""
+The same calls on the same rows and states in the same order on every buffer (``kda_lanes``): the same bits.
+
+TF_GLM_LANE_INPUTS (patch 0183, ``lane_inputs``): at the sites after an output projection that every rank holds whole,
+a lane swaps the projection's bf16 inputs instead of its fp32 partials; the current stream computes only this rank's
+rows' partial and the exchange stream every peer's (``LaneSplit._inputs``): the same partials, the same bits."""
 
 from __future__ import annotations
 
@@ -169,14 +173,21 @@ class LaneSplit(HcSplit):
         self.ev_done = torch.cuda.Event()
         self.ev_front = torch.cuda.Event()       # TF_GLM_KDA_OVERLAP: the lane's KDA projections written (main)
         self.ev_rec = torch.cuda.Event()         # ... and its recurrence's read-outs (the recurrence stream)
+        self.ev_in = torch.cuda.Event()          # TF_GLM_LANE_INPUTS: an output projection's input rows written
         self.ce = parent.ce
         self.ce_at = ce_at
+        # TF_GLM_LANE_DIRECT: the peers write the lane's swapped rows that live in the arena in place (lane_inputs)
+        self.direct = bool(getattr(self.ce, "home_off", None))
 
     def partial(self, fill) -> None:
         """The lane's whole partial on the main stream, then its exchange on the exchange stream. A fill that left
         its last rows to another stream says so in ``fill.ready`` (an event: TF_GLM_MOE_GLUE defer); the exchange
-        waits for it too."""
+        waits for it too. An output projection that every rank holds whole exchanges its inputs instead
+        (TF_GLM_LANE_INPUTS: ``_inputs``)."""
 
+        if getattr(fill, "inputs", None) is not None:
+            self._inputs(fill)
+            return
         main = torch.cuda.current_stream()
         fill(0, self.R)
         self.ev_fill[0].record(main)
@@ -187,6 +198,50 @@ class LaneSplit(HcSplit):
                 self.stream.wait_event(ready)
             with prof.timed("lane: partials exchange", events_only=True):
                 self._swap_partial(0)
+
+    def _inputs(self, fill) -> None:
+        """TF_GLM_LANE_INPUTS (``lane_inputs``): an output projection's partials from its inputs. The current stream
+        records that the projection's input rows are written (``ev_in``) and computes this rank's rows' partial with
+        its own slice (``fill`` on those rows: b.part, as before); the exchange stream, from that record on, swaps the
+        input rows (``_swap_inputs``), computes every peer's partial of this rank's rows with that peer's slice into
+        the peer's slot of the staging block (``_slot_partials``: where the peer's copy landed before), then waits for
+        the own rows' partial; ``glue_async`` sums the slots rank 0 first as before. The input rows stay unwritten
+        until the lane's next block, which waits for the lane's glue (``wait``), which follows the swap. For a fill
+        with inputs (``forward.out_proj`` sets them: ``fill.inputs``, ``fill.ranks``)."""
+
+        x, ranks = fill.inputs, fill.ranks
+        if self.ce is None or self.ce.inp_row < x.shape[1] * 2:
+            raise RuntimeError("TF_GLM_LANE_INPUTS: the copy-engine arena has no input staging for this projection")
+        cur = torch.cuda.current_stream()
+        lo = self.mine()
+        self.ev_in.record(cur)
+        fill(lo, lo + self.H)
+        self.ev_fill[0].record(cur)
+        ready = getattr(fill, "ready", None)
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(self.ev_in)
+            self._swap_inputs(x)
+            self._slot_partials(x, ranks)
+            self.stream.wait_event(self.ev_fill[0])
+            if ready is not None:
+                self.stream.wait_event(ready)
+
+    def _swap_inputs(self, x) -> None:
+        """The lane's input rows of a projection: this rank's rows of each peer out, the peers' rows of this rank's
+        rows in (one copy-engine step)."""
+
+        self.ce.inputs(x, self.H, 0, self.H, at=self.ce_at)
+
+    def _slot_partials(self, x, ranks) -> None:
+        """Each peer's fp32 partial of this rank's rows: its staged input rows times its slice of the weight (the
+        prompt matmul, as the peer's own ``fill`` runs it), into its slot of the staging block."""
+
+        from .forward import mm
+
+        block = self.got[0]
+        k = x.shape[1]
+        for p in self.peers:
+            mm(self.b, self.ce.staged(p, k, self.ce_at, self.H), ranks[p], None, block[p], f32=True)
 
     def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
