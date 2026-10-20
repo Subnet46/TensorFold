@@ -14,7 +14,7 @@ void exl3_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Ten
 void exl3_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                       const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
-                      double, int64_t, int64_t, bool);
+                      double, int64_t, int64_t, bool, const c10::optional<at::Tensor>&);
 void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, int64_t, int64_t);
 void exl3_dec_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                    const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
@@ -96,7 +96,7 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
             const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
             const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
             at::Tensor xd, at::Tensor y, int64_t D, int64_t N, int64_t E, int64_t max_items, double limit,
-            int64_t pass, int64_t slots, bool shx) {
+            int64_t pass, int64_t slots, bool shx, c10::optional<at::Tensor> order) {
     const at::cuda::CUDAGuard guard(Xg.device());
     for (auto* t : {&Xg, &Xu, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "prompt: fp16 input");
     for (auto* t : {&Tg, &Tu, &Td, &items, &counts, &members}) check(*t, at::kInt, "prompt: int32 input");
@@ -104,8 +104,9 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
     check(y, at::kFloat, "prompt: y");
     TORCH_CHECK(!shx || Xg.data_ptr() == Xu.data_ptr(), "prompt: shared rows take one Xh for gate and up");
     TORCH_CHECK(slots > 0, "prompt: slots");
+    if (order.has_value()) check(*order, at::kInt, "prompt: order");
     exl3_prompt_cuda(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
-                     max_items, limit, pass, slots, shx);
+                     max_items, limit, pass, slots, shx, order);
 }
 
 // Decode windows: the grouped kernel's sums; fuse 1 writes Y (down, its epilogue fused), 2 writes Xd

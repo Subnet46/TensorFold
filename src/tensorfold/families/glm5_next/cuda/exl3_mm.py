@@ -58,7 +58,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v17", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v18", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -130,6 +130,14 @@ def prompt_kernels() -> bool:
     return os.environ.get("TF_GLM_EXL3_PROMPT", "1") != "0"
 
 
+def item_order() -> bool:
+    """TF_GLM_EXL3_ORDER (default on): prompt kernels run the items of single-item experts (DRAM-bound) and of
+    multi-item experts (mma-bound, weights shared through L2) interleaved; 0: plan order. The same bits either way."""
+    import os
+
+    return os.environ.get("TF_GLM_EXL3_ORDER", "1") != "0"
+
+
 def row_rotation() -> bool:
     """TF_GLM_EXL3_ROWROT (default on): prompt chunks of layers whose experts share one gate/up suh rotate each row's
     input once and load it once for gate and up (the same fp16 inputs, so the same bits); 0: per pair, as decode."""
@@ -153,6 +161,8 @@ class Scratch:
         self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
                                 dtype=torch.int32, device=device)
         self.rows, self.slots = rows, slots
+        # a prompt plan's launch order (item_order): room for any plan of up to 1,024 experts in items of >= 16 pairs
+        self.order = torch.zeros((P // 16 + 1024 if prompt else 1,), dtype=torch.int32, device=device)
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Experts, s: Scratch, y: torch.Tensor,
@@ -173,7 +183,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
         ext.prompt(xg, xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
                    ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
                                                                                    plan.tile), float(limit),
-                   plan.tile, slots, shx)
+                   plan.tile, slots, shx, s.order if item_order() else None)
         return
     if plan.tile != grouped.TILE:
         raise ValueError("the EXL3 kernel takes items of 16 pairs")
