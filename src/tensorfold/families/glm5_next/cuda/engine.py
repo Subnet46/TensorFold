@@ -682,7 +682,8 @@ class GlmEngine:
                 print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
                       f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
-                      f"{self.multi.share:g}); {self.multi.tune.describe()}", flush=True)
+                      f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+                      f"{self.multi.tune.describe()}", flush=True)
                 if self.multi.row_ms is not None:
                     print("[tensorfold] --parallel batched window ms by rows: " +
                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)

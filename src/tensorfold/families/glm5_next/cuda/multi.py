@@ -8,7 +8,10 @@ window scratch; a DFlash2 context, ``dflash2_multi.DraftContext``; host side its
 
 Iterations (``GlmScheduler``, one worker thread on rank 0): admissions, then either one prompt chunk of the oldest
 filling stream (FIFO, at most TF_GLM_FILL_ROWS rows while others decode, the engine's prompt chunk alone) or one
-decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. A round: each
+decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. With
+TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling streams (``multi_prefill``: each
+stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
+budget). A round: each
 decoding stream (admission order) proposes drafts under its own DFlash2 policy (copy drafts first), the combined
 window is capped at ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows
 (``forward_streams``: ``verify.BatchedVerify``, one forward over every stream's rows through the segmented KDA and
@@ -16,7 +19,7 @@ DSA kernels, or ``verify.SerialVerify``, the reference running each window as it
 one packed all-gather for the samplers, each stream accepts and commits its own.
 
 Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
-ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, which both ranks apply
+ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, ROUND, FINISH, IDLE, which both ranks apply
 in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the depths rank 0
 sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error the two
 ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
@@ -39,13 +42,14 @@ import torch
 from tensorfold.cuda.scheduler import Scheduler
 from tensorfold.cuda.streams import Stream, next_fill
 
+from . import multi_prefill
 from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
 from .pool import ALIGN, Pool, align_up
 from .verify import BatchedVerify, Segment, SerialVerify, Verified
 
-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT = range(1, 10)
+ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
 OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
-       IDLE: "IDLE", SLOT: "SLOT"}
+       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL"}
 
 
 def watchdog_seconds(value: str | None = None) -> float:
@@ -98,6 +102,15 @@ def fill_rows(prefill_rows: int, grid: int = 0, value: str | None = None) -> int
         raise ValueError(f"TF_GLM_FILL_ROWS: a multiple of 64{f' and of the {grid}-token prompt grid' if grid else ''}"
                          f" up to the {prefill_rows}-row prompt chunk, not {value!r}")
     return rows
+
+
+def fill_unit(grid: int) -> int:
+    """Rows a prompt chunk cut short of a stream's next stop comes in multiples of (a multi-prompt chunk's share of
+    the row budget): 64 and the prompt grid (as TF_GLM_FILL_ROWS), so every cut stays on the grid."""
+
+    import math
+
+    return math.lcm(64, grid) if grid else 64
 
 
 def fill_share(value: str | None = None) -> float:
@@ -324,6 +337,15 @@ class MultiDecoder:
         self.fill_rows = fill_rows(e.prefill_rows, self.grid)
         self.share = fill_share()
         self.credit = 0.0
+        # TF_GLM_MULTI_PREFILL: rank 0 groups filling streams into one chunk (rank 1 applies whatever MFILL it gets)
+        self.group = multi_prefill.enabled()
+        if self.group:
+            from . import latent
+
+            if not latent.ENABLED:
+                raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+        self.unit = fill_unit(self.grid)
+        self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
         self.drafts = drafts
         if self.drafts is None and engine.drafter is not None:
             from .dflash2_multi import MultiDrafter
@@ -390,7 +412,7 @@ class MultiDecoder:
                             "filling": sum(not l.decoding for l in lanes),
                             "paused": sum(l.decoding and l.paused for l in lanes)},
                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
-                "kept_prompts": len(self.kept)}
+                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {})}
 
     def _check(self) -> None:
         if self.broken is not None:
@@ -881,6 +903,22 @@ class MultiDecoder:
     def _iterate(self) -> list[Stream]:
         prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
         lane = self._fill_turn()
+        group = self._group(lane) if lane is not None and self.group else None
+        if group is not None:
+            t = time.perf_counter()
+            rows = sum(stop - l.st.pos for l, stop in group)
+            self._emit(MFILL, [len(group), *[v for l, stop in group for v in (l.sid, stop)]])
+            self._flush()
+            firsts = self._fill_many(group)
+            for (l, _), first in zip(group, firsts):
+                if first is not None:
+                    l.s.take([first], self._ends(l))
+            self.grouped["chunks"] += 1
+            self.grouped["pieces"] += len(group)
+            self.grouped["rows"] += rows
+            if prof is not None:
+                prof.fill(time.perf_counter() - t)
+            return [l.s for l, _ in group if l.s.done]
         if lane is not None:
             t = time.perf_counter()
             stop = self._stop(lane)
@@ -970,6 +1008,39 @@ class MultiDecoder:
         rows = self.fill_rows if busy or lane.s.background else self.e.prefill_rows
         return min(stop, pos + rows)
 
+    def _group(self, first: Lane) -> list[tuple[Lane, int]] | None:
+        """Rank 0, TF_GLM_MULTI_PREFILL=1: the (lane, stop) pieces of this iteration's prompt chunk when it can hold
+        more than one stream's rows, else None (``first`` fills alone, as without the setting). The chunk's row budget
+        is the single-stream one (TF_GLM_FILL_ROWS while others decode, else the engine's prompt chunk). Foreground
+        streams before background ones, then the fewest prompt rows left first (a short prompt's first token does not
+        wait behind a long prompt; the long one takes the rest of the budget), then admission order; each takes the
+        rows to its next stop (a kept point or its end) when they fit, else the budget left in whole ``fill_unit``s.
+        Image prompts and replays of a kept head fill alone."""
+
+        def plain(l: Lane) -> bool:
+            return not l.decoding and l.feed is None and l.head is None
+
+        if not plain(first):
+            return None
+        busy = any(l.decoding and not l.s.done for l in self.lanes.values())
+        left = self.fill_rows if busy else self.e.prefill_rows
+        lanes = sorted((l for l in self.lanes.values() if plain(l)),
+                       key=lambda l: (bool(l.s.background), len(l.s.prompt) - l.st.pos, l.order))
+        out: list[tuple[Lane, int]] = []
+        for l in lanes:
+            pos, n = l.st.pos, len(l.s.prompt)
+            stop = next((p for p in l.stops if p > pos), n)
+            room = min(left, self.fill_rows if l.s.background else left)
+            if stop - pos > room:
+                stop = pos + room // self.unit * self.unit
+            if stop <= pos:
+                continue
+            out.append((l, stop))
+            left -= stop - pos
+            if left <= 0:
+                break
+        return out if len(out) > 1 else None
+
     def _ends(self, lane: Lane) -> tuple[int, ...]:
         return self.eos if lane.s.stop_eos else ()
 
@@ -978,7 +1049,6 @@ class MultiDecoder:
         """Both ranks: the lane's prompt rows pos .. stop in one chunk; its kept states; at the prompt's end its first
         token (the stream then decodes)."""
 
-        from .copy_drafts import CopyDrafts
         from .decode import prefill_chunk
 
         e = self.e
@@ -1012,15 +1082,71 @@ class MultiDecoder:
         finally:
             e.use(prev)
             s.prefill_s += time.perf_counter() - t
+        self._started(lane, first)
+        return first
+
+    def _started(self, lane: Lane, first: int) -> None:
+        """Both ranks: the lane's prompt is in and its first token sampled: it decodes from the next round."""
+
+        from .copy_drafts import CopyDrafts
+
+        s = lane.s
+        prompt = s.prompt
         lane.decoding = True
         s.started = time.perf_counter()
         if lane.policy is not None and self.g.copy is not None:
             c = self.g.copy                 # no pads: batched windows are not the single-stream widths
-            lane.copies = CopyDrafts(list(prompt) + [first], c.match, c.most, prompt=n, reply_match=c.reply_match,
-                                     miss_most=c.miss_most)
+            lane.copies = CopyDrafts(list(prompt) + [first], c.match, c.most, prompt=len(prompt),
+                                     reply_match=c.reply_match, miss_most=c.miss_most)
         if lane.policy is not None:
             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
-        return first
+
+    @torch.no_grad()
+    def _fill_many(self, group: Sequence[tuple[Lane, int]]) -> list[int | None]:
+        """Both ranks, TF_GLM_MULTI_PREFILL: every (lane, stop)'s prompt rows pos .. stop in ONE chunk
+        (``multi_prefill.prefill_pieces``: each lane's rows the bits of a chunk of their own); then per lane, in
+        order, what ``_fill`` does after its chunk: its kept states, and at its prompt's end its first token (all
+        first tokens sampled together, each as alone: ``sample_streams``). Returns each lane's first token or None."""
+
+        e = self.e
+        pieces = []
+        for lane, stop in group:
+            start, n = lane.st.pos, len(lane.s.prompt)
+            if lane.decoding or lane.feed is not None or lane.head is not None:
+                raise RuntimeError(f"stream {lane.sid} cannot join a multi-prompt chunk")
+            if not start < stop <= n or stop - start > e.prefill_rows:
+                raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
+            pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
+        t = time.perf_counter()
+        heads = multi_prefill.prefill_pieces(e, pieces)
+        parts, who = [], []
+        for k, ((lane, stop), out) in enumerate(zip(group, heads)):
+            n = len(lane.s.prompt)
+            if stop < n:
+                if stop in lane.stops:
+                    self._keep(lane, stop)
+                continue
+            if lane.point == n:
+                self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
+            logits = out[:1]
+            if lane.constraint is not None:             # the first token's row, under the reply's grammar
+                lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
+            parts.append((logits, [n], lane.s.sampling))
+            who.append(k)
+        firsts: list[int | None] = [None] * len(group)
+        if parts:
+            for k, rows in zip(who, sample_streams(self.w, parts)):
+                lane = group[k][0]
+                firsts[k] = rows[0]
+                if lane.constraint is not None:
+                    lane.constraint.advance([rows[0]])
+        dt = time.perf_counter() - t
+        for (lane, _), first in zip(group, firsts):
+            lane.s.prefill_s += dt
+            if first is not None:
+                self._started(lane, first)
+        return firsts
 
     @torch.no_grad()
     def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False) -> None:
@@ -1268,6 +1394,16 @@ class MultiDecoder:
                 first = self._fill(lane, p[1])
                 if first is not None:
                     lane.s.take([first], self._ends(lane))
+            elif op == MFILL:
+                group = []
+                for sid, stop in zip(p[1:1 + 2 * p[0]:2], p[2:2 + 2 * p[0]:2]):
+                    lane = self.lanes[sid]
+                    if stop != self._stop_bound(lane, stop):
+                        raise RuntimeError(f"rank 1: stream {sid}'s prompt chunk to {stop} passes a kept point")
+                    group.append((lane, stop))
+                for (lane, _), first in zip(group, self._fill_many(group)):
+                    if first is not None:
+                        lane.s.take([first], self._ends(lane))
             elif op == ROUND:
                 n = p[0]
                 sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
@@ -1299,6 +1435,9 @@ class GlmScheduler(Scheduler):
 
     def __init__(self, decoder: MultiDecoder, *, max_streams: int) -> None:
         self.held = None
+        # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
+        # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
+        self.gather_s = multi_prefill.wait_ms() / 1000.0 if getattr(decoder, "group", False) else 0.0
         super().__init__(decoder, max_streams=max_streams)
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
@@ -1321,7 +1460,10 @@ class GlmScheduler(Scheduler):
             else:
                 return value
 
-    def _admit(self, first=None) -> list[Stream]:
+    def _admit(self, first=None, until: float | None = None) -> list[Stream]:
+        """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
+        is waited on until then for more arrivals."""
+
         done: list[Stream] = []
         while self.decoder.live() < self.max_streams:
             if first is not None:
@@ -1330,7 +1472,8 @@ class GlmScheduler(Scheduler):
                 item, self.held = self.held, None
             else:
                 try:
-                    item = self.waiting.get_nowait()
+                    left = until - time.monotonic() if until is not None else 0.0
+                    item = self.waiting.get(timeout=left) if left > 0 else self.waiting.get_nowait()
                 except queue.Empty:
                     break
             stream, box = item
@@ -1395,7 +1538,9 @@ class GlmScheduler(Scheduler):
     def _iteration(self) -> None:
         self._yield()
         idle = not self.decoder.live() and self.held is None
-        done = self._admit(self.waiting.get() if idle else None)     # idle: wait for a request
+        first = self.waiting.get() if idle else None                # idle: wait for a request
+        until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
+        done = self._admit(first, until)
         try:
             done += self.decoder.round()
         except Exception as exc:                 # noqa: BLE001  (the live requests fail)

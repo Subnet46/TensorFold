@@ -494,16 +494,45 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
             mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
             mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
             l2pf.site(layer.index, "o")
-    cur = st.cur[li]
-    with prof.timed("kda: recurrence"):
-        out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
-                            k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
-                            st.rec[1 - cur, li], pos=st.pos if pre else None)
     if pre:                              # a prompt chunk keeps every row: the layer commits now
-        st.cur[li] = 1 - cur
-        _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+        out = kda_rows(layer, w, st, b, 0, R)
+    else:
+        cur = st.cur[li]
+        with prof.timed("kda: recurrence"):
+            out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+                                k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
     with prof.timed("kda: out + all-gather"):
         return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+
+
+def _scratch_rows(s, lo: int):
+    """A prompt buffer's KDA scratch from row ``lo`` on (the same storage)."""
+
+    if lo == 0:
+        return s
+    from types import SimpleNamespace
+
+    return SimpleNamespace(out=s.out[lo:], k=s.k[lo:], v=s.v[lo:], g=s.g[lo:], b=s.b[lo:])
+
+
+def kda_rows(layer: LayerW, w: Weights, st: State, b: Buffers, lo: int, n: int) -> torch.Tensor:
+    """A prompt chunk's KDA recurrence for rows lo .. lo + n of the prompt buffers (their projections done) on ``st``
+    from its position: the chain into b.kscratch.out[lo:lo + n] (returned), the layer's state committed and its conv
+    window shifted. ``kda_block`` runs a chunk as rows 0 .. R; a chunk of several streams' prompts
+    (``multi_prefill``) runs each stream's rows through this on that stream's state: the call they get alone."""
+
+    c = w.cfg
+    k = layer.kda
+    li = st.kda_index[layer.index]
+    rs = slice(lo, lo + n)
+    cur = st.cur[li]
+    with prof.timed("kda: recurrence"):
+        out = kda_mod.chain(b.kproj[0, rs], k.b_off, b.ka[rs], b.kg[rs], st.conv[li], k.conv, st.rec[cur, li],
+                            k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, _scratch_rows(b.kscratch, lo),
+                            st.rec[1 - cur, li], pos=st.pos)
+    st.cur[li] = 1 - cur
+    _shift_conv(st.conv[li:li + 1], b.kproj[:, rs], n)
+    return out
 
 
 def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tensor, slots: "Slots",
@@ -614,11 +643,24 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
                 index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1) -> torch.Tensor:
     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
 
+    o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer)
+    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
+
+
+def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
+             index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1, lo: int = 0) -> torch.Tensor:
+    """``_dsa_latent`` up to its output projection, for rows lo .. lo + R of the buffers (their front done) on one
+    stream's caches (``lc``, ``index``, ``pos_dev``, ``host_pos``: its first row's position): the latent write,
+    indexer update, absorb, attention and expand; returns the rows' attention output [R, heads * v_dim] (b.vn's rows).
+    A chunk of several streams' prompts (``multi_prefill``) runs each stream's rows through this: the call they get
+    alone."""
+
     c = w.cfg
     HL = a.heads
     s = b.lat_s
+    rs = slice(lo, lo + R)
     with prof.timed("dsa: latent write"):
-        latent.latent_write(b.lat[:R], lc, pos_dev)
+        latent.latent_write(b.lat[rs], lc, pos_dev)
     # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
@@ -626,13 +668,13 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
         ik, ig, pk = index
         ix = a.index
         with prof.timed("dsa: indexer update"):
-            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
-            glue.router(b.normed[:R], ix.gate, b.igr[:R])
-            sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+            mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
+            glue.router(b.normed[rs], ix.gate, b.igr[rs])
+            sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
     with prof.timed("dsa: absorb"):
-        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
+        qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], prompt=b.prefill and latent.PROMPT_MMA)
     l2pf.site(layer, "o")
-    ol = s.ol[:R]
+    ol = s.ol[rs]
     scale = c.qk_dim ** -0.5
     if not all_sparse:
         # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
@@ -643,8 +685,8 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
                             hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
     if sparse_rows:
         with prof.timed("dsa: select tokens"):
-            mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
-            tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
+            mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
+            tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
             if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
@@ -652,8 +694,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
             else:
                 latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
     with prof.timed("dsa: expand"):
-        o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
+        return latent.expand_v(ol, a.absorb, b.vn[rs], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
 
 
 def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
@@ -830,10 +871,13 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
 
 
-def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None) -> None:
+def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+                 mixer=None) -> None:
     """Every layer of a prompt chunk with its hyper-connection glue split by rows between the ranks
     (``hcsplit``): the first hc_pre runs on every row as unsplit, each later one on this rank's rows, and b.normed,
-    the taps and b.hidden come back whole from the peer. The same bits as the unsplit loop and its final mean."""
+    the taps and b.hidden come back whole from the peer. The same bits as the unsplit loop and its final mean.
+    ``mixer``: the layers' KDA / DSA blocks as ``mixer(layer, done)`` instead of on ``st`` (a chunk of several
+    streams' prompts, ``multi_prefill``)."""
 
     c = w.cfg
     sp = b.split
@@ -847,7 +891,10 @@ def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, hos
                     b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters, prompt=True)
         done = None                              # rows whose front the glue already ran (TF_GLM_PREFILL_OVERLAP=2)
         for i, layer in enumerate(layers):
-            _mixer(layer, w, st, b, R, nch, host_pos, None, done)
+            if mixer is not None:
+                mixer(layer, done)
+            else:
+                _mixer(layer, w, st, b, R, nch, host_pos, None, done)
             front = ffn_front(layer, w, b) if fronts else None
             with prof.timed("hc"):
                 sp.glue(layer.ffn_hc, layer.post_norm, front=front)
@@ -910,8 +957,8 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, 
     if inject is not None:
         rows, features = inject
         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
-    if b.prefill and b.split is not None and sparse_np is None and mixer is None and b.split.applies(R):
-        split_layers(w, st, b, R, nch, host_pos)             # also leaves the taps and b.hidden[:R]
+    if b.prefill and b.split is not None and sparse_np is None and b.split.applies(R):
+        split_layers(w, st, b, R, nch, host_pos, mixer)      # also leaves the taps and b.hidden[:R]
     else:
         for layer in w.layers:
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
