@@ -16,7 +16,7 @@ from typing import Sequence
 import numpy as np
 
 MATCH = 8        # the context's last this many tokens must have occurred before (TF_GLM_COPY_MATCH)
-MOST = 5         # drafts a round: 5 keeps the verify window (6 rows) within the captured graphs (TF_GLM_COPY_MAX)
+MOST = 5         # drafts a round (TF_GLM_COPY_MAX, up to 15): graphs cover windows of 8 rows, wider ones run eagerly
 
 
 @dataclass(frozen=True)

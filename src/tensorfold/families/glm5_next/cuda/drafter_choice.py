@@ -8,7 +8,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, copy_room, draft
+from .decode import DecodeResult, DepthPolicy, Engine, _Clock, _Late, _sync, absorb, copy_room, draft
 from .forward import commit
 
 
@@ -91,6 +91,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     arms: list[str] = []
     last = {"m": (0, 0), "f": (0, 0), "c": (0, 0)}
     c_rounds = c_drafted = c_accepted = 0
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
@@ -119,8 +120,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
+        clock.start()
         logits = e.forward(tokens)
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last round's tokens, while this window runs
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
@@ -159,12 +162,12 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         out.extend(sampled[:keep])
         if copies is not None:
             copies.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        late(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
-        stages["forward"] += t2 - t1
+        stages["forward"] += clock.seconds()
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
+    late.flush()
     _sync(w)
     seconds = time.perf_counter() - start
     if drafter is not None and n_f:

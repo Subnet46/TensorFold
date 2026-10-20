@@ -175,8 +175,10 @@ class Drafter:
     """Draft one sequence from position-indexed context using device lengths and static buffers shared by eager execution and CUDA graphs."""
 
     def __init__(self, draft_dir: str | Path, w: Weights, *, block: int | None = None, capacity: int = 2560,
-                 ring: bool = False) -> None:
-        """``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and block, the same drafts."""
+                 tap_rows: int = 0, ring: bool = False) -> None:
+        """``tap_rows``: context updates up to this many rows (a verify window's kept rows) replay captured graphs too
+        (the block's own size always does). ``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and
+        block, the same drafts."""
 
         path = Path(draft_dir)
         cfg = json.loads((path / "config.json").read_text())
@@ -268,11 +270,20 @@ class Drafter:
         self.ids_host = torch.zeros((1,), dtype=torch.int32, pin_memory=torch.cuda.is_available())
         self.ar = torch.arange(max(64, n), device=dev)
         self.tap_in = torch.zeros((64, len(self.tap_layers) * self.D), dtype=torch.bfloat16, device=dev)
-        self.packed: torch.Tensor | None = None       # [world, block - 1, 2 * top_k] after a pass
-        self.proj: torch.Tensor | None = None         # [block - 1, selector rank] fp32
+        # a pass's candidates (every rank's [block - 1, 2 * top_k], values then ids as fp32 bits) and projected rows
+        # [block - 1, selector rank] fp32 in one device buffer, read back by one pinned copy (``candidates``)
+        self.gathered = self.world if self.world > 1 and w.comm is not None else 1
+        self.cand_n = self.gathered * (n - 1) * 2 * self.top_k
+        cuda = torch.cuda.is_available()
+        self.cand = torch.zeros((self.cand_n + (n - 1) * self.hproj.shape[0],), dtype=torch.float32, device=dev)
+        self.cand_host = torch.zeros(self.cand.shape, dtype=torch.float32, pin_memory=cuda)
+        self.cand_ready = torch.cuda.Event() if cuda else None
+        self.packed = self.cand[:self.cand_n].view(self.gathered, n - 1, 2 * self.top_k)
+        self.proj = self.cand[self.cand_n:].view(n - 1, self.hproj.shape[0])
         self.pool = None
         self.block_graph = None
         self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.tap_rows = min(max(self.block, int(tap_rows)), self.tap_in.shape[0])
 
     def nbytes(self) -> int:
         total = sum(q.nbytes() for L in self.layers for q in (L.a_kp, L.m_kp, L.qkv, L.kv, L.o, L.gu, L.down))
@@ -390,23 +401,21 @@ class Drafter:
         vals, local = torch.topk(logits.float(), self.top_k, dim=-1)
         gids = (local + self.w.vocab_offset).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
-        if self.world > 1 and self.w.comm is not None:
-            got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=self.dev)
-            self.w.comm.all_gather(packed.view(-1), got)
-            self.packed = got.view(self.world, n - 1, 2 * self.top_k)
+        if self.gathered > 1:
+            self.w.comm.all_gather(packed.view(-1), self.cand[:self.cand_n])
         else:
-            self.packed = packed.view(1, n - 1, 2 * self.top_k)
-        self.proj = F.linear(h, self.hproj).float()
+            self.cand[:self.cand_n].copy_(packed.view(-1))
+        self.proj.copy_(F.linear(h, self.hproj).float())
 
     @torch.no_grad()
     def capture(self) -> None:
-        """CUDA graphs for the block pass and for context updates of 1..block rows (both ranks together)."""
+        """CUDA graphs for the block pass and for context updates of 1..tap_rows rows (both ranks together)."""
 
         self.pool = torch.cuda.graph_pool_handle()
         self.reset()
         self.tap_in.zero_()
         self.ids[0] = 0
-        for n in range(1, self.block + 1):
+        for n in range(1, self.tap_rows + 1):
             for _ in range(2):
                 self._taps_compute(n)
             torch.cuda.synchronize()
@@ -435,7 +444,15 @@ class Drafter:
             self.block_graph.replay()
         else:
             self._block_compute()
-        g = self.packed[:, :depth].cpu()
+        # one pinned copy of candidates and projected rows (two .cpu() calls were two syncs and two pageable copies)
+        if self.cand_ready is not None:
+            self.cand_host.copy_(self.cand, non_blocking=True)
+            self.cand_ready.record()
+            self.cand_ready.synchronize()
+        else:
+            self.cand_host.copy_(self.cand)
+        g = self.cand_host[:self.cand_n].view(self.gathered, self.block - 1, 2 * self.top_k)[:, :depth]
+        proj = self.cand_host[self.cand_n:].view(self.block - 1, -1)[:depth]
         k = self.top_k
         values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
@@ -444,7 +461,7 @@ class Drafter:
             order = np.lexsort((tokens, -values), axis=-1)[:, :k]
             values = np.take_along_axis(values, order, axis=1)
             tokens = np.take_along_axis(tokens, order, axis=1)
-        return tokens, values, self.proj[:depth].cpu().numpy().astype(np.float64)
+        return tokens, values, proj.numpy().astype(np.float64)          # astype copies: nothing keeps cand_host
 
     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
               sampling: Sampling | None, confidence: float = 0.0) -> list[int]:

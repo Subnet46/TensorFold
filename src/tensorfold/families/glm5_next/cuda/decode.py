@@ -84,9 +84,11 @@ class Engine:
 
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
-                 taps: tuple[int, ...] = (), grid: int = 0, split=None) -> None:
+                 taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None) -> None:
         """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere); ``split``: a
-        ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit."""
+        ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit;
+        ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``): draft chains take one row a step,
+        so the MTP buffers need not be as wide as the verify windows."""
 
         if grid and prefill_rows % grid:
             raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
@@ -103,7 +105,7 @@ class Engine:
             from .hcsplit import HcSplit
 
             self.pbuf.split = HcSplit(w, self.pbuf, split)
-        self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
+        self.mbuf = Buffers(w, min(mtp_rows or max_rows, max_rows), capacity) if w.mtp is not None else None
         self.st = State(w, capacity, max_rows)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
@@ -113,7 +115,8 @@ class Engine:
         if graphs:
             from .graphs import Graphs
 
-            self.graphs = Graphs(self, graph_rows, graph_rows)
+            mtp_graphs = tuple(r for r in graph_rows if self.mbuf is None or r <= self.mbuf.rows)
+            self.graphs = Graphs(self, tuple(r for r in graph_rows if r <= max_rows), mtp_graphs)
             self.reset()
 
     def reset(self) -> None:
@@ -421,6 +424,8 @@ class DecodeResult:
     rounds: int
     drafted: int = 0
     accepted: int = 0
+    # seconds by stage: "forward" the verify windows' GPU time (CUDA events), "sample" from a window's launch to its
+    # tokens (waiting for the window included: no sync of its own), "draft" and "commit" host time
     stages: dict[str, float] = field(default_factory=dict)
     depths: list[int] = field(default_factory=list)
     keeps: list[int] = field(default_factory=list)
@@ -439,6 +444,55 @@ def _sync(w: Weights) -> None:
     torch.cuda.synchronize()
 
 
+class _Clock:
+    """A verify window's GPU time between two CUDA events, read after the round's sample has waited for the window
+    anyway (so timing adds no host-device sync); wall time where there is no GPU (the CPU tests' fake engines)."""
+
+    def __init__(self) -> None:
+        self.cuda = torch.cuda.is_available()
+        if self.cuda:
+            self.a = torch.cuda.Event(enable_timing=True)
+            self.b = torch.cuda.Event(enable_timing=True)
+        self.t = self.dt = 0.0
+
+    def start(self) -> None:
+        if self.cuda:
+            self.a.record()
+        else:
+            self.t = time.perf_counter()
+
+    def stop(self) -> None:
+        if self.cuda:
+            self.b.record()
+        else:
+            self.dt = time.perf_counter() - self.t
+
+    def seconds(self) -> float:
+        """Only after something has waited for the work queued before ``stop`` (the sample's device-to-host copy)."""
+        return self.a.elapsed_time(self.b) / 1e3 if self.cuda else self.dt
+
+
+class _Late:
+    """``on_tokens`` one round late: a round's tokens go to the caller once the next verify window is queued on the
+    GPU (``flush`` right after ``Engine.forward``), so the server's work on them (detokenizing, stop strings, the
+    stream write) runs while the GPU verifies instead of between rounds, where the GPU would wait for it. The loops
+    never read on_tokens' result (both ranks decode to the end), so only when the tokens arrive changes: one round
+    later, all of them before the loop returns (``flush`` again at its end)."""
+
+    def __init__(self, on_tokens) -> None:
+        self.fn, self.held = on_tokens, None
+
+    def __call__(self, tokens) -> None:
+        if self.fn is not None:
+            self.flush()
+            self.held = list(tokens)
+
+    def flush(self) -> None:
+        if self.held is not None:
+            held, self.held = self.held, None
+            self.fn(held)
+
+
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -447,24 +501,26 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
     w, st, b = e.w, e.st, e.buf
     out = [pending]
     stages = dict(forward=0.0, sample=0.0, commit=0.0)
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        t0 = time.perf_counter()
+        clock.start()
         logits = e.forward(e.verify_window([out[-1]]))
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last step's token, while this step runs
         t1 = time.perf_counter()
         tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
         e.follow([tok])
         t2 = time.perf_counter()
         commit(w, st, b, 1, 1)
         t3 = time.perf_counter()
-        stages["forward"] += t1 - t0
+        stages["forward"] += clock.seconds()
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         out.append(tok)
-        if on_tokens is not None:
-            on_tokens([tok])
+        late([tok])
+    late.flush()
     _sync(w)
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
@@ -505,6 +561,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     c_rounds = c_drafted = c_accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     t0 = time.perf_counter()
@@ -517,12 +574,13 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
     stages["draft"] += time.perf_counter() - t0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        t0 = time.perf_counter()
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
+        clock.start()
         logits = e.forward(tokens)
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last round's tokens, while this window runs
         t1 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
@@ -544,9 +602,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         out.extend(sampled[:keep])
         if copies is not None:
             copies.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
-        stages["forward"] += t1 - t0
+        late(sampled[:keep][:max(0, count - (len(out) - keep))])
+        stages["forward"] += clock.seconds()
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
@@ -562,6 +619,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
             drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
                             policy.confidence) if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
+    late.flush()
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
                         copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
@@ -581,6 +639,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     c_rounds = c_drafted = c_accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     depth = min(policy.next(0, 0), count - len(out))
@@ -595,8 +654,10 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
+        clock.start()
         logits = e.forward(tokens)
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last round's tokens, while this window runs
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
@@ -620,14 +681,14 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         out.extend(sampled[:keep])
         if copies is not None:
             copies.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        late(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
-        stages["forward"] += t2 - t1
+        stages["forward"] += clock.seconds()
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
         # a copied round's acceptance does not move DFlash2's depth
         depth = min(policy.next(*((0, 0) if copied else (len(drafts), keep - 1))), count - len(out))
+    late.flush()
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
                         copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)

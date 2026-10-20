@@ -180,6 +180,14 @@ def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
     """TF_GLM_DENSE=q4: bf16 weights as affine 4-bit groups of 64, each group's range the one of ``grid`` clippings
     (1.0 down to 0.55 of its min / max) with the least squared error, scale and bias as stored (bf16). Lossy."""
 
+    return make_q4(*quantize4_mse_raw(w, chunk, grid))
+
+
+def quantize4_mse_raw(w: torch.Tensor, chunk: int = 4096,
+                      grid: int = 16) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``quantize4_mse``'s groups in MLX's layout, untiled: words [n, k / 8] int32 (8 nibbles low to high), scales and
+    biases [n, k / 64] bf16 (what ``latent.AbsorbQ4`` reads)."""
+
     n, k = w.shape
     words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
     scales = torch.empty((n, k // 64), dtype=torch.bfloat16, device=w.device)
@@ -208,7 +216,7 @@ def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
         for j in range(8):
             part |= q[..., j] << (4 * j)
         words[r:r + chunk], scales[r:r + chunk], biases[r:r + chunk] = part, best_s, best_b
-    return make_q4(words, scales.contiguous(), biases.contiguous())
+    return words, scales.contiguous(), biases.contiguous()
 
 
 DRAFT_QUANTS = ("minmax", "mse")
@@ -507,6 +515,42 @@ def dense_kind() -> str:
     if kind not in ("bf16", "fp8", "q4"):
         raise ValueError(f"TF_GLM_DENSE is bf16, fp8 or q4, not {kind!r}")
     return kind
+
+
+KVB_KINDS = ("bf16", "fp8", "q4")
+
+
+def kvb_kind(env=None) -> str:
+    """TF_GLM_KVB: how an EXL3 checkpoint's kv_b_proj is held for the latent path's absorb and expand (the kernels
+    every decode round runs once a DSA layer): bf16 (as stored, the default), fp8 (e4m3, an fp32 scale per row and
+    128 latent columns, ``make_f8``'s layout) or q4 (MSE-searched affine groups of 64 along the latent, the MLX
+    checkpoint's kernels). fp8 and q4 are lossy, like the rest of TF_GLM_DENSE; a row's bits still never depend on its
+    window's other rows, so drafted replies equal serial ones under each."""
+
+    import os
+
+    kind = (os.environ if env is None else env).get("TF_GLM_KVB", "bf16").strip() or "bf16"
+    if kind not in KVB_KINDS:
+        raise ValueError(f"TF_GLM_KVB is bf16, fp8 or q4, not {kind!r}")
+    return kind
+
+
+def kvb_weights(base, kind: str):
+    """A split_weights transform for TF_GLM_KVB: kv_b_proj at a byte a value plus fp32 scales a 128 block (fp8), or
+    half a byte plus a bf16 scale and bias a group of 64 (q4); the latent path then holds no other copy of it."""
+
+    def transform(name: str, info: dict) -> tuple[int, int]:
+        total, extra = base(name, info)
+        shape = info.get("shape") or []
+        if kind == "bf16" or not total or "kv_b_proj" not in name or info.get("dtype") != "BF16" or len(shape) != 2:
+            return total, extra
+        n = total // 2
+        if kind == "fp8" and shape[-1] % F8_BLOCK == 0:
+            return n + n // F8_BLOCK * 4, extra
+        if kind == "q4" and shape[-1] % 64 == 0:
+            return n // 2 + n // 64 * 4, extra
+        return total, extra
+    return transform
 
 
 # The matrices TF_GLM_DENSE=fp8 converts (weights.py's q4 / stack / head), for the startup memory estimate

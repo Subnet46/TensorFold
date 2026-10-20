@@ -10,6 +10,7 @@ from .capacity import Geometry, Weights, headers, itemsize
 PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
 PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
+MLA_DECODE_ROWS = 64    # GLM's decode windows the MLA estimate sizes buffers for (its verify windows: at most this)
 MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
 MLA_SELECT_ROWS = 512       # GLM's prompt-chunk rows whose pool scores are held at once (sparse.SELECT_ROWS)
 
@@ -263,7 +264,7 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
     vd, index = int(t["v_head_dim"]), int(t.get("index_head_dim", 128))
     mtp = int(t.get("num_nextn_predict_layers", 0)) > 0 if mtp is None else bool(mtp)
-    rows, d, streams = 64, int(t["hidden_size"]), int(t.get("hc_mult", 4))
+    rows, d, streams = MLA_DECODE_ROWS, int(t["hidden_size"]), int(t.get("hc_mult", 4))
     fixed = linear * (4 * lh * ld * ld * 4 + 3 * (conv - 1) * 3 * lh * ld * 2)
     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
     fixed += linear * rows * lh * (12 * ld + 4)
