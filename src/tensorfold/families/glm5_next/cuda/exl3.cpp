@@ -16,6 +16,10 @@ void exl3_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, c
                       const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
                       double, int64_t, int64_t, bool);
 void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, int64_t, int64_t);
+void exl3_dec_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                   const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+                   int64_t, int64_t, int64_t, int64_t, bool, const at::Tensor&, const at::Tensor&,
+                   const at::Tensor&, at::Tensor&, double, at::Tensor&);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -104,6 +108,27 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
                      max_items, limit, pass, slots, shx);
 }
 
+// Decode windows: the grouped kernel's sums; fuse 1 writes Y (down, its epilogue fused), 2 writes Xd
+// (gate/up, the epilogue run by each (item, n block)'s last block; ``done`` zeroed ints, reset by the kernel).
+void dec(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1, const at::Tensor& items,
+         const at::Tensor& counts, const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N,
+         int64_t P, int64_t SK, int64_t max_items, int64_t slots, int64_t fuse, bool xrow,
+         const at::Tensor& sv0, const at::Tensor& sv1, const at::Tensor& su2, at::Tensor out, double limit,
+         at::Tensor done) {
+    const int64_t E = T0.size(0);
+    for (auto* t : {&X0, &X1, &sv0, &sv1, &su2}) check(*t, at::kHalf, "dec: fp16 input");
+    for (auto* t : {&T0, &T1, &items, &counts, &members}) check(*t, at::kInt, "dec: int32 input");
+    check(done, at::kInt, "done");
+    check(Z, at::kFloat, "Z");
+    TORCH_CHECK(fuse == 1 || Z.numel() >= mats * SK * P * N, "Z too small");
+    TORCH_CHECK(fuse != 1 || (out.scalar_type() == at::kFloat && out.numel() >= P * N), "dec: Y fp32 [P, N]");
+    TORCH_CHECK(fuse != 2 || (out.scalar_type() == at::kHalf && out.numel() >= P * N &&
+                              done.numel() >= max_items * (N / 128)), "dec: Xd fp16 [P, N] and done counts");
+    c10::cuda::CUDAGuard guard(X0.device());
+    exl3_dec_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow,
+                  sv0, sv1, su2, out, limit, done);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
     m.def("prompt", &prompt);
@@ -111,4 +136,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rot_rows", &rot_rows);
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);
+    m.def("dec", &dec);
 }

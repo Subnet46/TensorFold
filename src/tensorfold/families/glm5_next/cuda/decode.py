@@ -96,6 +96,10 @@ class Engine:
         self.grid = grid
         w.meta["long_context"] = long_context
         self.rows, self.prefill_rows = max_rows, prefill_rows
+        if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
+            from . import kda as kda_mod
+
+            kda_mod.reserve(max(max_rows, prefill_rows), w.cfg.lin_heads // w.world, w.device)
         self.buf = Buffers(w, max_rows, capacity)
         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
         if taps:

@@ -343,7 +343,29 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
         raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
     if out is not None and (out.shape != (x.shape[0], q.n) or not out.is_contiguous()):
         raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({x.shape[0]}, {q.n})")
-    return shared.matmul(x, q, group_sums(x) if xs is None else xs, sk=split_k(q.n, q.k), f32=f32, out=out)
+    return shared.matmul(x, q, group_sums(x) if xs is None else xs, sk=split_k(q.n, q.k), f32=f32, out=out,
+                         variant=dec_tile(q.n, q.k) if x.shape[0] <= 16 else None)
+
+
+# Decode rows (up to 16) of a Q4 matmul on another column tile / warp / stage count (``shared.qmm_cfg``): every
+# output keeps its chain, so every choice gives the same bits. By per-rank shape (n, k), measured on GB10.
+DEC_TILES: dict[tuple[int, int], int] = {(4096, 4096): 2, (2048, 4096): 2, (8192, 1536): 2, (4096, 8192): 4,
+                                         (4096, 1024): 6}
+_dec_env: tuple[str, dict] = ("", {})
+
+
+def dec_tile(n: int, k: int) -> int | None:
+    """TF_GLM_Q4_TILE: unset or "table" the table above, "stock" none, a number that config for every shape."""
+
+    import os
+
+    global _dec_env
+    value = os.environ.get("TF_GLM_Q4_TILE", "") or "table"
+    if value != _dec_env[0]:
+        table = DEC_TILES if value == "table" else {} if value == "stock" else None
+        _dec_env = (value, table if table is not None else {"all": int(value)})
+    table = _dec_env[1]
+    return table.get("all", table.get((n, k)))
 
 
 def b16_split_k(n: int, k: int) -> int:

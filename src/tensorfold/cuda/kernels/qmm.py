@@ -18,9 +18,9 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm_v5", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
-                                                   str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
-                                                   str(here / "qmm_prefill8.cu")],
+    return load(name="tensorfold_qmm_v5m", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+                                                    str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
+                                                    str(here / "qmm_prefill8.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -35,6 +35,27 @@ def grouped(device: int) -> bool:
     """sm_12x runs groups of 64 through the grouped kernel: several projections of one input in a launch."""
 
     return torch.cuda.get_device_capability(device)[0] == 12
+
+
+GROUP_MODES = ("auto", "all", "0")
+
+
+def group_mode(env=None) -> str:
+    """TENSORFOLD_QMM_GROUP: which reduced group-64 matmuls ``matmul`` runs on the grouped sm_12x kernel (qmm_group.cu:
+    each column keeps qmm.cu's order, so the same bits; only the speed differs). ``auto`` (default): all but the
+    decode rows a caller gives a tile ``variant`` (``qmm_cfg``, chosen per shape); ``all``: those too; ``0``: none
+    (qmm.cu's kernels alone, as before the grouped kernel)."""
+
+    import os
+
+    value = ((os.environ if env is None else env).get("TENSORFOLD_QMM_GROUP", "") or "auto").strip().lower()
+    value = {"1": "all", "on": "all", "off": "0", "none": "0"}.get(value, value)
+    if value not in GROUP_MODES:
+        raise ValueError(f"TENSORFOLD_QMM_GROUP: auto, all or 0, not {value!r}")
+    return value
+
+
+GROUP_MODE = group_mode()
 
 
 
@@ -155,8 +176,10 @@ def group_sums(x: torch.Tensor, gs: int = 64) -> torch.Tensor:
 
 
 def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | None = None, f32: bool = False,
-           out: torch.Tensor | None = None, part: torch.Tensor | None = None, reduce: bool = True) -> torch.Tensor:
-    """x @ q.T as (M, n) bf16, or unrounded fp32 with ``f32``; ``reduce=False`` returns K slices to add in order."""
+           out: torch.Tensor | None = None, part: torch.Tensor | None = None, reduce: bool = True,
+           variant: int | None = None) -> torch.Tensor:
+    """x @ q.T as (M, n) bf16, or unrounded fp32 with ``f32``; ``reduce=False`` returns K slices to add in order;
+    ``variant``: decode rows (up to 16, groups of 64) on another tile config (``qmm_cfg``: the same bits)."""
 
     if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != q.k:
         raise ValueError(f"matmul: x must be (M, {q.k}) bf16")
@@ -168,12 +191,16 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | 
     sk = sk or split_k(q.n, q.k, q.gs)
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
-    if q.gs == 64 and reduce and grouped(x.device.index):
+    if (q.gs == 64 and reduce and GROUP_MODE != "0" and (variant is None or GROUP_MODE == "all")
+            and grouped(x.device.index)):
         _ext().qmm_group(x, xs, [q.weight], [q.scales], [q.biases], [out], [q.n], [sk], f32,
                          group_tile(m, *_chip(x.device.index)), -1)
         return out
     if sk > 1 and not reduce and part is None:
         part = torch.empty((sk, m, q.n), dtype=torch.float32, device=x.device)
+    if variant is not None and reduce and m <= 16 and q.gs == 64:
+        _ext().qmm_cfg(x, xs, q.weight, q.scales, q.biases, out, part, q.n, sk, f32, int(variant))
+        return out
     _ext().qmm(x, xs, q.weight, q.scales, q.biases, out, part, q.n, sk, q.gs, bucket(m), f32, reduce)
     return out if sk == 1 or reduce else part.reshape(-1)[:sk * m * q.n].view(sk, m, q.n)
 

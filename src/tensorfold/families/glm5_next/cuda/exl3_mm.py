@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+import os
 from pathlib import Path
 
 import torch
@@ -31,6 +32,20 @@ def _nfirst() -> bool:
     return os.environ.get("TF_GLM_EXL3_NFIRST", "1") != "0"
 
 
+def dec_settings() -> tuple[bool, int, bool]:
+    """Decode windows' EXL3 path. TF_GLM_EXL3_DEC (default on): ``dec``, grouped_kernel's sums with the down
+    projection's epilogue fused into it (one launch less a layer, no Z round trip); TF_GLM_EXL3_FUSE: 1 (default) the
+    down epilogue, 2 gate/up's too (the last of an item's blocks runs it: measured slower), 0 neither;
+    TF_GLM_EXL3_XROW (default on): a layer whose experts share one gate/up suh rotates each row's input once
+    (rot_rows: the same fp16 inputs). Every setting gives the same bits; TF_GLM_EXL3_DEC=0: the grouped kernel and
+    its epilogue kernels."""
+    on = os.environ.get("TF_GLM_EXL3_DEC", "1") != "0"
+    fuse = int(os.environ.get("TF_GLM_EXL3_FUSE", "1"))
+    if fuse not in (0, 1, 2, 3):
+        raise ValueError(f"TF_GLM_EXL3_FUSE is 0 to 3, not {fuse}")
+    return on, fuse, os.environ.get("TF_GLM_EXL3_XROW", "1") != "0"
+
+
 def _seq() -> bool:
     """TF_GLM_EXL3_SEQ (default on): prompt chunks sum a matmul's K splits in one program (same bits)."""
     import os
@@ -43,7 +58,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v15", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v17", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -134,6 +149,9 @@ class Scratch:
         self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
         self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
         self.z = torch.zeros((1 if prompt else 2 * sk * P * max(width, dims),), dtype=torch.float32, device=device)
+        # decode windows' fused gate/up epilogue: a finished-block count per (item, 128 columns), reset by the kernel
+        self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
+                                dtype=torch.int32, device=device)
         self.rows, self.slots = rows, slots
 
 
@@ -160,6 +178,24 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
     if plan.tile != grouped.TILE:
         raise ValueError("the EXL3 kernel takes items of 16 pairs")
     items = grouped.max_items(R * slots, plan.experts)
+    dec, fuse, xrow = dec_settings()
+    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI == 1024:
+        xrow = xrow and ex.shared_suh is not None
+        if xrow:                                     # one rotated input a row, read by all its pairs' gate and up
+            ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
+            xg = xu = s.xg
+        else:
+            ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+            xg, xu = s.xg, s.xu
+        ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
+                2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done)
+        if not fuse & 2:
+            ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
+        ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
+                1 if fuse & 1 else 0, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done)
+        if not fuse & 1:
+            ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
+        return
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
     nfirst = R >= PROMPT_ROWS and _nfirst()
     nt, w, sk = GATEUP_CFG
