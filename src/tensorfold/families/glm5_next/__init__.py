@@ -223,7 +223,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                      drafter=Path(drafter) if drafter and not no_drafts else None,
                      context=options.get("context"), context_explicit=options.get("context_explicit"),
                      serial_only=bool(no_drafts), vision=bool(options.get("vision", False)),
-                     vision_urls=bool(options.get("vision_urls", False)))
+                     vision_urls=bool(options.get("vision_urls", False)), parallel=int(options.get("parallel", 1)))
 
 
 def __getattr__(name: str) -> Any:

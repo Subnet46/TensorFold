@@ -84,11 +84,15 @@ class Engine:
 
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
-                 taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None) -> None:
+                 taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
+                 streams: int = 1, pool_rows: int | None = None) -> None:
         """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere); ``split``: a
         ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit;
         ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``): draft chains take one row a step,
-        so the MTP buffers need not be as wide as the verify windows."""
+        so the MTP buffers need not be as wide as the verify windows; ``streams``: stream slots (``forward.Slots``)
+        and ``pool_rows``: tokens of the shared cache pool (``forward.Caches``, default ``capacity``) for concurrent
+        streams (``multi``). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
+        ``capacity`` tokens), the one the CUDA graphs were captured on, unless ``use`` points it at another."""
 
         if grid and prefill_rows % grid:
             raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
@@ -110,7 +114,11 @@ class Engine:
 
             self.pbuf.split = HcSplit(w, self.pbuf, split)
         self.mbuf = Buffers(w, min(mtp_rows or max_rows, max_rows), capacity) if w.mtp is not None else None
-        self.st = State(w, capacity, max_rows)
+        from .forward import Caches, Slots
+
+        self.caches = Caches(w, pool_rows or capacity)
+        self.slots = Slots(w, streams, max_rows)
+        self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
         self.draft_n = w.head.n
@@ -126,13 +134,29 @@ class Engine:
     def reset(self) -> None:
         self.st.reset()
 
+    def use(self, st: State) -> State:
+        """Run the single-stream paths (prefill, forward, commit, snapshots) on ``st``; returns the previous state."""
+
+        prev, self.st = self.st, st
+        return prev
+
+    def graphed(self, st: State | None = None) -> bool:
+        """Whether the captured graphs run ``st`` (default the current state): the same slot and extent base as the
+        state they were captured on (and the pool's views, not a clone's)."""
+
+        st = self.st if st is None else st
+        return (self.graphs is not None and st.caches is self.caches and st.slots is self.slots
+                and st.graph_key == self.home.graph_key)
+
     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
-        """A step's forward (a CUDA graph when one was captured for its shape): logits [R, V/world]."""
+        """A step's forward (a CUDA graph when one was captured for its shape and state): logits [R, V/world]."""
 
         R = stage(self.w, self.st, self.buf, tokens)
         dense = self.st.pos + R <= self.w.cfg.dense_limit
         g, kind = None, "main"
-        if self.graphs is not None and dense:
+        if not self.graphed():
+            pass
+        elif self.graphs is not None and dense:
             g = self.graphs.main.get((R, self.st.parity))
         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
@@ -151,7 +175,9 @@ class Engine:
         n = mtp_stage(self.w, self.st, self.mbuf, next_tokens, hidden)
         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
         g, kind = None, "mtp"
-        if self.graphs is not None and not self.mbuf.zero_first and dense:
+        if not self.graphed():
+            pass
+        elif self.graphs is not None and not self.mbuf.zero_first and dense:
             g = self.graphs.mtp.get(n)
         elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
               and self.st.mtp_len >= self.w.cfg.dense_limit):
@@ -407,22 +433,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     last = None
     prof.active = True
     for start in range(begin, len(prompt), e.prefill_rows):
-        chunk = list(prompt[start:start + e.prefill_rows])
-        R = len(chunk)
-        inject = feed.chunk(start, R) if feed is not None else None
-        out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, inject=inject,
-                      head=sample)
-        last = out.clone() if sample else None
-        e.last_hidden = b.fnormed[R - 1:R].clone()
-        if drafter is not None:
-            drafter.add_taps(e.tap_rows(R, b))
-        if use_mtp:
-            nxt = list(prompt[start + 1:start + R + 1])
-            if nxt:
-                with prof.timed("mtp absorb"):
-                    _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
-        with prof.timed("commit"):
-            commit(w, st, b, R, R)
+        last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter, feed=feed,
+                             mtp=use_mtp, head=sample)
     prof.active = False
     prof.report(len(prompt) - begin)
     if not sample:
@@ -432,6 +444,32 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     first = e.sample(last, [len(prompt)], sampling)[0]
     e.follow([first])
     return first
+
+
+def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, drafter=None, feed=None,
+                  mtp: bool = False, head: bool = True) -> torch.Tensor | None:
+    """Commit prompt rows start .. start + R (at e.st.pos == start): the chunk's forward, DFlash2's taps, the MTP
+    head's rows (``mtp``: the next tokens are the prompt's), the commit; a copy of the head's logits of its last
+    row, taken before anything else reuses the buffers, with ``head``, else None. ``prefill`` runs a prompt as these;
+    so do concurrent streams' prompt steps (``multi``), one chunk at a time."""
+
+    w, st, b = e.w, e.st, e.pbuf
+    chunk = list(prompt[start:start + R])
+    inject = feed.chunk(start, R) if feed is not None else None
+    out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, inject=inject,
+                  head=head)
+    out = out.clone() if head else None
+    e.last_hidden = b.fnormed[R - 1:R].clone()
+    if drafter is not None:
+        drafter.add_taps(e.tap_rows(R, b))
+    if mtp:
+        nxt = list(prompt[start + 1:start + R + 1])
+        if nxt:
+            with prof.timed("mtp absorb"):
+                _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
+    with prof.timed("commit"):
+        commit(w, st, b, R, R)
+    return out
 
 
 def _absorb_rows(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> None:
