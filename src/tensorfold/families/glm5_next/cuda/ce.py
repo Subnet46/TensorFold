@@ -321,15 +321,19 @@ class CeExchange:
         stream.wait_event(self.theirs[p][k])
 
     # -- the row split's two exchanges ---------------------------------------------------------------------------------
-    def partials(self, part: torch.Tensor, H: int, off: int, n: int) -> None:
+    def partials(self, part: torch.Tensor, H: int, off: int, n: int, at: int | None = None) -> None:
         """Piece (off, n): this rank's fp32 partial rows of each peer q (part[q H + off ..]) into q's staging block
-        of the piece ([N, n, D] at N x off rows of the arena, this rank's slot); the peers' into this rank's."""
+        of the piece ([N, n, D] at N x ``at`` rows of the arena, ``at`` = off unless given; this rank's slot); the
+        peers' into this rank's."""
 
         d = self.width
         if part.shape[1] != d or part.dtype != torch.float32 or not part.is_contiguous():
             raise ValueError("ce partials: contiguous fp32 rows of the arena's width")
+        at = off if at is None else at
+        if at + n > self.H:
+            raise ValueError(f"ce partials: arena rows {at} .. {at + n} past its {self.H}")
         row = d * 4
-        copies = [(self.remote[q] + (self.world * off + self.rank * n) * row, part[q * H + off].data_ptr(), n * row)
+        copies = [(self.remote[q] + (self.world * at + self.rank * n) * row, part[q * H + off].data_ptr(), n * row)
                   for q in self.peers]
         self.exchange(copies)
 
@@ -339,12 +343,16 @@ class CeExchange:
         d = self.width
         return self.rs[self.world * off * d:self.world * (off + n) * d].view(self.world, n, d)
 
-    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int) -> None:
-        """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging,
-        then the peers' rows from this rank's staging into place (rows p H + off ..)."""
+    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None) -> None:
+        """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging
+        (its rows ``at`` .., ``at`` = off unless given), then the peers' rows from this rank's staging into place
+        (rows p H + off ..)."""
 
         if len(outs) > self.tensors:
             raise ValueError(f"ce rows: {len(outs)} buffers, the staging holds {self.tensors}")
+        at = off if at is None else at
+        if at + n > self.H:
+            raise ValueError(f"ce rows: staging rows {at} .. {at + n} past its {self.H}")
         d = self.width
         row = d * 2
         mine = self.rank * H + off
@@ -354,9 +362,9 @@ class CeExchange:
             if buf.shape[1] != d or buf.dtype != torch.bfloat16 or not buf.is_contiguous():
                 raise ValueError("ce rows: contiguous bf16 rows of the arena's width")
             for q in self.peers:                 # sender r's slot in receiver q's staging: (r - q - 1) mod N
-                at = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + off) * row
-                copies.append((self.remote[q] + self.rs_bytes + at, buf[mine].data_ptr(), n * row))
+                pos = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + at) * row
+                copies.append((self.remote[q] + self.rs_bytes + pos, buf[mine].data_ptr(), n * row))
         self.exchange(copies)
         for t, buf in enumerate(outs):
             for p in self.peers:
-                buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, off:off + n])
+                buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, at:at + n])

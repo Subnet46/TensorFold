@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import glue, index_split, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
+from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 
@@ -970,7 +970,10 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, 
         rows, features = inject
         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
     if b.prefill and b.split is not None and sparse_np is None and b.split.applies(R):
-        split_layers(w, st, b, R, nch, host_pos, mixer)      # also leaves the taps and b.hidden[:R]
+        if lanes.applies(w, b, R, host_pos, sparse_np, mixer):
+            lanes.lane_layers(w, st, b, R, host_pos)        # TF_GLM_PREFILL_LANES=2 (patch 0123): two lanes
+        else:
+            split_layers(w, st, b, R, nch, host_pos, mixer)  # also leaves the taps and b.hidden[:R]
     else:
         for layer in w.layers:
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)

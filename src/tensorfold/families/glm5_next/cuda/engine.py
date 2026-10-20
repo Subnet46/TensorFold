@@ -649,6 +649,9 @@ class GlmEngine:
         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
 
         mine += index_split_settings().code()
+        from . import lanes as lanes_mod                              # patch 0123: TF_GLM_PREFILL_LANES*
+
+        mine += lanes_mod.code()
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -661,7 +664,8 @@ class GlmEngine:
                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*): "
+                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
+                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS): "
                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                "every rank the same flags")
@@ -724,6 +728,9 @@ class GlmEngine:
                           "(only shorter ones split)", flush=True)
         if rank == 0 and index_split_settings().on and world > 1:
             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
+        if rank == 0 and lanes_mod.LANES > 1:
+            print(f"[tensorfold] {lanes_mod.describe()}"
+                  + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
         c = self.copy
         if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
             print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "

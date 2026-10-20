@@ -160,6 +160,7 @@ class HcSplit:
         # takes the [N, n, D] staging blocks of more than two ranks at any world size
         self.ce_mode = settings.exchange == "ce"
         self.ce = None
+        self.ce_at = 0                  # the arena rows this split's staging starts at (a prefill lane's offset)
         self.blocks = world > 2 or self.ce_mode
         # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
         self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
@@ -229,7 +230,7 @@ class HcSplit:
         if self.ce_mode and self.ce is None:
             raise RuntimeError("TF_GLM_HC_EXCHANGE=ce: the copy-engine exchange is set up by warm() at startup")
         if self.ce is not None:                       # the staging blocks in this rank's copy-engine arena
-            self.got = [self.ce.block(off, n) for off, n in self.pieces]
+            self.got = [self.ce.block(self.ce_at + off, n) for off, n in self.pieces]
         elif N == 2 and self.gather:
             self.got = [b.gath[(2 * off + self.peer * n) * d:(2 * off + self.peer * n + n) * d].view(n, d)
                         for off, n in self.pieces]
@@ -268,7 +269,7 @@ class HcSplit:
         off, n = self.pieces[j]
         b = self.b
         if self.ce is not None:                         # copy engines: into each peer's staging block of the piece
-            self.ce.partials(b.part, self.H, off, n)
+            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off)
             return
         if self.world > 2:
             if self.gather:                             # every rank's whole partial (one piece)
@@ -291,7 +292,7 @@ class HcSplit:
         off, n = self.pieces[j]
         mine = self.mine() + off
         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
-            self.ce.rows(outs, self.H, off, n)
+            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off)
             return
         if self.gather:                                 # one piece: rank order is row order
             for t in outs:
