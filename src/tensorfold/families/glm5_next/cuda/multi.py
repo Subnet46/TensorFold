@@ -384,9 +384,12 @@ class MultiDecoder:
         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
         self.drafts = drafts
         if self.drafts is None and engine.drafter is not None:
+            from . import dflash2_fast
             from .dflash2_multi import MultiDrafter
 
-            self.drafts = MultiDrafter(engine.drafter, streams=streams)
+            fast = dflash2_fast.settings()               # TF_GLM_DRAFT_FAST=1: the fused block pass (drafts only)
+            self.drafts = (dflash2_fast.fast_drafter(engine.drafter, streams, fast, window=MAX_WINDOW) if fast.on
+                           else MultiDrafter(engine.drafter, streams=streams))
             graphs = os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None else draft_graphs
             if graphs and torch.cuda.is_available():
                 self.drafts.capture()
@@ -1399,6 +1402,9 @@ class MultiDecoder:
             if l.policy is not None:
                 l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
                               max(0, s.count - len(s.out)))
+        wants = getattr(self.drafts, "wants_ahead", None)
+        if wants is not None and tune.depth != "joint" and wants():
+            self._draft_ahead(lanes)                       # TF_GLM_DRAFT_FAST_AHEAD (dflash2_fast)
         if prof is not None:
             prof.mark("emit")
             prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
@@ -1427,6 +1433,27 @@ class MultiDecoder:
             drafts[k] = drafts[k][:n]
 
     # -- ends ----------------------------------------------------------------------------------------------------------------
+    def _draft_ahead(self, lanes: list[Lane]) -> None:
+        """Both ranks, at a round's end: the next round's DFlash2 requests of these lanes, as ``_round`` builds them
+        (copy drafts first), handed to the drafter, which launches their pass now when TF_GLM_DRAFT_FAST_AHEAD is on
+        (it then runs while the host emits, plans and sends the next round). Drafts only: nothing here can change a
+        reply, and every rank builds the same requests from the state they share."""
+
+        from .decode import copy_room
+        from .dflash2_multi import DraftRequest
+
+        reqs = []
+        for l in lanes:
+            if l.s.done or not l.dflash or l.depth <= 0:
+                continue
+            if l.copies is not None and l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)):
+                continue
+            conf = l.policy.confidence
+            if self.tune.depth == "scale":
+                conf = scaled_confidence(conf, len(lanes), self.tune.alpha)
+            reqs.append(DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling, conf, **l.policy.chain_rule))
+        self.drafts.ahead(reqs)
+
     def finish(self, done: list[Stream]) -> None:
         """Rank 0: finished (or cancelled) streams leave on both ranks; an idle rank 1 is told to wait for the bell."""
 

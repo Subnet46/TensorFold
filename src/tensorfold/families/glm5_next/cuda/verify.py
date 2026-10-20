@@ -93,6 +93,9 @@ class BatchedVerify:
         if taps:
             self.b.set_taps(tuple(taps), c.hidden)
         self.taps = bool(taps)
+        from .dflash2_fast import settings as _fast              # TF_GLM_DRAFT_FAST: one copy of the window's taps
+
+        self.one_cat = self.taps and _fast().on
         self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS, ring=e.caches.ring if e.caches.rings else None)
         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
         kda_layers = [l for l in w.layers if l.kind == "kda"]
@@ -243,10 +246,14 @@ class BatchedVerify:
             select = index and self.seg_rows.any_sparse()
             logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
         out, taps, at = [], [], 0
+        whole = torch.cat([t[:R] for t in b.taps], dim=1) if self.one_cat else None     # views of one copy, the same rows
         for seg in segments:
             n = len(seg.tokens)
             out.append(logits[at:at + n])
-            taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
+            if whole is not None:
+                taps.append(whole[at:at + n])
+            else:
+                taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
             at += n
         return Verified(out, taps)
 

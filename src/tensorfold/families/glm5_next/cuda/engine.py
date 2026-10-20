@@ -652,6 +652,9 @@ class GlmEngine:
         from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
 
         mine += draft_skip_mod.code()
+        from . import dflash2_fast                                    # TF_GLM_DRAFT_FAST*: drafts' passes, gathers
+
+        mine += dflash2_fast.code() if parallel > 1 and drafter is not None else [0, 0, 0]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -665,7 +668,8 @@ class GlmEngine:
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
-                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP): "
+                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
+                               "TF_GLM_DRAFT_FAST*): "
                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                "every rank the same flags")
@@ -765,6 +769,8 @@ class GlmEngine:
             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
         if rank == 0 and moe_glue_mod.on():
             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+        if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
+            print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:
             print(f"[tensorfold] {lanes_mod.describe()}"
                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
