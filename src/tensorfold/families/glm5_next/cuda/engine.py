@@ -646,6 +646,9 @@ class GlmEngine:
         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
 
         mine += index_split_settings().code()
+        from .index_split import gather_code as index_gather_code     # patch 0198: TF_GLM_INDEX_SPLIT_GATHER
+
+        mine.append(index_gather_code())
         from . import lanes as lanes_mod                # patches 0123, 0128: TF_GLM_PREFILL_LANES*, TF_GLM_KDA_OVERLAP
 
         mine += lanes_mod.code()
@@ -765,6 +768,8 @@ class GlmEngine:
                           "(only shorter ones split)", flush=True)
         if rank == 0 and index_split_settings().on and world > 1:
             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
+        from . import index_split as index_split_mod        # patch 0198: every rank, the split's own IPC gather
+        index_split_mod.warm(getattr(self.comm, "nccl", self.comm), rank, world, prefill_rows)
         if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
         if rank == 0 and moe_glue_mod.on():

@@ -185,7 +185,8 @@ class LaneSplit(HcSplit):
             self.stream.wait_event(self.ev_fill[0])
             if ready is not None:
                 self.stream.wait_event(ready)
-            self._swap_partial(0)
+            with prof.timed("lane: partials exchange", events_only=True):
+                self._swap_partial(0)
 
     def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
@@ -196,7 +197,7 @@ class LaneSplit(HcSplit):
         b, c = self.b, self.w.cfg
         lo, hi = self.mine(), self.mine() + self.H
         outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + ([b.normed] if hc is not None else [])
-        with torch.cuda.stream(self.stream):
+        with torch.cuda.stream(self.stream), prof.timed("lane: glue + rows exchange", events_only=True):
             self._post(0, lo, hi)
             x = b.x[lo:hi]
             for slot in taps:

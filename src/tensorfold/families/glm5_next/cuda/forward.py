@@ -615,9 +615,34 @@ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
     c = w.cfg
     a = layer.dsa
     mm(b, b.normed[lo:hi], a.proj, b.xs[lo:hi], b.dp[lo:hi])
-    glue.rmsnorm(b.dp[lo:hi, :c.q_lora], a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
-    glue.rmsnorm(b.dp[lo:hi, c.q_lora:], a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
+    _dsa_norms(c, a, b, lo, hi)
     mm(b, b.qr[lo:hi], a.q_b, b.xs_qr[lo:hi], b.q[lo:hi].view(hi - lo, a.heads * c.qk_dim))
+
+
+def _dsa_norms(c, a, b: Buffers, lo: int, hi: int) -> None:
+    """The DSA front's query and latent RMSNorms of rows lo .. hi (one launch under TF_GLM_DSA_FUSE norms, patch
+    0193: the same bits)."""
+
+    qa, qb = b.dp[lo:hi, :c.q_lora], b.dp[lo:hi, c.q_lora:]
+    from . import dsa_fuse
+
+    if dsa_fuse.wanted() and dsa_fuse.norm_pair_ok(qa, qb) and dsa_fuse.on(
+            "norms", lambda: dsa_fuse.check_norms(c.q_lora, c.kv_lora, qa.device)):
+        dsa_fuse.norm_pair(qa, a.q_norm, b.qr[lo:hi], b.xs_qr[lo:hi], qb, a.kv_norm, b.lat[lo:hi], b.xs_lat[lo:hi],
+                           c.eps)
+        return
+    glue.rmsnorm(qa, a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
+    glue.rmsnorm(qb, a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
+
+
+def _writes_fused(lc: torch.Tensor) -> bool:
+    """TF_GLM_DSA_FUSE writes (patch 0193): the latent write, index write and pool keys in one launch, once checked
+    bit for bit on this GPU (for this cache format)."""
+
+    from . import dsa_fuse
+
+    return bool(dsa_fuse.wanted()) and dsa_fuse.on(
+        "writes", lambda: dsa_fuse.check_writes(kv8.kind_of(lc), lc.device))
 
 
 def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
@@ -627,8 +652,9 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
 
     c = w.cfg
     a = layer.dsa
-    for lo, hi in undone(R, done):
-        dsa_front(layer, w, b, lo, hi)
+    with prof.timed("dsa: front", events_only=True):
+        for lo, hi in undone(R, done):
+            dsa_front(layer, w, b, lo, hi)
     HL = a.heads
     if a.absorb is not None:
         return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer=layer.index)
@@ -693,7 +719,8 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
 
     o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer)
-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
+    with prof.timed("dsa: out + all-gather", events_only=True):
+        return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
 
 
 def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
@@ -708,8 +735,10 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
     HL = a.heads
     s = b.lat_s
     rs = slice(lo, lo + R)
-    with prof.timed("dsa: latent write"):
-        latent.latent_write(b.lat[rs], lc, pos_dev)
+    fused = index is not None and _writes_fused(lc)      # TF_GLM_DSA_FUSE writes (patch 0193): with the indexer's
+    if not fused:
+        with prof.timed("dsa: latent write"):
+            latent.latent_write(b.lat[rs], lc, pos_dev)
     # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
@@ -719,7 +748,14 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
             glue.router(b.normed[rs], ix.gate, b.igr[rs])
-            sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+            if fused:
+                from . import dsa_fuse
+
+                dsa_fuse.writes(b.lat[rs], lc, b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig,
+                                pk, pos_dev)
+            else:
+                sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
+                                    pos_dev)
     with prof.timed("dsa: absorb"):
         qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], prompt=b.prefill and latent.PROMPT_MMA)
     l2pf.site(layer, "o")
@@ -766,13 +802,14 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
     if a.absorb is None:
         raise ValueError("segmented windows need the latent cache (TF_GLM_LATENT=1)")
     mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
-    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
-    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+    _dsa_norms(c, a, b, 0, R)
     HL = a.heads
     mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
     s = b.lat_s
-    with prof.timed("dsa: latent write"):
-        latent.seg_latent_write(b.lat[:R], lc, rows)
+    fused = index is not None and _writes_fused(lc)      # TF_GLM_DSA_FUSE writes (patch 0193): with the indexer's
+    if not fused:
+        with prof.timed("dsa: latent write"):
+            latent.seg_latent_write(b.lat[:R], lc, rows)
     tokens = counts = None
     if index is not None:
         ik, ig, pk = index
@@ -780,7 +817,14 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
             glue.router(b.normed[:R], ix.gate, b.igr[:R])
-            sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
+            if fused:
+                from . import dsa_fuse
+
+                dsa_fuse.seg_writes(b.lat[:R], lc, b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik,
+                                    ig, pk, rows)
+            else:
+                sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
+                                        rows)
         if select:
             with prof.timed("dsa: select tokens"):
                 mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])

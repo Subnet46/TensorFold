@@ -247,6 +247,12 @@ def prefill_matmul(x: torch.Tensor, q: Q4, *, f32: bool = False, tile: int = 0,
         x = x.clone(memory_format=torch.contiguous_format)
     if out is None:
         out = torch.empty((x.shape[0], q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+    if tile >= 32:                       # qmm_prefill2's variants (patch 0195): the same bits, once checked here
+        from . import qmm_prefill2
+
+        if qmm_prefill2.matmul(x, q, f32, out, tile):
+            return out
+        tile = 0
     _ext().qmm_prefill(x, q.weight, q.scales, q.biases, out, q.n, q.gs, f32, tile)
     return out
 
