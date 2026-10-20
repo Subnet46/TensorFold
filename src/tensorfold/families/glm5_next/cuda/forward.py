@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
+from . import glue, index_split, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 
@@ -689,9 +689,15 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
                             hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
     if sparse_rows:
         with prof.timed("dsa: select tokens"):
-            mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
-            tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
-                                                  pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+            if index_split.applies(w, b, R, host_pos, all_sparse, sparse_np):
+                # TF_GLM_INDEX_SPLIT (patch 0120): each rank selects its blocks of rows, the pools all-gathered
+                tokens, counts = index_split.select(w, b, b.qr[rs], b.xs_qr[rs], ix.qb, b.qi[rs],
+                                                    b.ikr[rs, c.index_dim:], pk, host_pos, R, pk.shape[0] - 2,
+                                                    pos_dev, lambda x, q, xs, out: mm(b, x, q, xs, out))
+            else:
+                mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
+                tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+                                                      pk.shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
             if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
                 latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
@@ -788,6 +794,8 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
             done = (0, R)
         with prof.timed("moe: routed (exl3)"):
             if b.plan is None:           # the universal route (weights.exl3_route)
+                from . import exl3_generic
+
                 exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
             else:
                 exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
