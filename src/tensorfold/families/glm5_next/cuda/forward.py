@@ -388,18 +388,46 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
     return partials(w, b, R, fill)
 
 
-def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+def undone(R: int, done: tuple[int, int] | None) -> list[tuple[int, int]]:
+    """The row ranges of [0, R) outside ``done`` (a block's front already run on those rows, TF_GLM_PREFILL_OVERLAP=2),
+    in row order; every row when ``done`` is None."""
+
+    if done is None:
+        return [(0, R)]
+    lo, hi = done
+    return [(a, z) for a, z in ((0, min(lo, R)), (max(hi, 0), R)) if z > a]
+
+
+def kda_front(layer: LayerW, b: Buffers, lo: int, hi: int) -> None:
+    """A prompt chunk's KDA input projections of rows lo .. hi (row-independent: the prompt matmul's bits for any
+    row range; BF16 / FP8 projections of an EXL3 checkpoint keep rows apart too)."""
+
+    k = layer.kda
+    p = b.kproj[0, lo:hi]
+    mm(b, b.normed[lo:hi], k.proj, b.xs[lo:hi], p)
+    mm(b, p[:, k.fa_off:k.fa_off + 128], k.fb, None, b.ka[lo:hi])
+    mm(b, p[:, k.ga_off:k.ga_off + 128], k.gb, None, b.kg[lo:hi])
+
+
+def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tuple[int, int] | None = None
+              ) -> torch.Tensor:
+    """``done``: rows whose projections ``kda_front`` already wrote (a prompt chunk, TF_GLM_PREFILL_OVERLAP=2)."""
+
     c = w.cfg
     k = layer.kda
     li = st.kda_index[layer.index]
     p = b.kproj[0, :R] if b.prefill else st.proj[li, :R]
     pre = b.prefill
     with prof.timed("kda: projections"):
-        mm(b, b.normed[:R], k.proj, b.xs[:R], p)
-        fa = p[:, k.fa_off:k.fa_off + 128]
-        ga = p[:, k.ga_off:k.ga_off + 128]
-        mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
-        mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+        if pre:
+            for lo, hi in undone(R, done):
+                kda_front(layer, b, lo, hi)
+        else:
+            mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+            fa = p[:, k.fa_off:k.fa_off + 128]
+            ga = p[:, k.ga_off:k.ga_off + 128]
+            mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+            mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
     cur = st.cur[li]
     with prof.timed("kda: recurrence"):
         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
@@ -436,18 +464,27 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
         return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R)
 
 
-def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
-              R: int, nch: int | None, index=None, host_pos: int | None = None,
-              sparse_np: int | None = None) -> torch.Tensor:
-    """Write every index key and pool; rows past the dense limit attend to their top-512 pools (host_pos eager, or sparse_np in a captured graph)."""
+def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+    """DSA's projection, query / latent norms and query expansion of rows lo .. hi (row-independent kernels)."""
 
     c = w.cfg
     a = layer.dsa
-    mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
-    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
-    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+    mm(b, b.normed[lo:hi], a.proj, b.xs[lo:hi], b.dp[lo:hi])
+    glue.rmsnorm(b.dp[lo:hi, :c.q_lora], a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
+    glue.rmsnorm(b.dp[lo:hi, c.q_lora:], a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
+    mm(b, b.qr[lo:hi], a.q_b, b.xs_qr[lo:hi], b.q[lo:hi].view(hi - lo, a.heads * c.qk_dim))
+
+
+def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+              R: int, nch: int | None, index=None, host_pos: int | None = None,
+              sparse_np: int | None = None, done: tuple[int, int] | None = None) -> torch.Tensor:
+    """Write every index key and pool; rows past the dense limit attend to their top-512 pools (host_pos eager, or sparse_np in a captured graph). ``done``: rows ``dsa_front`` already ran on (TF_GLM_PREFILL_OVERLAP=2)."""
+
+    c = w.cfg
+    a = layer.dsa
+    for lo, hi in undone(R, done):
+        dsa_front(layer, w, b, lo, hi)
     HL = a.heads
-    mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
     if a.absorb is not None:
         return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np)
     if sparse_np is not None:
@@ -593,14 +630,32 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
 
 
-def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+def mlp_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
     m = layer.mlp
-    mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
-    glue.swiglu(b.gu[:R], b.act[:R], b.xs_act[:R], w.cfg.limit)
+    mm(b, b.normed[lo:hi], m.gu, b.xs[lo:hi], b.gu[lo:hi])
+    glue.swiglu(b.gu[lo:hi], b.act[lo:hi], b.xs_act[lo:hi], w.cfg.limit)
+
+
+def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor:
+    m = layer.mlp
+    for lo, hi in undone(R, done):
+        mlp_front(layer, w, b, lo, hi)
     return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
 
 
-def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+def shared_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+    """The MoE's shared expert (an EXL3 checkpoint's, BF16 / FP8 / 4-bit matmuls) on rows lo .. hi: b.sy."""
+
+    s, c = layer.moe.shared, w.cfg
+    with prof.timed("moe: shared expert"):
+        mm(b, b.normed[lo:hi], s.gu, b.xs[lo:hi], b.sgu[lo:hi])
+        glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
+        mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
+
+
+def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor:
+    """``done``: rows whose shared expert ``shared_front`` already ran (TF_GLM_PREFILL_OVERLAP=2)."""
+
     c = w.cfg
     m = layer.moe
     with prof.timed("moe: route"):
@@ -617,13 +672,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
                 exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
             else:
                 exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
-        s = m.shared
 
         def fill(lo: int, hi: int) -> None:
-            with prof.timed("moe: shared expert"):
-                mm(b, b.normed[lo:hi], s.gu, b.xs[lo:hi], b.sgu[lo:hi])
-                glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
-                mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
+            for a, z in undone(hi, done):     # rows lo .. hi the front has not run on
+                if max(a, lo) < z:
+                    shared_front(layer, w, b, max(a, lo), z)
             with prof.timed("moe: combine"):
                 # the shared row read from sy where it is (the copy's bits, one pass less); decode windows too unless
                 # TF_GLM_COMBINE_SY=0
@@ -647,21 +700,40 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
 
 
 def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
-           sparse_np: int | None) -> torch.Tensor | None:
+           sparse_np: int | None, done: tuple[int, int] | None = None) -> torch.Tensor | None:
     """The layer's KDA or DSA block on b.normed: every rank's partials, or None row-split (``partials``)."""
 
     if layer.kind == "kda":
         with prof.timed("kda"):
-            return kda_block(layer, w, st, b, R)
+            return kda_block(layer, w, st, b, R, done)
     di = st.dsa_index[layer.index]
     with prof.timed("dsa (total)"):
         return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
-                         st.index[di] if st.index is not None else None, host_pos, sparse_np)
+                         st.index[di] if st.index is not None else None, host_pos, sparse_np, done)
 
 
-def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
+def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
-        return mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+        return mlp_block(layer, w, b, R, done) if layer.mlp is not None else moe_block(layer, w, b, R, done)
+
+
+def mixer_front(layer: LayerW, w: Weights, b: Buffers):
+    """A prompt chunk's KDA / DSA front as ``front(lo, hi)`` (``hcsplit.HcSplit.glue``)."""
+
+    if layer.kind == "kda":
+        return lambda lo, hi: kda_front(layer, b, lo, hi)
+    return lambda lo, hi: dsa_front(layer, w, b, lo, hi)
+
+
+def ffn_front(layer: LayerW, w: Weights, b: Buffers):
+    """The dense MLP's gate/up or the MoE's shared expert as ``front(lo, hi)``; None for a MoE without a separate
+    shared expert (an MLX checkpoint's routes it with the others)."""
+
+    if layer.mlp is not None:
+        return lambda lo, hi: mlp_front(layer, w, b, lo, hi)
+    if layer.moe.shared is not None:
+        return lambda lo, hi: shared_front(layer, w, b, lo, hi)
+    return None
 
 
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
@@ -693,20 +765,25 @@ def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, hos
     sp = b.split
     layers = w.layers
     sp.begin(R)
+    fronts = sp.settings.fronts
     try:
         Rp = sp.Rp                               # R, or R + 1 with a zero pad row for an odd chunk
         first, h = layers[0], layers[0].attn_hc
         glue.hc_pre(b.x[:Rp], h.fn, h.base, h.scale, first.in_norm, b.normed[:Rp], b.xs[:Rp], b.post[:Rp],
                     b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+        done = None                              # rows whose front the glue already ran (TF_GLM_PREFILL_OVERLAP=2)
         for i, layer in enumerate(layers):
-            _mixer(layer, w, st, b, R, nch, host_pos, None)
+            _mixer(layer, w, st, b, R, nch, host_pos, None, done)
+            front = ffn_front(layer, w, b) if fronts else None
             with prof.timed("hc"):
-                sp.glue(layer.ffn_hc, layer.post_norm)
-            _ffn(layer, w, b, R)
+                sp.glue(layer.ffn_hc, layer.post_norm, front=front)
+            _ffn(layer, w, b, R, sp.own() if front is not None else None)
             nxt = layers[i + 1] if i + 1 < len(layers) else None
+            front = mixer_front(nxt, w, b) if fronts and nxt is not None else None
             with prof.timed("hc (layer end)"):
                 sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
-                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None)
+                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None, front=front)
+            done = sp.own() if front is not None else None
     finally:
         sp.finish()
 
