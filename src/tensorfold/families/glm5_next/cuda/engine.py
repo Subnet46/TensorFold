@@ -473,7 +473,26 @@ class GlmEngine:
         self.serial_only = serial_only
         self.comm = comm if comm is not None else open_comm(rank, world, master, port)
         self.comm.barrier()
-        if comm is None and os.environ.get("TF_GLM_COMM", "nccl") == "roce":
+        transport = os.environ.get("TF_GLM_COMM", "nccl").strip().lower() or "nccl"
+        if transport not in ("nccl", "roce", "ipc"):
+            raise ValueError(f"TF_GLM_COMM: nccl, roce or ipc, not {transport!r}")
+        if comm is None and transport == "ipc":
+            # small all-gathers (a decode round's partials, the samplers, the messages) as one-shot CUDA IPC pushes
+            # between the GPUs of this host; without peer-to-peer access every rank says so and keeps NCCL
+            from tensorfold.cuda.ipc import IpcComm, IpcUnavailable
+
+            try:
+                self.comm = IpcComm(self.comm, rank, world)
+            except IpcUnavailable as exc:
+                if rank == 0:
+                    print(f"[tensorfold] TF_GLM_COMM=ipc: {exc}; every all-gather stays on NCCL", flush=True)
+            else:
+                if rank == 0:
+                    ipc = self.comm.ipc
+                    print(f"[tensorfold] all-gathers up to {ipc.max_bytes >> 10} KiB over CUDA IPC (one-shot "
+                          f"peer-to-peer push, blocks of {ipc.block_bytes >> 10} KiB x {ipc.threads} threads, wait "
+                          f"limit {ipc.timeout_ns / 1e9:g} s), larger ones over NCCL", flush=True)
+        if comm is None and transport == "roce":
             # small all-gathers (a decode round's partials, the samplers) over b12x's one-shot RoCE transport
             from tensorfold.cuda.roce import RoceComm
 
