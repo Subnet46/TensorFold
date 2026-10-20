@@ -440,6 +440,48 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
 
 
+def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
+                 select: bool = True) -> torch.Tensor | None:
+    """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
+    streams' rows back to back, each stream's latents (lc), index keys, gates and pooled keys (index: arenas) in
+    its own extent. Each segment's rows get the bits of that segment alone through dsa_block (the projections,
+    absorb and expand keep rows apart; the attention kernels are latent.seg_* / sparse.seg_*). Graphs: one per R
+    covers every position mix. ``select`` False skips the token selection (eager windows with no sparse row:
+    ``rows.any_sparse()``); ``sel``: segments.SelectScratch, needed with an index."""
+
+    c = w.cfg
+    a = layer.dsa
+    if a.absorb is None:
+        raise ValueError("segmented windows need the latent cache (TF_GLM_LATENT=1)")
+    mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
+    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
+    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+    HL = a.heads
+    mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
+    s = b.lat_s
+    with prof.timed("dsa: latent write"):
+        latent.seg_latent_write(b.lat[:R], lc, rows)
+    tokens = counts = None
+    if index is not None:
+        ik, ig, pk = index
+        ix = a.index
+        with prof.timed("dsa: indexer update"):
+            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
+            glue.router(b.normed[:R], ix.gate, b.igr[:R])
+            sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
+        if select:
+            with prof.timed("dsa: select tokens"):
+                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+                tokens, counts = sparse.seg_select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, rows, sel)
+    with prof.timed("dsa: absorb"):
+        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
+    with prof.timed("dsa: attention"):
+        ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
+    with prof.timed("dsa: expand"):
+        o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
+
+
 def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     m = layer.mlp
     mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
