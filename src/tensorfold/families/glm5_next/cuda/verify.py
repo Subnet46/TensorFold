@@ -85,7 +85,7 @@ class BatchedVerify:
         if taps:
             self.b.set_taps(tuple(taps), c.hidden)
         self.taps = bool(taps)
-        self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS)
+        self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS, ring=e.caches.ring if e.caches.rings else None)
         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
         kda_layers = [l for l in w.layers if l.kind == "kda"]
         n = len(kda_layers)
@@ -120,7 +120,7 @@ class BatchedVerify:
         pool = torch.cuda.graph_pool_handle()
         for R in rows or range(1, self.rows_max + 1):
             self._stage([0] * R)
-            self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)
+            self.seg_rows.set([self._span(e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
             self._write_table([(R, 0, 0, 0, R)])
             run = lambda: compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, index))  # noqa: E731
             for _ in range(2):
@@ -169,6 +169,12 @@ class BatchedVerify:
         self._write_table([(len(s.tokens), s.st.slot, s.st.cur[0] if s.st.cur else 0, s.st.slot,
                             len(s.tokens) if keeps is None else keeps[k]) for k, s in enumerate(segments)])
 
+    def _span(self, st, pos: int, n: int) -> tuple:
+        """SegRows' segment of ``n`` rows of ``st`` from ``pos``: its extent's base, and its slot's ring base."""
+        caches = self.e.caches
+        span = (st.base, pos, n)
+        return span + (caches.ring_base(st.slot),) if caches.rings else span
+
     def _write_table(self, rows) -> None:
         from . import kda as kda_mod
 
@@ -201,7 +207,7 @@ class BatchedVerify:
         spans = []
         for seg in segments:
             check_room(w, seg.st, len(seg.tokens))
-            spans.append((seg.st.base, seg.st.pos, len(seg.tokens)))
+            spans.append(self._span(seg.st, seg.st.pos, len(seg.tokens)))
         tokens = [t for seg in segments for t in seg.tokens]
         R = len(tokens)
         self._stage(tokens)
@@ -240,7 +246,7 @@ class BatchedVerify:
         di = self.dsa_index[layer.index]
         planes = caches.arena.planes
         lc = planes[caches.kc[di]].tensor
-        index = None if caches.index is None else tuple(planes[i].tensor for i in caches.index[di])
+        index = None if caches.index is None else caches.index_tensors(di)
         with prof.timed("dsa (total)"):
             return dsa_segments(layer, self.w, lc, self.b, R, self.seg_rows, self.sel, index, select=select)
 

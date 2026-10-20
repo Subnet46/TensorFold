@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse
+from . import exl3_generic, glue, kda as kda_mod, kv8, latent, prof, qmm, sparse
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 
@@ -172,13 +172,28 @@ class Buffers:
         return p
 
 
+def index_ring(capacity: int, rows: int) -> int:
+    """Rows of the indexer's key and gate rings (``sparse.index_update``) for windows of up to ``rows`` rows: those
+    and the 3 before them, rounded up to 64; the context when that is less (then no row wraps)."""
+    return min(capacity, -(-(rows + 3) // 64) * 64)
+
+
 class Caches:
     """Every per-token cache of the model over ``rows`` tokens of a shared pool (``pool.Arena``): per DSA layer its
     latents (or keys and values without the latent cache); the MTP layer's; and with long contexts per indexed layer
     (the DSA layers, then the MTP layer) its index keys, gates and pooled keys (a row a pool of 4 tokens, 2 rows of
-    pad). Element types and layouts are decided here; a ``State`` views them over its extent (``bind``)."""
+    pad). Element types and layouts are decided here; a ``State`` views them over its extent (``bind``).
 
-    def __init__(self, w: Weights, rows: int) -> None:
+    ``ring``: the index keys and gates (read only by the pool a token falls in, while it fills) are not arena planes
+    but one ring of ``ring`` rows per stream slot (``streams`` of them, ``index_ring``): token t of the stream in slot
+    s at row s x ring + t % ring. They stay with the slot when its extent moves; a kept prompt carries the rows of its
+    pools still filling (``decode.Snapshot.tail``). None: arena planes (token t at its extent's row).
+
+    ``kv``: the latent planes' and pooled keys' format (TF_GLM_KV, ``kv8``): bf16, or fp8 (a uint8 row a token /
+    pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only."""
+
+    def __init__(self, w: Weights, rows: int, *, streams: int = 1, ring: int | None = None,
+                 kv: str = "bf16") -> None:
         from .pool import Arena, Plane
 
         c = w.cfg
@@ -186,15 +201,21 @@ class Caches:
         HL = c.heads // w.world
         dsa = len([l for l in w.layers if l.kind == "dsa"])
         self.latent = latent.ENABLED
+        if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
+            raise ValueError(f"TF_GLM_KV={kv}: bf16, or fp8 with the latent cache (TF_GLM_LATENT=1)")
+        self.kv = kv
         planes: list[Plane] = []
 
-        def add(shape, div: int = 1, pad: int = 0) -> int:
-            planes.append(Plane(torch.zeros((rows // div + pad, *shape), dtype=torch.bfloat16, device=dev), div, pad))
+        def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16") -> int:
+            n = rows // div + pad
+            t = (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
+                 torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
+            planes.append(Plane(t, div, pad))
             return len(planes) - 1
 
         def attention_planes() -> tuple[int, int | None]:
             if self.latent:          # one 512-wide latent a token and layer (kc), no separate values (vc)
-                return add((c.kv_lora,)), None
+                return add((c.kv_lora,), fmt=kv), None
             return add((HL, c.qk_dim)), add((HL, c.v_dim))
 
         self.kc, self.vc = [], []
@@ -203,13 +224,41 @@ class Caches:
             self.kc.append(k)
             self.vc.append(v)
         self.mtp = attention_planes() if w.mtp is not None else None
-        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
+        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys; with a
+        # ring, index[i] = (None, None, pool plane) and rings[i] = (keys, gates) [streams x ring, 128]
         self.index = None
+        self.rings = None
+        self.ring = None if ring is None else int(ring)
+        if self.ring is not None and self.ring < 4:
+            raise ValueError(f"index rings of {self.ring} rows")
         if w.meta.get("long_context"):
             n_idx = dsa + (1 if w.mtp is not None else 0)
-            self.index = [(add((c.index_dim,)), add((c.index_dim,)), add((c.index_dim,), 4, 2)) for _ in range(n_idx)]
+            if self.ring is None:
+                self.index = [(add((c.index_dim,)), add((c.index_dim,)), add((c.index_dim,), 4, 2, kv))
+                              for _ in range(n_idx)]
+            else:
+                self.index = [(None, None, add((c.index_dim,), 4, 2, kv)) for _ in range(n_idx)]
+                ring_rows = int(streams) * self.ring
+                self.rings = [tuple(torch.zeros((ring_rows, c.index_dim), dtype=torch.bfloat16, device=dev)
+                                    for _ in range(2)) for _ in range(n_idx)]
         self.arena = Arena(rows, planes)
         self.rows = rows
+
+    def index_tensors(self, i: int) -> tuple:
+        """Indexed layer i's (keys, gates, pooled keys) over every stream: the rings (or planes) and the pool plane."""
+
+        planes = self.arena.planes
+        pk = planes[self.index[i][2]].tensor
+        if self.rings is None:
+            return planes[self.index[i][0]].tensor, planes[self.index[i][1]].tensor, pk
+        return self.rings[i][0], self.rings[i][1], pk
+
+    def ring_base(self, slot: int) -> int:
+        """The first ring row of stream slot ``slot`` (index rows at ring_base + t % ring)."""
+        return 0 if self.ring is None else int(slot) * self.ring
+
+    def ring_bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for pair in (self.rings or []) for t in pair)
 
     def bind(self, st: "State", base: int, size: int) -> None:
         """Point ``st``'s caches at tokens [base, base + size) of the pool."""
@@ -219,7 +268,14 @@ class Caches:
         st.vc = [view(i) for i in self.vc]
         if self.mtp is not None:
             st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
-        st.index = None if self.index is None else [tuple(view(i) for i in trio) for trio in self.index]
+        if self.index is None:
+            st.index = None
+        elif self.rings is None:
+            st.index = [tuple(view(i) for i in trio) for trio in self.index]
+        else:                        # the slot's rings (index_update's ring: their rows) and the extent's pools
+            r0 = self.ring_base(st.slot)
+            st.index = [(ik[r0:r0 + self.ring], ig[r0:r0 + self.ring], view(trio[2]))
+                        for (ik, ig), trio in zip(self.rings, self.index)]
 
 
 class Slots:
@@ -269,8 +325,8 @@ class State:
     own (one sequence of ``capacity`` tokens, one slot), as it always held tensors of its own."""
 
     def __init__(self, w: Weights, capacity: int, rows: int, *, caches: Caches | None = None, base: int = 0,
-                 slots: Slots | None = None, slot: int = 0) -> None:
-        self.caches = caches if caches is not None else Caches(w, capacity)
+                 slots: Slots | None = None, slot: int = 0, kv: str = "bf16") -> None:
+        self.caches = caches if caches is not None else Caches(w, capacity, kv=kv)
         self.slots = slots if slots is not None else Slots(w, 1, rows)
         self.slot = slot
         kda_layers = [l for l in w.layers if l.kind == "kda"]
@@ -298,6 +354,11 @@ class State:
 
         self.base, self.capacity = int(base), int(capacity)
         self.caches.bind(self, self.base, self.capacity)
+
+    @property
+    def kv(self) -> str:
+        """The DSA caches' format (TF_GLM_KV): the pool's."""
+        return self.caches.kv
 
     @property
     def graph_key(self) -> tuple[int, int]:

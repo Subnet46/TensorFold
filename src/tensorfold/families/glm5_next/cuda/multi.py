@@ -611,8 +611,11 @@ class MultiDecoder:
         if self.drafts is not None:
             self._ctx(lane).reset()
         if hit is not None:
+            from .decode import put_ring_tail
+
             st.rec[st.cur[0]].copy_(hit.rec)
             st.conv.copy_(hit.conv)
+            put_ring_tail(st, hit)          # the index rows of its pools still filling, into this slot's rings
             st.set_pos(cut)
             if dflash:
                 if hit.drafter_end != cut or hit.drafter_rows is None:
@@ -684,6 +687,7 @@ class MultiDecoder:
         x = c.extent
         x.kept = [k for k in x.kept if k is not c]
         c.rec = c.conv = None
+        c.tail = None
         c.drafter_rows = None
         self._settle(x)
 

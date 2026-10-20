@@ -85,13 +85,14 @@ class Engine:
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
                  taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
-                 streams: int = 1, pool_rows: int | None = None) -> None:
-        """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere); ``split``: a
-        ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit;
-        ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``): draft chains take one row a step,
-        so the MTP buffers need not be as wide as the verify windows; ``streams``: stream slots (``forward.Slots``)
-        and ``pool_rows``: tokens of the shared cache pool (``forward.Caches``, default ``capacity``) for concurrent
-        streams (``multi``). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
+                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None) -> None:
+        """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
+        the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
+        anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
+        chunks, None or off: unsplit; ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``):
+        draft chains take one row a step, so the MTP buffers need not be as wide as the verify windows; ``streams``:
+        stream slots (``forward.Slots``) and ``pool_rows``: tokens of the shared cache pool (``forward.Caches``,
+        default ``capacity``) for concurrent streams (``multi``). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
         ``capacity`` tokens), the one the CUDA graphs were captured on, unless ``use`` points it at another."""
 
         if grid and prefill_rows % grid:
@@ -114,9 +115,15 @@ class Engine:
 
             self.pbuf.split = HcSplit(w, self.pbuf, split)
         self.mbuf = Buffers(w, min(mtp_rows or max_rows, max_rows), capacity) if w.mtp is not None else None
-        from .forward import Caches, Slots
+        from .forward import Caches, Slots, index_ring
 
-        self.caches = Caches(w, pool_rows or capacity)
+        # the indexer's key and gate rings, one a slot, hold the widest window (a prompt chunk, an MTP absorb chunk, a
+        # verify window, a stream's rows of a batched window) and the 3 rows before it
+        from . import kv8
+
+        self.caches = Caches(w, pool_rows or capacity, streams=streams,
+                             ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)),
+                             kv=kv8.kv_kind() if kv is None else kv)
         self.slots = Slots(w, streams, max_rows)
         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
         self.last_hidden: torch.Tensor | None = None
@@ -287,16 +294,55 @@ class Snapshot:
     rows: list | None = None      # the attention rows of ids, saved when another conversation took the live caches
     nbytes: int = 0
     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
+    tail: list | None = None      # the indexer rings' rows of the pools still filling at ids' end (``_ring_tail``)
+
+
+def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """(slots, rows) of the indexer's key and gate rings a snapshot of n tokens (m in the MTP head) needs besides the
+    pools: the tokens of each layer's pool still filling (n % 4 of them, the last ones), which later tokens' windows
+    overwrite in the ring (``forward.index_ring``). slots: ring rows (positions mod the ring); rows: [2, k, 128]
+    (keys, gates), cloned."""
+    index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
+    out = []
+
+    def take(trio, end):
+        ik, ig, _ = trio
+        slots = torch.arange(end - end % 4, end, device=ik.device) % ik.shape[0]
+        out.append((slots, torch.stack((ik[slots], ig[slots]))))
+
+    for trio in index[:len(kc)]:
+        if n % 4:
+            take(trio, n)
+    if m > 0 and m % 4 and len(index) > len(kc):
+        take(index[-1], m)
+    return out
+
+
+def put_ring_tail(st, snap: Snapshot) -> None:
+    """A kept snapshot's ring tail (``_ring_tail``) into ``st``'s rings (restore, and a multi-stream stream taking
+    over a kept prompt in any slot)."""
+    index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
+    idx = list(index[:len(kc)]) if len(snap.ids) % 4 else []
+    if snap.mtp_len > 0 and snap.mtp_len % 4 and len(index) > len(kc):
+        idx.append(index[-1])
+    tail = snap.tail or []
+    if len(tail) != len(idx):
+        raise ValueError("a snapshot's indexer ring rows do not match the caches they go back to")
+    for (ik, ig, _), (slots, rows) in zip(idx, tail):
+        ik.index_copy_(0, slots % ik.shape[0], rows[0])
+        ig.index_copy_(0, slots % ig.shape[0], rows[1])
 
 
 def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
                   drafter=None) -> Snapshot:
-    """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring."""
+    """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring; so
+    are the indexer rings' rows of the pools still filling (``_ring_tail``)."""
     st = e.st
     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
+    mtp_len = st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1
     snap = Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
-                    st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1,
-                    drafter.context_end if drafter is not None else -1)
+                    mtp_len, drafter.context_end if drafter is not None else -1,
+                    tail=_ring_tail(st, len(ids), max(mtp_len, 0)))
     if drafter is not None and getattr(drafter, "ring", 0) and snap.drafter_end == len(snap.ids):
         snap.drafter_rows = _ring_window(drafter, len(snap.ids))
     return snap
@@ -324,19 +370,19 @@ def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
 
 
 def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
-    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values, indexer keys, gates and pools."""
+    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values,
+    and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``)."""
     views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
     idx = st.index or []
     main_idx = idx[:len(st.kc)]
-    for ik, ig, pk in main_idx:
-        views += [ik[:n], ig[:n], pk[:n // 4 + 1]]
+    for _, _, pk in main_idx:
+        views.append(pk[:n // 4 + 1])
     if m > 0 and hasattr(st, "mtp_kc"):
         views.append(st.mtp_kc[:m])
         if getattr(st, "mtp_vc", None) is not None:
             views.append(st.mtp_vc[:m])
         if len(idx) > len(st.kc):
-            ik, ig, pk = idx[-1]
-            views += [ik[:m], ig[:m], pk[:m // 4 + 1]]
+            views.append(idx[-1][2][:m // 4 + 1])
     return views
 
 
@@ -374,8 +420,10 @@ def row_bytes(e: Engine, snap: Snapshot, drafter=None) -> int:
 
 
 def snapshot_bytes(snap: Snapshot) -> int:
-    """A kept snapshot's device bytes: KDA states, conv windows, pending MTP rows, a ring window, saved rows."""
+    """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window,
+    the indexer rings' tail and any saved rows."""
     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
+    held += [t for pair in (snap.tail or []) for t in pair]
     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
 
 
@@ -390,6 +438,7 @@ def load_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
 
 def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
     st = e.st
+    put_ring_tail(st, snap)
     if st.cur:
         st.rec[st.cur[0]].copy_(snap.rec)
     st.conv.copy_(snap.conv)

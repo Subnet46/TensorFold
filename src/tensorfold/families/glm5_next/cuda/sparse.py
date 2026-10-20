@@ -8,6 +8,9 @@ import triton.language as tl
 
 from tensorfold.cuda.geometry import MLA_SELECT_ROWS as SELECT_ROWS   # a prompt chunk's rows scored at once
 
+from . import kv8
+from .kv8 import row_scales
+
 POOL = 4
 TOPK_POOLS = 512
 BR = 16
@@ -17,8 +20,8 @@ TOKENS = TOPK_POOLS * POOL + POOL - 1      # a sparse row's attended tokens: its
 
 
 @triton.jit
-def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, eps, D: tl.constexpr):
-    """Row r: LayerNorm(k_raw) -> bf16 into IK[pos + r]; the gate row (fp32) -> bf16 into IG[pos + r]."""
+def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, RING, eps, D: tl.constexpr):
+    """Row r: LayerNorm(k_raw) -> bf16 into IK[(pos + r) % RING]; the gate row (fp32) -> bf16 into IG alike."""
 
     r = tl.program_id(0)
     P = tl.load(POS).to(tl.int64)
@@ -28,13 +31,16 @@ def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, eps, D: tl.constexpr):
     xc = x - mean
     var = tl.sum(xc * xc, axis=0) / D
     y = xc / tl.sqrt(var + eps) * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
-    tl.store(IK + (P + r) * D + d, y.to(tl.bfloat16))
-    tl.store(IG + (P + r) * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
+    slot = (P + r) % RING
+    tl.store(IK + slot * D + d, y.to(tl.bfloat16))
+    tl.store(IG + slot * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
 
 
 @triton.jit
-def _pool_keys(IK, IG, APE, PK, POS, R, D: tl.constexpr):
-    """Program i: pool p = pos // 4 + i if it is complete within the window (ends at or before pos + R - 1)."""
+def _pool_keys(IK, IG, APE, PK, PKS, POS, R, RING, D: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
+    """Program i: pool p = pos // 4 + i if it is complete within the window (ends at or before pos + R - 1), from its
+    four tokens' keys and gates in the ring (token t at t % RING); a pool's bits depend on those rows only, whichever
+    window completes it. FP8 (TF_GLM_KV=fp8): the pooled key stored as kv8.store_row's codes and scale."""
 
     i = tl.program_id(0)
     P = tl.load(POS).to(tl.int64)
@@ -42,40 +48,55 @@ def _pool_keys(IK, IG, APE, PK, POS, R, D: tl.constexpr):
     if 4 * p + 3 > P + R - 1:
         return
     d = tl.arange(0, D)
-    l0 = tl.load(IG + (4 * p + 0) * D + d).to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
-    l1 = tl.load(IG + (4 * p + 1) * D + d).to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
-    l2 = tl.load(IG + (4 * p + 2) * D + d).to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
-    l3 = tl.load(IG + (4 * p + 3) * D + d).to(tl.float32) + tl.load(APE + 3 * D + d).to(tl.float32)
+    s0 = (4 * p + 0) % RING
+    s1 = (4 * p + 1) % RING
+    s2 = (4 * p + 2) % RING
+    s3 = (4 * p + 3) % RING
+    l0 = tl.load(IG + s0 * D + d).to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
+    l1 = tl.load(IG + s1 * D + d).to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
+    l2 = tl.load(IG + s2 * D + d).to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
+    l3 = tl.load(IG + s3 * D + d).to(tl.float32) + tl.load(APE + 3 * D + d).to(tl.float32)
     m = tl.maximum(tl.maximum(l0, l1), tl.maximum(l2, l3))
     e0 = tl.exp(l0 - m)
     e1 = tl.exp(l1 - m)
     e2 = tl.exp(l2 - m)
     e3 = tl.exp(l3 - m)
     s = ((e0 + e1) + e2) + e3
-    k0 = tl.load(IK + (4 * p + 0) * D + d).to(tl.float32)
-    k1 = tl.load(IK + (4 * p + 1) * D + d).to(tl.float32)
-    k2 = tl.load(IK + (4 * p + 2) * D + d).to(tl.float32)
-    k3 = tl.load(IK + (4 * p + 3) * D + d).to(tl.float32)
+    k0 = tl.load(IK + s0 * D + d).to(tl.float32)
+    k1 = tl.load(IK + s1 * D + d).to(tl.float32)
+    k2 = tl.load(IK + s2 * D + d).to(tl.float32)
+    k3 = tl.load(IK + s3 * D + d).to(tl.float32)
     t0 = ((e0 / s).to(tl.bfloat16).to(tl.float32) * k0).to(tl.bfloat16).to(tl.float32)
     t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1).to(tl.bfloat16).to(tl.float32)
     t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2).to(tl.bfloat16).to(tl.float32)
     t3 = ((e3 / s).to(tl.bfloat16).to(tl.float32) * k3).to(tl.bfloat16).to(tl.float32)
-    tl.store(PK + p * D + d, (((t0 + t1) + t2) + t3).to(tl.bfloat16))
+    kv8.store_row(PK, PKS, p, ((t0 + t1) + t2) + t3, D, RS, FP8)
 
 
 def index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, ape: torch.Tensor,
                  ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor, pos: torch.Tensor) -> None:
-    """Window rows' index keys and gates into the caches at pos.., then every pool the window completes."""
+    """Window rows' index keys and gates into their ring (ik, ig: bf16 [ring, 128], token t at row t % ring), then
+    every pool the window completes into pk (bf16, or TF_GLM_KV=fp8's kv8 rows). Only the pool a token belongs to
+    ever reads its key and gate, so the ring needs the window's rows and the 3 before it: ring >= R + 3
+    (forward.index_ring), or at least the context (no row wraps: the full-length caches of before)."""
 
     R = k_raw.shape[0]
-    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, pos, 1e-6, D=128, num_warps=1)
-    _pool_keys[(R // 4 + 2,)](ik, ig, ape, pk, pos, R, D=128, num_warps=1)
+    ring = ik.shape[0]
+    if ik.dtype != torch.bfloat16 or ig.shape != ik.shape or not ik.is_contiguous() or not ig.is_contiguous():
+        raise ValueError("index_update: bf16 key and gate rings of one shape, contiguous")
+    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, pos, ring, 1e-6, D=128, num_warps=1)
+    if kv8.width(pk) != 128:
+        raise ValueError("index_update: 128-wide pooled keys")
+    pkv, pks, rs, fp8 = kv8.parts(pk)
+    _pool_keys[(R // 4 + 2,)](ik, ig, ape, pkv, pks, pos, R, ring, D=128, RS=rs, FP8=fp8, num_warps=1)
 
 
 @triton.jit
-def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
-            D: tl.constexpr, BP: tl.constexpr, RB: tl.constexpr):
-    """Program (RB rows, pool block): s_p = sum_h w_h relu(scale * qi_h . pool_p) up to each row's position, heads padded to HP; RB never changes a row's bits."""
+def _scores(QI, W, w_stride, PK, PKS, OUT, POS, R, NP, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
+            D: tl.constexpr, BP: tl.constexpr, RB: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
+    """Program (RB rows, pool block): s_p = sum_h w_h relu(scale * qi_h . pool_p) up to each row's position, heads
+    padded to HP; RB never changes a row's bits. FP8 (TF_GLM_KV=fp8): the pooled keys' e4m3 codes on the tensor
+    cores, each pool's power-of-two scale on its dots."""
 
     rb = tl.program_id(0)
     pb = tl.program_id(1)
@@ -92,8 +113,10 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr
     d = tl.arange(0, D)
     hh = tl.arange(0, HP)
     hok = hh < H
-    k = tl.load(PK + p[:, None] * D + d[None, :], mask=(p < (P + rb * RB + RB) // 4)[:, None],
-                other=0.0).to(tl.bfloat16)                                              # [BP, D]
+    kok = p < (P + rb * RB + RB) // 4
+    k = tl.load(PK + p[:, None].to(tl.int64) * RS + d[None, :], mask=kok[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
+    if FP8:
+        ks = row_scales(PKS, p.to(tl.int64), kok, D, RS)
     for i in tl.static_range(RB):
         r = rb * RB + i
         if r < R:
@@ -101,6 +124,8 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr
             q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
             kr = tl.where((p < npool)[:, None], k, 0.0)
             dots = tl.dot(q, tl.trans(kr))                                                # [HP, BP] fp32
+            if FP8:
+                dots = dots * ks[None, :]
             w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
             sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
             sc = tl.where(p < npool, sc, float("-inf"))
@@ -108,12 +133,14 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr
 
 
 @triton.jit
-def _scores_rows(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, BASE, R, NP, scale, wscale, H: tl.constexpr,
-                 HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr, SEG: tl.constexpr):
+def _scores_rows(QI, W, w_stride, PK, PKS, OUT, o_stride, POS, SPR, BASE, R, NP, scale, wscale, H: tl.constexpr,
+                 HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr, SEG: tl.constexpr,
+                 RS: tl.constexpr, FP8: tl.constexpr):
     """Decode rows, program (row, g): the row's index queries and head weights loaded once, then pool blocks g,
     g + G, .. each through _scores' arithmetic for that row (the same key mask, dot tile, warps and head sum, so
     RB = 1's bits). SEG False: NP columns a row from one position (POS[0] + r; pools past the row's -inf); SEG: a
-    segmented window's row r (skipped when dense) over its own visible pools, keys at its stream's base / 4."""
+    segmented window's row r (skipped when dense) over its own visible pools, keys at its stream's base / 4. FP8
+    (TF_GLM_KV=fp8): pooled keys as kv8 rows RS bytes apart, each pool's scale on its dots, as in _scores."""
 
     r = tl.program_id(0)
     g = tl.program_id(1)
@@ -121,11 +148,11 @@ def _scores_rows(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, BASE, R, NP, scal
         if tl.load(SPR + r) == 0:
             return
         npool = (tl.load(POS + r) + 1) // 4
-        pk = PK + (tl.load(BASE + r).to(tl.int64) // 4) * D
+        pbase = tl.load(BASE + r).to(tl.int64) // 4
         nb = (npool + BP - 1) // BP
     else:
         npool = (tl.load(POS) + r + 1) // 4
-        pk = PK
+        pbase = tl.zeros((), tl.int64)
         nb = (NP + BP - 1) // BP
     if g >= nb:
         return
@@ -136,9 +163,12 @@ def _scores_rows(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, BASE, R, NP, scal
     w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
     for pb in tl.range(g, nb, G, num_stages=1):          # Triton's pipelining of this loop: slower (measured)
         p = pb * BP + tl.arange(0, BP)
-        k = tl.load(pk + p[:, None] * D + d[None, :], mask=(p < npool)[:, None], other=0.0).to(tl.bfloat16)
+        rows = pbase + p
+        k = tl.load(PK + rows[:, None] * RS + d[None, :], mask=(p < npool)[:, None], other=0.0).to(tl.bfloat16)
         kr = tl.where((p < npool)[:, None], k, 0.0)
         dots = tl.dot(q, tl.trans(kr))                                                # [HP, BP] fp32
+        if FP8:
+            dots = dots * row_scales(PKS, rows, p < npool, D, RS)[None, :]
         sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
         if SEG:
             tl.store(OUT + r * o_stride + p, sc, mask=p < npool)
@@ -288,9 +318,10 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
     D = qi.shape[1] // H
     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
     grid = min(ROW_SCORE_G, triton.cdiv(np_max, 64))
-    _scores_rows[(R, grid)](qi, wts, wts.stride(0), pk, scores, np_max, pos_dev, pos_dev, pos_dev, R, np_max, D ** -0.5,
-                            wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, G=grid, SEG=False,
-                            num_warps=4)
+    pkv, pks, rs, fp8 = kv8.parts(pk)
+    _scores_rows[(R, grid)](qi, wts, wts.stride(0), pkv, pks, scores, np_max, pos_dev, pos_dev, pos_dev, R, np_max,
+                            D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, G=grid,
+                            SEG=False, RS=rs, FP8=fp8, num_warps=4)
     pools = top_pools(scores, TOPK_POOLS, pos_dev)                                      # ascending pool index
     dev = qi.device
     width = TOPK_POOLS * POOL + POOL - 1
@@ -332,14 +363,15 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
     width = TOPK_POOLS * POOL + POOL - 1
     tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
     counts = torch.empty((R,), dtype=torch.int32, device=dev)
+    pkv, pks, rs, fp8 = kv8.parts(pk)
     for a in range(0, R, B):
         n = min(B, R - a)
         at = pos_dev if a == 0 else pos_dev + a
         scores = buf[:n * NP].view(n, NP)
-        _scores[(triton.cdiv(n, rb), triton.cdiv(NP, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pk, scores, at, n,
-                                                           NP, D ** -0.5, wscale, H=H,
+        _scores[(triton.cdiv(n, rb), triton.cdiv(NP, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv, pks, scores,
+                                                           at, n, NP, D ** -0.5, wscale, H=H,
                                                            HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, RB=rb,
-                                                           num_warps=4)
+                                                           RS=rs, FP8=fp8, num_warps=4)
         pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
         _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
                       num_warps=4)
@@ -438,10 +470,12 @@ def sparse_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, tokens
 
 
 # ------------------------------------------------------------------------------------- multi-stream windows ---
-# Segmented windows (latent.py's section of the same name): each stream's index keys and gates in its own extent of
-# shared arenas [P, 128] (token t of the stream at base + t) and its pooled keys at base / 4 + p of [P / 4 + 2, 128];
-# per-row device tables (``segments.SegRows``) give each row its position, base and kind. A row keeps its
-# single-stream arithmetic. Reads and writes of the index caches go through the helpers below.
+# Segmented windows (latent.py's section of the same name): each stream's index keys and gates in its own part of
+# shared [Q, 128] tensors (token t of the stream at ibase + t % ring: its slot's ring, or its extent without rings)
+# and its pooled keys at base / 4 + p of [P / 4 + 2, 128]; per-row device tables (``segments.SegRows``) give each row
+# its position, bases and kind; pooled keys bf16 or TF_GLM_KV=fp8's kv8 rows (codes, then scales in PKS, rows RS
+# elements apart). A row keeps its single-stream arithmetic. Reads and writes of the index caches go through the
+# helpers below.
 
 @triton.jit
 def _ix_put(IX, row, d, x, D: tl.constexpr):
@@ -456,23 +490,27 @@ def _ix_get(IX, row, d, D: tl.constexpr):
 
 
 @triton.jit
-def _pk_put(PK, row, d, x, D: tl.constexpr):
-    """Pooled key row ``row`` (int64) <- x [D] (fp32) as bf16."""
-    tl.store(PK + row * D + d, x.to(tl.bfloat16))
+def _pk_put(PK, PKS, row, x, D: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
+    """Pooled key row ``row`` (int64) <- x [D] (fp32) as bf16, or FP8 (kv8.store_row, as _pool_keys stores it)."""
+    kv8.store_row(PK, PKS, row, x, D, RS, FP8)
 
 
 @triton.jit
-def _pk_get(PK, rows, ok, d, D: tl.constexpr):
-    """Pooled key rows ``rows`` (int64 [n]) as a bf16 tile [n, D]; rows with ok false are zeros."""
-    return tl.load(PK + rows[:, None] * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+def _pk_get(PK, PKS, rows, ok, d, D: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
+    """Pooled key rows ``rows`` (int64 [n]) as a bf16 tile [n, D] (FP8: the codes, exact) and their scales [n]
+    (FP8; ones for bf16, unread); rows with ok false are zeros."""
+    k = tl.load(PK + rows[:, None] * RS + d[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+    if FP8:
+        return k, row_scales(PKS, rows, ok, D, RS)
+    return k, tl.full(rows.shape, 1.0, tl.float32)
 
 
 @triton.jit
-def _seg_index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, BASE, eps, D: tl.constexpr):
-    """_index_write for row r at its stream's row base[r] + pos[r]."""
+def _seg_index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, IBASE, RING, eps, D: tl.constexpr):
+    """_index_write for row r at its stream's index row ibase[r] + pos[r] % RING."""
 
     r = tl.program_id(0)
-    row = tl.load(BASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64)
+    row = tl.load(IBASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64) % RING
     d = tl.arange(0, D)
     x = tl.load(KR + r * k_stride + d).to(tl.float32)
     mean = tl.sum(x, axis=0) / D
@@ -484,53 +522,62 @@ def _seg_index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, BASE, eps, D: tl.c
 
 
 @triton.jit
-def _seg_pool_keys(IK, IG, APE, PK, POS, BASE, D: tl.constexpr):
+def _seg_pool_keys(IK, IG, APE, PK, PKS, POS, BASE, IBASE, RING, D: tl.constexpr, RS: tl.constexpr,
+                   FP8: tl.constexpr):
     """Program r: the pool row r completes (pos[r] % 4 == 3), pool p = pos[r] // 4 of its stream, from tokens
-    base + 4p .. base + 4p + 3 into pooled row base / 4 + p: _pool_keys' arithmetic (the pools a single-stream
-    window completes are exactly those its rows end)."""
+    4p .. 4p + 3 (index rows ibase + t % RING) into pooled row base / 4 + p: _pool_keys' arithmetic (the pools a
+    single-stream window completes are exactly those its rows end)."""
 
     r = tl.program_id(0)
     q = tl.load(POS + r).to(tl.int64)
     if q % 4 != 3:
         return
     B = tl.load(BASE + r).to(tl.int64)
-    t = B + (q // 4) * 4
+    IB = tl.load(IBASE + r).to(tl.int64)
+    t = (q // 4) * 4
+    s0 = IB + (t + 0) % RING
+    s1 = IB + (t + 1) % RING
+    s2 = IB + (t + 2) % RING
+    s3 = IB + (t + 3) % RING
     d = tl.arange(0, D)
-    l0 = _ix_get(IG, t + 0, d, D) + tl.load(APE + 0 * D + d).to(tl.float32)
-    l1 = _ix_get(IG, t + 1, d, D) + tl.load(APE + 1 * D + d).to(tl.float32)
-    l2 = _ix_get(IG, t + 2, d, D) + tl.load(APE + 2 * D + d).to(tl.float32)
-    l3 = _ix_get(IG, t + 3, d, D) + tl.load(APE + 3 * D + d).to(tl.float32)
+    l0 = _ix_get(IG, s0, d, D) + tl.load(APE + 0 * D + d).to(tl.float32)
+    l1 = _ix_get(IG, s1, d, D) + tl.load(APE + 1 * D + d).to(tl.float32)
+    l2 = _ix_get(IG, s2, d, D) + tl.load(APE + 2 * D + d).to(tl.float32)
+    l3 = _ix_get(IG, s3, d, D) + tl.load(APE + 3 * D + d).to(tl.float32)
     m = tl.maximum(tl.maximum(l0, l1), tl.maximum(l2, l3))
     e0 = tl.exp(l0 - m)
     e1 = tl.exp(l1 - m)
     e2 = tl.exp(l2 - m)
     e3 = tl.exp(l3 - m)
     s = ((e0 + e1) + e2) + e3
-    k0 = _ix_get(IK, t + 0, d, D)
-    k1 = _ix_get(IK, t + 1, d, D)
-    k2 = _ix_get(IK, t + 2, d, D)
-    k3 = _ix_get(IK, t + 3, d, D)
+    k0 = _ix_get(IK, s0, d, D)
+    k1 = _ix_get(IK, s1, d, D)
+    k2 = _ix_get(IK, s2, d, D)
+    k3 = _ix_get(IK, s3, d, D)
     t0 = ((e0 / s).to(tl.bfloat16).to(tl.float32) * k0).to(tl.bfloat16).to(tl.float32)
     t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1).to(tl.bfloat16).to(tl.float32)
     t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2).to(tl.bfloat16).to(tl.float32)
     t3 = ((e3 / s).to(tl.bfloat16).to(tl.float32) * k3).to(tl.bfloat16).to(tl.float32)
-    _pk_put(PK, B // 4 + q // 4, d, ((t0 + t1) + t2) + t3, D)
+    _pk_put(PK, PKS, B // 4 + q // 4, ((t0 + t1) + t2) + t3, D, RS, FP8)
 
 
 def seg_index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor,
                      ape: torch.Tensor, ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor, rows) -> None:
-    """index_update for a segmented window: each row's index key and gate at its stream's base + pos, then every
-    pool a row completes (``rows``: segments.SegRows)."""
+    """index_update for a segmented window: each row's index key and gate at its stream's ibase + pos % ring (its
+    slot's ring, or base + pos without rings: ``rows``: segments.SegRows), then every pool a row completes."""
 
     R = k_raw.shape[0]
-    _seg_index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, rows.pos, rows.base, 1e-6, D=128,
-                           num_warps=1)
-    _seg_pool_keys[(R,)](ik, ig, ape, pk, rows.pos, rows.base, D=128, num_warps=1)
+    _seg_index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, rows.pos, rows.ibase, rows.ring_rows,
+                           1e-6, D=128, num_warps=1)
+    pkv, pks, rs, fp8 = kv8.parts(pk)
+    _seg_pool_keys[(R,)](ik, ig, ape, pkv, pks, rows.pos, rows.base, rows.ibase, rows.ring_rows, D=128, RS=rs,
+                         FP8=fp8, num_warps=1)
 
 
 @triton.jit
-def _seg_scores(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, SEG_START, SEG_ROWS, SEG_PBASE, SEG_POOLS, scale,
-                wscale, H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr):
+def _seg_scores(QI, W, w_stride, PK, PKS, OUT, o_stride, POS, SPR, SEG_START, SEG_ROWS, SEG_PBASE, SEG_POOLS, scale,
+                wscale, H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr,
+                RS: tl.constexpr, FP8: tl.constexpr):
     """Program (segment, g): pool blocks g, g + G, .. below the segment's pool count (on the device: the pools its
     last row sees), each block's keys (at the stream's pooled base) loaded once for all the segment's sparse rows;
     a row's scores are _scores' (its keys masked to its own pools before the dot, as with RB > 1), written for its
@@ -547,7 +594,7 @@ def _seg_scores(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, SEG_START, SEG_ROW
     hok = hh < H
     for pb in range(g, (npm + BP - 1) // BP, G):
         p = pb * BP + tl.arange(0, BP)
-        k = _pk_get(PK, pbase + p, p < npm, d, D)                                       # [BP, D]
+        k, ks = _pk_get(PK, PKS, pbase + p, p < npm, d, D, RS, FP8)                    # [BP, D], [BP]
         for i in range(nr):
             r = r0 + i
             if tl.load(SPR + r) != 0:
@@ -555,6 +602,8 @@ def _seg_scores(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, SEG_START, SEG_ROW
                 q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
                 kr = tl.where((p < npool)[:, None], k, 0.0)
                 dots = tl.dot(q, tl.trans(kr))                                            # [HP, BP] fp32
+                if FP8:
+                    dots = dots * ks[None, :]
                 w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
                 sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
                 tl.store(OUT + r * o_stride + p, sc, mask=p < npool)
@@ -640,10 +689,11 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # select_tokens' constants
     scores = scratch.scores
     grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
-    _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pk, scores, scores.stride(0), rows.pos, rows.sparse,
-                                       rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools, D ** -0.5,
-                                       wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, G=grid,
-                                       num_warps=4)
+    pkv, pks, rs, fp8 = kv8.parts(pk)
+    _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
+                                       rows.sparse, rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools,
+                                       D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
+                                       G=grid, RS=rs, FP8=fp8, num_warps=4)
     tokens, counts = scratch.tokens[:R], scratch.counts[:R]
     if SEG_SPLIT:
         select_split(scores[:R], TOPK_POOLS, scratch=scratch.split, rows=rows, tokens=tokens, counts=counts)

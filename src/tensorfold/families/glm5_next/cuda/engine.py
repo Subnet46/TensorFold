@@ -384,7 +384,7 @@ class GlmEngine:
         from .split import rule
         from tensorfold.cuda.capacity import admit
         from tensorfold.cuda.geometry import (PREFILL_ROWS, dflash2_geometry, dflash2_weights, mla_geometry,
-                                              split_weights)
+                                              mla_ring_bytes, split_weights)
 
         encode_policy(policy)                           # a bad default fails here, not in the first request
         if not encode_policy(DFLASH_POLICY)[0] >= 10:
@@ -435,6 +435,13 @@ class GlmEngine:
         # TF_GLM_KVB=fp8/q4 (an EXL3 checkpoint, latent cache): kv_b as the absorb and expand kernels read it
         kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
         weights_estimate = kvb_weights(weights_estimate, kvb)
+        # TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows (``kv8``), half the bytes
+        from .kv8 import KINDS as KV_KINDS, kv_kind
+
+        kv = kv_kind()
+        if kv != "bf16" and not LATENT:
+            raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
+        self.kv = kv
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
         if not self.mtp_on:
@@ -472,11 +479,11 @@ class GlmEngine:
 
             g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=lean_prompt,
-                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4")
+                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv)
             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
             # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
             # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
-            extra = workspace + (parallel - 1) * slot_bytes(text)
+            extra = workspace + (parallel - 1) * (slot_bytes(text) + mla_ring_bytes(text, prefill_rows))
             per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
             if not extra and not per:
                 return g
@@ -523,7 +530,8 @@ class GlmEngine:
                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
-                                 sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0)]
+                                 sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+                                 KV_KINDS.index(kv)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -535,7 +543,7 @@ class GlmEngine:
                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE, "
-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS): "
+                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -586,7 +594,7 @@ class GlmEngine:
         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
-                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows)
+                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv)
         if self.e.pbuf.split is not None:
             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
             if rank == 0:
@@ -602,6 +610,9 @@ class GlmEngine:
         if rank == 0 and self.dump is not None:
             print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
                   f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
+        if rank == 0 and kv != "bf16":
+            print("[tensorfold] TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows with a "
+                  "power-of-two scale each (lossy; drafted replies still equal serial ones)", flush=True)
         if rank == 0 and quant_code:
             print("[tensorfold] TF_GLM_DRAFT_QUANT=mse: DFlash2's 4-bit copies (and an EXL3 draft head) with "
                   "least-squares clipped ranges", flush=True)
