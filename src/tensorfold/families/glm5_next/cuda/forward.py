@@ -448,7 +448,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
                 glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
                 mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
             with prof.timed("moe: combine"):
-                if b.prefill:            # the shared row read from sy where it is (the copy's bits, one pass less)
+                # the shared row read from sy where it is (the copy's bits, one pass less); decode windows too unless
+                # TF_GLM_COMBINE_SY=0
+                if b.prefill or __import__("os").environ.get("TF_GLM_COMBINE_SY", "1") != "0":
                     glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
                 else:
                     b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])

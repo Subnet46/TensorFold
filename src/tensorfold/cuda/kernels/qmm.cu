@@ -39,9 +39,15 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
         unsigned char* pw = p + T::X;
         constexpr int TILE_BYTES = 64 * GS / 2;           // one stored 64-column tile's group block
         for (int c = tid; c < T::W / 16; c += T::THREADS) {
-            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
-            const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
-            cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
+            if constexpr (BN >= 64) {
+                const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+                const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
+                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
+            } else {                                      // part of a stored tile: its n8 tiles are contiguous
+                const size_t tile = static_cast<size_t>(n0 / 64) * KG + g;
+                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + (n0 % 64) * GS / 2 +
+                                  c * 16);
+            }
         }
         unsigned char* ps = pw + T::W;
         for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
@@ -293,7 +299,11 @@ void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::
         case 9: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
         case 10: launch<64, 16, 64, 1, 2, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
         case 11: launch<64, 16, 128, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
-        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-11");
+        case 12: launch<64, 16, 32, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 13: launch<64, 16, 32, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 14: launch<64, 16, 32, 1, 4, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 15: launch<64, 16, 32, 1, 1, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-15");
     }
 }
 

@@ -186,6 +186,23 @@ def _hc_partial_mma(X, FN, PART, R, WIDE: tl.constexpr, NB: tl.constexpr, BM: tl
 HC_MMA = __import__("os").environ.get("TF_GLM_HC_MMA", "1") != "0"    # prompt rows' mixing dots on the tensor cores
 
 
+def hc_dec() -> bool:
+    """TF_GLM_HC_DEC (default on): decode rows' mixing dots in hc.cu, 48 blocks a row instead of 16, _hc_partial's
+    bits; 0: _hc_partial."""
+    return __import__("os").environ.get("TF_GLM_HC_DEC", "1") != "0"
+
+
+@__import__("functools").lru_cache(maxsize=1)
+def _hc_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_glm_hc_v2", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
            eps: float, hc_eps: float, iters: int, *, prompt: bool = False) -> None:
@@ -198,6 +215,9 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.T
     if prompt and HC_MMA and x.is_contiguous():
         _hc_partial_mma[(triton.cdiv(rows, 64), HC_BLOCKS)](x, fn, part, rows, WIDE=wide, NB=HC_BLOCKS, BM=64, BK=64,
                                                             num_warps=4, num_stages=3)
+    elif (hc_dec() and wide == 16384 and fn.shape[0] == 24 and HC_BLOCKS == 16 and x.is_contiguous()
+          and fn.is_contiguous() and part.is_contiguous()):
+        _hc_ext().hc_partial(x, fn, part, rows)                  # _hc_partial's bits on 48 blocks a row
     else:
         _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
     _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,

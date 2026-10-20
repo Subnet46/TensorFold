@@ -350,7 +350,7 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
 # Decode rows (up to 16) of a Q4 matmul on another column tile / warp / stage count (``shared.qmm_cfg``): every
 # output keeps its chain, so every choice gives the same bits. By per-rank shape (n, k), measured on GB10.
 DEC_TILES: dict[tuple[int, int], int] = {(4096, 4096): 2, (2048, 4096): 2, (8192, 1536): 2, (4096, 8192): 4,
-                                         (4096, 1024): 6}
+                                         (4096, 1024): 2}
 _dec_env: tuple[str, dict] = ("", {})
 
 

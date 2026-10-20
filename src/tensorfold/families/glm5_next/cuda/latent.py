@@ -587,6 +587,12 @@ def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.c
     tl.store(OUT + (r * H + h) * LW + k, (o / l).to(tl.bfloat16))
 
 
+def chunk_stages() -> int:
+    """TF_GLM_LATENT_STAGES (default 3): Triton pipeline depth of the dense / sparse chunk programs' key tiles: the
+    loads only, the same bits (1: none, as before; 4 does not fit in shared memory)."""
+    return int(__import__("os").environ.get("TF_GLM_LATENT_STAGES", "3"))
+
+
 class LatentScratch:
     """Chunk partials for ``part_rows`` (one ``attention`` call) x heads x chunks; queries and latents for ``rows``."""
 
@@ -616,7 +622,8 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
     if hb not in (HB, HB_WIDE):
         raise ValueError(f"latent attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
     _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
-                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
+                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8,
+                                                num_stages=chunk_stages())
     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
     return out
 
@@ -633,7 +640,8 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
     hb = head_block(R)
     _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
-                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
+                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8,
+                                                 num_stages=chunk_stages())
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 
 
