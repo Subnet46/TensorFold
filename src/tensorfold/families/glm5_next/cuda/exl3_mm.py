@@ -46,6 +46,21 @@ def dec_settings() -> tuple[bool, int, bool]:
     return on, fuse, os.environ.get("TF_GLM_EXL3_XROW", "1") != "0"
 
 
+LOADS = {"0": 0, "ldg": 0, "1": 1, "nc": 1, "nc1": 1, "nc2": 2, "nc4": 3}
+
+
+def dec_loads() -> int:
+    """TF_GLM_EXL3_LOADS: the decode kernel's trellis loads (the same bits for every value). ``0`` / ``ldg``
+    (default): 32-bit loads one k step ahead; ``nc`` / ``nc1``, ``nc2``, ``nc4``: 16-byte ld.global.nc loads 1, 2 or
+    4 k steps ahead through a staging area, the item read with its count in one round trip and the first steps'
+    words issued before the member rows arrive (after jayleaton/glm53-tensorfold-spark patches/0580, Apache-2.0)."""
+
+    v = (os.environ.get("TF_GLM_EXL3_LOADS", "") or "0").strip().lower()
+    if v not in LOADS:
+        raise ValueError(f"TF_GLM_EXL3_LOADS: 0, nc, nc2 or nc4, not {v!r}")
+    return LOADS[v]
+
+
 def _seq() -> bool:
     """TF_GLM_EXL3_SEQ (default on): prompt chunks sum a matmul's K splits in one program (same bits)."""
     import os
@@ -58,7 +73,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v18", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v19", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -197,12 +212,13 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
         else:
             ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
             xg, xu = s.xg, s.xu
+        ld = dec_loads()
         ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
-                2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done)
+                2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, ld)
         if not fuse & 2:
             ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
         ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
-                1 if fuse & 1 else 0, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done)
+                1 if fuse & 1 else 0, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, ld)
         if not fuse & 1:
             ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
         return
