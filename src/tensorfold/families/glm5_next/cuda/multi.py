@@ -39,12 +39,14 @@ import torch
 from tensorfold.cuda.scheduler import Scheduler
 from tensorfold.cuda.streams import Stream, next_fill
 
+from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
 from .pool import ALIGN, Pool, align_up
 from .verify import BatchedVerify, Segment, SerialVerify, Verified
 
-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE = range(1, 9)
+ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT = range(1, 10)
 OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
-       IDLE: "IDLE"}
+       IDLE: "IDLE", SLOT: "SLOT"}
+LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
 DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
 MAX_WINDOW = 32                          # rows of every stream's windows together in one round
 SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST)
@@ -266,7 +268,8 @@ class NoRoom(RuntimeError):
 class MultiDecoder:
     """The ``GlmScheduler``'s decoder, on rank 0 (deciding) and rank 1 (``follow``, applying)."""
 
-    def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None) -> None:
+    def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+                 tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None) -> None:
         """``drafts``: the multi-stream drafter (``dflash2_multi.MultiDrafter``; default one over the engine's
         drafter, its graphs captured unless TF_GLM_MULTI_DRAFT_GRAPHS=0); ``verify``: the verify seam (default
         ``SerialVerify``)."""
@@ -304,6 +307,22 @@ class MultiDecoder:
             else:
                 verify = SerialVerify(e, taps=self.drafts is not None)
         self.verify = verify
+        # speed settings (multi_tune): the sampler's gathers, the drafts' depth, async messages, the profile
+        self.tune = tune if tune is not None else MultiSettings.from_env()
+        self.profiles = None
+        if self.tune.profile and self.rank == 0:
+            self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
+                             True: RoundProfile(self.tune.profile, label="lone stream, one-stream graphs")}
+        self.profile = None                              # the current round's (``profiles``), or None
+        self.solo_verify = SerialVerify(e, taps=self.drafts is not None)
+        graphs = getattr(e, "graphs", None)
+        self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
+        self.row_ms = list(row_ms) if row_ms is not None else None
+        if self.tune.depth == "joint" and self.row_ms is None:
+            self.row_ms = self._time_rows()
+        if self.profiles is not None and isinstance(self.verify, BatchedVerify) and self.verify.graphs:
+            self._compare_paths()
+        self.msg = None                                  # TF_GLM_MULTI_ASYNC: rank 0's pinned message staging
         self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
         self.next_sid = self.next_kid = self.next_order = 0
@@ -352,7 +371,82 @@ class MultiDecoder:
             self.g._ring()
             self.idle = False
         msg, self.outbox = self.outbox, []
-        self.g._share(msg)
+        if self.tune.async_msg:
+            self._send(msg)
+        else:
+            self.g._share(msg)
+
+    def _send(self, values: list[int]) -> None:
+        """Rank 0, TF_GLM_MULTI_ASYNC: ``GlmEngine._share``'s two all-gathers (the length, then the values) without
+        reading anything back: the values go through a pinned staging buffer (reused once its last copy has left),
+        so the host does not wait for the GPU. Rank 1 receives them with its ``_share`` as ever."""
+
+        n = len(values)
+        dev = self.w.device
+        if self.msg is None or self.msg[0].numel() < n + 1:
+            if self.msg is not None:
+                self.msg[2].synchronize()
+            size = max(4096, 2 * (n + 1))
+            pinned = torch.cuda.is_available()
+            self.msg = (torch.zeros((size,), dtype=torch.int32, pin_memory=pinned),
+                        torch.zeros((size,), dtype=torch.int32, device=dev),
+                        torch.cuda.Event() if pinned else None)
+        host, buf, ready = self.msg
+        if ready is not None:
+            ready.synchronize()                          # the last message's copy has left the staging buffer
+        host[0] = n
+        if n:
+            host[1:1 + n].numpy()[:] = values
+        buf[:1 + n].copy_(host[:1 + n], non_blocking=True)
+        if ready is not None:
+            ready.record()
+        comm = self.g.comm
+        got = torch.empty((2,), dtype=torch.int32, device=dev)
+        comm.all_gather(buf[:1], got)
+        allv = torch.empty((2 * n,), dtype=torch.int32, device=dev)
+        comm.all_gather(buf[1:1 + n], allv)
+
+    def _time_rows(self, reps: int = 5) -> list[float]:
+        """TF_GLM_MULTI_DEPTH=joint: the batched window's ms for 1 .. MAX_WINDOW rows (its graphs, fastest of
+        ``reps``), the larger of both ranks' (so both allocate alike)."""
+
+        v = self.verify
+        if not isinstance(v, BatchedVerify) or not v.graphs:
+            raise ValueError("TF_GLM_MULTI_DEPTH=joint needs the batched verify window's graphs "
+                             "(TF_GLM_MULTI_VERIFY=batched, TF_GLM_MULTI_GRAPHS=1)")
+        mine = torch.tensor(v.time_rows(reps), dtype=torch.float32, device=self.w.device)
+        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device=self.w.device)
+        self.g.comm.all_gather(mine, got)
+        return [float(x) for x in got.view(2, -1).max(dim=0).values.tolist()]
+
+    def _compare_paths(self, reps: int = 5) -> None:
+        """TF_GLM_MULTI_PROFILE (rank 0, at startup): a lone stream's verify window on the one-stream graphs and on
+        the batched graphs, ms by rows (fastest of ``reps``; slot 0's states cleared after)."""
+
+        e, v = self.e, self.verify
+        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        solo = v.time_rows(reps)
+        out = []
+        for R in range(1, self.lone_rows + 1):
+            g = e.graphs.main.get((R, e.home.parity))
+            if g is None:
+                continue
+            best = float("inf")
+            for _ in range(reps + 1):
+                start.record()
+                g.replay()
+                stop.record()
+                stop.synchronize()
+                best = min(best, start.elapsed_time(stop))
+            out.append(f"{R}: {best:.2f} vs {solo[R - 1]:.2f}")
+        e.slots.rec[0].zero_()
+        e.slots.conv[0].zero_()
+        print("[tensorfold] multi profile: a lone stream's verify window ms, one-stream graphs vs batched graphs, by "
+              "rows: " + ", ".join(out), flush=True)
+
+    def _row_cost(self, rows: int) -> float:
+        ms = self.row_ms
+        return ms[min(max(rows, 1), len(ms)) - 1] + max(0, rows - len(ms)) * (ms[-1] - ms[-2] if len(ms) > 1 else 0)
 
     @staticmethod
     def parse(msg: Sequence[int]) -> list[tuple[int, list[int]]]:
@@ -720,16 +814,21 @@ class MultiDecoder:
         return self.lanes[s.sid]
 
     def _iterate(self) -> list[Stream]:
+        prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
         lane = self._fill_turn()
         if lane is not None:
+            t = time.perf_counter()
             stop = self._stop(lane)
             self._emit(FILL, [lane.sid, stop])
             self._flush()
             first = self._fill(lane, stop)
             if first is not None:
                 lane.s.take([first], self._ends(lane))
+            if prof is not None:
+                prof.fill(time.perf_counter() - t)
             return [lane.s] if lane.s.done else []
         lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
+        t_begin = time.perf_counter()
         for l in lanes:                       # room for this round's widest window, else paused
             l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
         active = [l for l in lanes if not l.paused]
@@ -740,11 +839,64 @@ class MultiDecoder:
             if self.outbox:                   # what was decided (evictions, moves, a stream given back) goes now
                 self._flush()
             return done
+        lone = False
+        if (self.tune.lone and len(active) == 1 and len(self.lanes) == 1 and self.lone_rows
+                and active[0].s.count - len(active[0].s.out) >= LONE_LEFT):
+            lone = self._home(active[0])
+        prof = self.profile = self.profiles[lone] if self.profiles is not None else None
+        if prof is not None:
+            prof.begin(t_begin)
         plan = [(l.sid, l.depth) for l in active]
-        self._emit(ROUND, [len(plan), *[v for p in plan for v in p]])
+        self._emit(ROUND, [len(plan), *[v for p in plan for v in p], int(lone)])
+        if prof is not None:
+            prof.mark("plan")
         self._flush()
-        self._round(active)
+        if prof is not None:
+            prof.mark("message")
+        self._round(active, lone=lone)
         return [l.s for l in active if l.s.done]
+
+    def _home(self, lane: Lane) -> bool:
+        """Rank 0: a lone stream into the one-stream graphs' home, slot 0 at the pool's first rows (SLOT, then
+        kept prompts in the way evicted and its extent MOVEd); True once it is there."""
+
+        if self.e.graphed(lane.st):
+            return True
+        if lane.slot != 0:
+            self._emit(SLOT, [lane.sid, 0])
+            self._reslot(lane, 0)
+        x = lane.extent
+        if x.base != 0:
+            for c in list(self.kept):                  # kept prompts in [0, x.size) make way
+                y = c.extent
+                if y is not x and y.base < x.size and c in self.kept:
+                    self._evict(c)
+            if any(y is not x and y.base < x.size for y in self.pool.extents):
+                return False                           # something else holds the home rows (cannot happen alone)
+            self._emit(MOVE, [x.eid, 0, x.size])
+            self._move(x, 0, x.size)
+        return self.e.graphed(lane.st)
+
+    def _reslot(self, lane: Lane, slot: int) -> None:
+        """Both ranks: the lane's slot state (KDA states, conv windows, DFlash2 context) copied into ``slot``."""
+
+        from .forward import State
+
+        e, old = self.e, lane.slot
+        if any(l.slot == slot for l in self.lanes.values() if l is not lane):
+            raise RuntimeError(f"stream {lane.sid} cannot take slot {slot}: another stream holds it")
+        e.slots.rec[slot].copy_(e.slots.rec[old])
+        e.slots.conv[slot].copy_(e.slots.conv[old])
+        if self.drafts is not None:
+            a, b = self.drafts.contexts[old], self.drafts.contexts[slot]
+            for dst, src in zip(list(b.kc) + list(b.vc), list(a.kc) + list(a.vc)):
+                dst.copy_(src)
+            b.context_end = a.context_end
+            b.pos_dev.copy_(a.pos_dev)
+        st = State(self.w, lane.extent.size, e.rows, caches=e.caches, base=lane.extent.base, slots=e.slots, slot=slot)
+        st.set_pos(lane.st.pos)
+        st.cur = list(lane.st.cur)
+        lane.st, lane.slot = st, slot
 
     def _stop(self, lane: Lane) -> int:
         pos, n = lane.st.pos, len(lane.s.prompt)
@@ -802,14 +954,17 @@ class MultiDecoder:
         return first
 
     @torch.no_grad()
-    def _round(self, lanes: list[Lane], depths: list[int] | None = None) -> None:
-        """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1)."""
+    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False) -> None:
+        """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1); ``lone``: one
+        stream at home, verified through the one-stream graphs when its window fits them."""
 
         from .decode import copy_room
         from .dflash2_multi import DraftRequest
 
         if depths is not None and [l.depth for l in lanes] != depths:
             raise RuntimeError(f"rank {self.rank}'s draft depths {[l.depth for l in lanes]} are not rank 0's {depths}")
+        prof = self.profile
+        tune = self.tune
         drafts: list[list[int]] = []
         copied: list[bool] = []
         asks = []
@@ -818,13 +973,20 @@ class MultiDecoder:
             copied.append(bool(c))
             drafts.append(list(c))
             if not c and l.dflash and l.depth > 0:
+                conf = l.policy.confidence
+                if tune.depth == "scale":
+                    conf = scaled_confidence(conf, len(lanes), tune.alpha)
                 asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling,
-                                                           l.policy.confidence, **l.policy.chain_rule)))
-        if asks:
+                                                           conf, **l.policy.chain_rule)))
+        if asks and tune.depth == "joint":
+            self._joint(lanes, drafts, asks)
+        elif asks:
             got = self.drafts.propose([a for _, a in asks])
             for (k, _), d in zip(asks, got):
                 drafts[k] = list(d)
         drafts = trim(drafts, MAX_WINDOW)
+        if prof is not None:
+            prof.mark("propose")
         segments = []
         for l, d in zip(lanes, drafts):
             tokens = [l.s.out[-1]] + d
@@ -833,13 +995,26 @@ class MultiDecoder:
                 l.window = l.constraint.window(tokens, list(range(-1, len(tokens) - 1)))
                 tokens = list(l.window.tokens)
             segments.append(Segment(l.st, tokens))
-        v = forward_streams(self.verify, segments)
+        verify = self.verify
+        if lone:
+            if not self.e.graphed(lanes[0].st):
+                raise RuntimeError(f"rank {self.rank}: a lone round's stream is not at the graphs' home")
+            if len(segments[0].tokens) <= self.lone_rows:
+                verify = self.solo_verify
+        if prof is not None:
+            prof.gpu_start()
+        v = forward_streams(verify, segments)
+        if prof is not None:
+            prof.gpu_stop()
+            prof.mark("verify")
         parts = []
         for l, seg, logits in zip(lanes, segments, v.logits):
             if l.window is not None:
                 l.constraint.mask(logits, l.window, self.w.vocab_offset)
             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
-        sampled = sample_streams(self.w, parts)
+        sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
+        if prof is not None:
+            prof.mark("sample")
         keeps = []
         for l, seg, rows in zip(lanes, segments, sampled):
             keep = 1
@@ -848,11 +1023,17 @@ class MultiDecoder:
                     break
                 keep += 1
             keeps.append(keep)
-        self.verify.commit(segments, keeps)
+        if prof is not None:
+            prof.mark("accept")
+        verify.commit(segments, keeps)
+        if prof is not None:
+            prof.mark("commit")
         if self.drafts is not None:
             items = [(self._ctx(l), v.taps[k][:keep]) for k, (l, keep) in enumerate(zip(lanes, keeps)) if l.dflash]
             if items:
                 self.drafts.commit(items)
+        if prof is not None:
+            prof.mark("taps")
         for l, seg, rows, keep, was_copy in zip(lanes, segments, sampled, keeps, copied):
             s = l.s
             new = rows[:keep]
@@ -871,6 +1052,32 @@ class MultiDecoder:
             if l.policy is not None:
                 l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
                               max(0, s.count - len(s.out)))
+        if prof is not None:
+            prof.mark("emit")
+            prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
+                     sum(len(g.tokens) - 1 for g in segments))
+
+    def _joint(self, lanes: list[Lane], drafts: list[list[int]], asks: list) -> None:
+        """TF_GLM_MULTI_DEPTH=joint: every asking stream's chain walked to its depth in one block pass, then the
+        round's rows allocated across them by expected tokens per ms (``multi_tune.allocate``). The picks are each
+        policy's; only where each chain stops differs (drafts never change a reply)."""
+
+        md = self.drafts
+        live = [(k, r) for k, r in asks if min(r.depth, md.block - 1) >= 1 and r.ctx.context_end > 0]
+        if not live:
+            return
+        got = md.candidates([(r.ctx, r.pending, min(r.depth, md.block - 1)) for _, r in live])
+        reach = []
+        for (k, r), (tokens, values, proj) in zip(live, got):
+            confs: list[float] = []
+            drafts[k] = md.d.chain(tokens, values, proj, r.pending, r.ctx.context_end + 1, r.sampling, 0.0,
+                                   beta=r.beta, confs=confs)
+            reach.append(reach_of(confs))
+        asked = {k for k, _ in live}
+        fixed = sum(1 + (0 if k in asked else len(d)) for k, d in enumerate(drafts))
+        take = allocate(reach, fixed, self._row_cost, self.tune.overhead_ms, MAX_WINDOW)
+        for (k, _), n in zip(live, take):
+            drafts[k] = drafts[k][:n]
 
     # -- ends ----------------------------------------------------------------------------------------------------------------
     def finish(self, done: list[Stream]) -> None:
@@ -992,7 +1199,10 @@ class MultiDecoder:
             elif op == ROUND:
                 n = p[0]
                 sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
-                self._round([self.lanes[sid] for sid in sids], depths)
+                lone = bool(p[1 + 2 * n]) if len(p) > 1 + 2 * n else False
+                self._round([self.lanes[sid] for sid in sids], depths, lone=lone)
+            elif op == SLOT:
+                self._reslot(self.lanes[p[0]], p[1])
             elif op == FINISH:
                 self._finish(p[0])
             elif op == IDLE:

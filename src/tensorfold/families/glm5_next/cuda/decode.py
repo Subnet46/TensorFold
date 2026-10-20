@@ -160,7 +160,9 @@ class Engine:
             g = self.graphs.main.get((R, self.st.parity))
         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
-            bucket = pool_bucket(self.st.pos, R, self.st.index[0][2].shape[0] - 2)
+            # the pool buckets the graphs were captured for: the home view's (a stream at home with a smaller
+            # extent scores pools past its own too, all past its visible ones: -inf, the same selection)
+            bucket = pool_bucket(self.st.pos, R, self.home.index[0][2].shape[0] - 2)
             g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
         if g is not None:
             self.replays[kind] += 1
@@ -181,7 +183,7 @@ class Engine:
             g = self.graphs.mtp.get(n)
         elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
               and self.st.mtp_len >= self.w.cfg.dense_limit):
-            bucket = pool_bucket(self.st.mtp_len, n, self.st.index[-1][2].shape[0] - 2)
+            bucket = pool_bucket(self.st.mtp_len, n, self.home.index[-1][2].shape[0] - 2)
             g, kind = self.graphs.sparse_mtp.get((n, bucket)), "sparse_mtp"
         if g is not None:
             self.replays[kind] += 1

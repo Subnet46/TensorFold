@@ -501,11 +501,14 @@ class Drafter:
 
     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
               sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
-              round_ms: tuple[float, ...] | None = None) -> list[int]:
+              round_ms: tuple[float, ...] | None = None, confs: list | None = None) -> list[int]:
         """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always
         keeping the first draft. ``beta`` > 0: the confidences are noise-aware (``noisy_confidence``); with
         ``round_ms`` (ms of a round of k drafts, k = 0..) the chain is walked whole and cut at ``best_depth`` of
-        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same."""
+        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same. ``confs``
+        (a list): the chain is walked whole and each pick's confidence (noise-aware with ``beta``, else the
+        softmax share of its score) appended to it, for a caller that cuts the chains itself (``multi``'s joint
+        allocation)."""
 
         depth = tokens.shape[0]
         sampled = sampling is not None and sampling.temperature > 0
@@ -522,7 +525,13 @@ class Drafter:
             score = (values[d] + EDGE * edge) / temp
             pick = score + NOISE * noise[d] if noise is not None else score
             j = int(np.argmax(pick))
-            if noisy:
+            if confs is not None:
+                if noisy:
+                    confs.append(noisy_confidence(score, noise[d] if noise is not None else None, j, beta))
+                else:
+                    p = np.exp(score - score.max())
+                    confs.append(float(p[j] / p.sum()))
+            elif noisy:
                 c = noisy_confidence(score, noise[d] if noise is not None else None, j, beta)
                 if round_ms is not None:
                     conf.append(c)
@@ -537,7 +546,7 @@ class Drafter:
                     break
             prev = int(tokens[d, j])
             out.append(prev)
-        if noisy and round_ms is not None:
+        if noisy and round_ms is not None and confs is None:
             out = out[:best_depth(conf, round_ms)]
         return out
 

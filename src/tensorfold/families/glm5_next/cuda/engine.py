@@ -506,17 +506,24 @@ class GlmEngine:
 
         self.dump = dump_dir() if drafter is not None and not serial_only and parallel == 1 else None
         quant_code = DRAFT_QUANTS.index(draft_quant())
+        from tensorfold.cuda.sampling import union_cover
+
         verify_code = 0
         if parallel > 1:                      # serial and batched verify windows make different collectives
             from .multi import verify_kind
 
             verify_code = 1 + ("batched", "serial").index(verify_kind())
+            from .multi_tune import MultiSettings
+
+            verify_code = [verify_code] + MultiSettings.from_env().code()
+        else:
+            verify_code = [verify_code]
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
-                                 parallel, verify_code, MAX_ROWS, len(WIDE_GRAPHS), sum(WIDE_GRAPHS),
-                                 max(WIDE_GRAPHS, default=0)]
+                                 parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                 sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -527,7 +534,8 @@ class GlmEngine:
                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
-                               "TF_GLM_MULTI_VERIFY, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS): "
+                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE, "
+                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -645,7 +653,10 @@ class GlmEngine:
                 print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
                       f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
-                      f"{self.multi.share:g})", flush=True)
+                      f"{self.multi.share:g}); {self.multi.tune.describe()}", flush=True)
+                if self.multi.row_ms is not None:
+                    print("[tensorfold] --parallel batched window ms by rows: " +
+                          " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""

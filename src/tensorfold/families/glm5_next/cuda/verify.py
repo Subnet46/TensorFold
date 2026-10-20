@@ -135,6 +135,33 @@ class BatchedVerify:
         e.slots.conv[0].zero_()
 
     # -- the window's tables -------------------------------------------------------------------------------------------
+    @torch.no_grad()
+    def time_rows(self, reps: int = 5) -> list[float]:
+        """ms of the captured window of each size (1 .. its rows): the fastest of ``reps`` replays, on the capture's
+        own tables (slot 0 at the pool's first rows; its states cleared after), before any stream is admitted."""
+
+        from .sparse import SPARSE_FROM
+
+        index = self.e.caches.index is not None
+        out = []
+        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        for R in range(1, self.rows_max + 1):
+            g = self.graphs[R]
+            self._stage([0] * R)
+            self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)
+            self._write_table([(R, 0, 0, 0, R)])
+            best = float("inf")
+            for _ in range(reps + 1):
+                start.record()
+                g.replay()
+                stop.record()
+                stop.synchronize()
+                best = min(best, start.elapsed_time(stop))
+            out.append(best)
+        self.e.slots.rec[0].zero_()
+        self.e.slots.conv[0].zero_()
+        return out
+
     def _tables(self, segments: Sequence[Segment], keeps: Sequence[int] | None = None) -> None:
         """The KDA segment table (row0, rows, slot, parity, conv slot, keep) into the device copy, in place (a captured
         graph reads the same tensor); unused segments have 0 rows."""
