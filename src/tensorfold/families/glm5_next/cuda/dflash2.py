@@ -144,9 +144,10 @@ def _dconv(x: torch.Tensor, dyn: torch.Tensor, base: torch.Tensor, branch: int, 
 
 
 def _quantize4(w: torch.Tensor) -> qmm.Q4:
-    """bf16 (N, K) -> MLX-style affine 4-bit in groups of 64 along K, tiled (``qmm.quantize4``)."""
+    """bf16 (N, K) -> MLX-style affine 4-bit in groups of 64 along K, tiled: min / max ranges (``qmm.quantize4``) or,
+    with TF_GLM_DRAFT_QUANT=mse, least-squares clipped ones (``qmm.quantize4_mse``). Drafts only: replies keep."""
 
-    return qmm.quantize4(w)
+    return qmm.draft_quantize4(w)
 
 
 def _mm(x: torch.Tensor, w: qmm.Q4, xs: torch.Tensor | None = None, *, f32: bool = False) -> torch.Tensor:

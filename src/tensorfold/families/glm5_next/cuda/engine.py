@@ -252,10 +252,17 @@ class GlmEngine:
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
+        # TF_GLM_DRAFT_DUMP=<dir>: DFlash2 requests decode serially and record the drafter's view for the offline
+        # simulator (``draft_dump``, ``draft_sim``); TF_GLM_DRAFT_QUANT=minmax|mse: how DFlash2's 4-bit copies are made
+        from .draft_dump import dump_dir
+        from .qmm import DRAFT_QUANTS, draft_quant
+
+        self.dump = dump_dir() if drafter is not None and not serial_only else None
+        quant_code = DRAFT_QUANTS.index(draft_quant())
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + self.split.code() + \
-            [int(self.mtp_on), int(DRAFT_RING)]
+                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + self.split.code() + [
+                int(self.dump is not None), quant_code, int(self.mtp_on), int(DRAFT_RING)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -264,7 +271,8 @@ class GlmEngine:
         if both[0][:-1] != both[1][:-1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, "
-                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                               "TF_GLM_DRAFT_QUANT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -299,6 +307,12 @@ class GlmEngine:
             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
             if rank == 0:
                 print(f"[tensorfold] {self.split.describe()}", flush=True)
+        if rank == 0 and self.dump is not None:
+            print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
+                  f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
+        if rank == 0 and quant_code:
+            print("[tensorfold] TF_GLM_DRAFT_QUANT=mse: DFlash2's 4-bit copies (and an EXL3 draft head) with "
+                  "least-squares clipped ranges", flush=True)
         if rank == 0 and self.grid:
             print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
                   f"(TF_GLM_PROMPT_GRID)", flush=True)
@@ -601,6 +615,16 @@ class GlmEngine:
             copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
         if policy is None:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+        elif self.dump is not None and drafter is not None:      # serial's reply, the drafter's view recorded
+            from .draft_dump import dump_decode
+
+            meta = None if self.rank else dict(
+                prompt_tokens=len(prompt), cached=cut, policy=list(code), images=feed is not None,
+                prompt_sha256=hashlib.sha256(json.dumps(list(prompt)).encode()).hexdigest()[:16])
+            res = dump_decode(self.e, drafter, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
+                              out_dir=self.dump if self.rank == 0 else None, meta=meta)
+            if self.rank == 0:
+                stats["draft_dump"] = res.dump_path
         elif auto:
             greedy = sampling is None or sampling.temperature <= 0
             m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)

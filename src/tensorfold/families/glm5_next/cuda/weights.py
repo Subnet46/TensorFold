@@ -16,7 +16,8 @@ from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts
 from .exl3_mm import Exl3Experts, words as exl3_words
 from . import latent
-from .qmm import B16, F8, Q4, as_i32, dense_kind, make_b16, make_f8, make_q4, quantize4, stack_b16, stack_f8, stack_q4
+from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, make_b16, make_f8, make_q4, stack_b16, stack_f8,
+                  stack_q4)
 
 PREFIX = "model.language_model."
 
@@ -551,7 +552,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         if exl3:
             raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
             head = dense(raw)
-            draft_head = quantize4(raw)    # Draft steps use the quantized head; verification keeps the original head.
+            # Draft steps use a 4-bit copy (TF_GLM_DRAFT_QUANT: minmax or mse ranges); verification keeps the head.
+            draft_head = draft_quantize4(raw)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),

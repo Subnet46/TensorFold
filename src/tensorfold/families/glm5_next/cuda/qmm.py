@@ -211,6 +211,29 @@ def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
     return make_q4(words, scales.contiguous(), biases.contiguous())
 
 
+DRAFT_QUANTS = ("minmax", "mse")
+
+
+def draft_quant(value: str | None = None) -> str:
+    """TF_GLM_DRAFT_QUANT: how the draft-only 4-bit copies (DFlash2's matrices, an EXL3 checkpoint's draft head) are
+    made: minmax (the default: each group's full min / max range, ``quantize4``) or mse (the least-squares clipping of
+    ``quantize4_mse``). Drafts only propose, so either keeps every reply; only acceptance can move."""
+
+    import os
+
+    kind = os.environ.get("TF_GLM_DRAFT_QUANT", "") if value is None else value
+    kind = kind or "minmax"
+    if kind not in DRAFT_QUANTS:
+        raise ValueError(f"TF_GLM_DRAFT_QUANT is minmax or mse, not {kind!r}")
+    return kind
+
+
+def draft_quantize4(w: torch.Tensor, kind: str | None = None) -> Q4:
+    """A draft-only 4-bit copy of bf16 ``w`` by TF_GLM_DRAFT_QUANT (``draft_quant``); never used to verify."""
+
+    return quantize4_mse(w) if draft_quant(kind) == "mse" else quantize4(w)
+
+
 def make_dense_q4(weight: torch.Tensor) -> "Q4 | F8":
     return quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
 
