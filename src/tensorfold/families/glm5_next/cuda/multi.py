@@ -45,6 +45,7 @@ from tensorfold.cuda.streams import Stream, next_fill
 from . import multi_prefill
 from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
 from .pool import ALIGN, Pool, align_up
+from .segments import window_rows
 from .verify import BatchedVerify, Segment, SerialVerify, Verified
 
 ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
@@ -86,7 +87,7 @@ def _unwatch(seconds: float) -> None:
 
 LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
 DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
-MAX_WINDOW = 32                          # rows of every stream's windows together in one round
+MAX_WINDOW = window_rows()               # rows of every stream's windows together in one round (TF_GLM_MULTI_WINDOW)
 SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST)
 
 

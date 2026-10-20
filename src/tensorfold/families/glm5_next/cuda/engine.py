@@ -304,8 +304,11 @@ def round_costs(costs: dict) -> tuple[float, ...]:
     return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
 
 
-PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
-MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
+from .segments import window_rows as _window_rows  # noqa: E402
+
+PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel)
+MULTI_WINDOW = _window_rows()         # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW;
+                                      # TF_GLM_MULTI_WINDOW, default 32)
 
 
 def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS, rank: int = 0) -> int:
@@ -462,6 +465,10 @@ class GlmEngine:
         if not 1 <= parallel <= PARALLEL_MOST:
             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
         self.parallel = parallel
+        if parallel > 4:                      # the segment tables and grids hold --parallel streams
+            from . import segments as seg_mod
+
+            seg_mod.MAX_SEGS = max(seg_mod.MAX_SEGS, parallel)
         self.policy = "0" if serial_only else policy
         self.serial_only = serial_only
         self.comm = comm if comm is not None else open_comm(rank, world, master, port)
@@ -619,7 +626,7 @@ class GlmEngine:
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
-                                 KV_KINDS.index(kv)]
+                                 KV_KINDS.index(kv), MULTI_WINDOW]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
