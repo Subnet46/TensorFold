@@ -105,12 +105,14 @@ class _Raw:
                                          "version": 3, "strides": None}
 
 
-def arena_bytes(rows: int, world: int, width: int, tensors: int) -> tuple[int, int]:
+def arena_bytes(rows: int, world: int, width: int, tensors: int, narrow: int = 0) -> tuple[int, int]:
     """(partials' staging bytes, rows' staging bytes) for prompt buffers of ``rows`` rows: H = ceil(rows / world)
-    rows a rank; [N, H, D] fp32 (hc_post reads every rank's slot) and [T, N - 1, H, D] bf16 (one slot a peer)."""
+    rows a rank; [N, H, D] fp32 (hc_post reads every rank's slot) and [T, N - 1, H, D] bf16 (one slot a peer), then
+    ``narrow`` bytes a row for the narrow row buffers ``rows`` may carry beside them ([N - 1, H, narrow]: a sender's
+    rows of each narrow buffer back to back; TF_GLM_MOE_GLUE rowsplit's picks and weights)."""
 
     H = -(-int(rows) // int(world))
-    return world * H * width * 4, tensors * (world - 1) * H * width * 2
+    return world * H * width * 4, tensors * (world - 1) * H * width * 2 + (world - 1) * H * int(narrow)
 
 
 def arena_cap() -> int:
@@ -131,14 +133,17 @@ def timeout_s() -> float:
 class CeExchange:
     """One rank's copy-engine exchange for a prompt buffer's row split (set up collectively by every rank)."""
 
-    def __init__(self, rank: int, world: int, store, rows: int, width: int, tensors: int, tag: str = "hcce") -> None:
+    def __init__(self, rank: int, world: int, store, rows: int, width: int, tensors: int, tag: str = "hcce",
+                 narrow: int = 0) -> None:
         self.rank, self.world, self.store = int(rank), int(world), store
+        self.narrow = int(narrow)            # bytes a row of narrow row buffers ``rows`` carries (0: none)
         # peers in rotated order (rank + 1, rank + 2, ..): at each moment every rank copies to a different peer, so
         # no GPU takes three senders' traffic at once while another takes none
         self.peers = [(self.rank + i) % self.world for i in range(1, self.world)]
         self.width, self.tensors = int(width), int(tensors)
         self.H = -(-int(rows) // self.world)
-        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors)
+        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors, self.narrow)
+        self.ag_main = self.tensors * (self.world - 1) * self.H * self.width * 2      # the bf16 rows' part
         self.timeout = timeout_s()
         self.step = 0
         self.key = f"tf_{tag}"
@@ -206,7 +211,9 @@ class CeExchange:
         if arena.data_ptr() != self.base or arena.numel() != total:
             raise RuntimeError("the arena's tensor view does not cover the allocation")
         self.rs = arena[:self.rs_bytes].view(torch.float32)
-        self.ag = arena[self.rs_bytes:].view(torch.bfloat16).view(self.tensors, self.world - 1, self.H, self.width)
+        self.ag = arena[self.rs_bytes:self.rs_bytes + self.ag_main].view(torch.bfloat16).view(
+            self.tensors, self.world - 1, self.H, self.width)
+        self.nw = arena[self.rs_bytes + self.ag_main:]       # the narrow rows' part (bytes), empty without it
         handle = _IpcHandle()
         self._check(lib.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(self.base)), "cudaIpcGetMemHandle")
         s.set(f"{self.key}/mem/{self.rank}", bytes(handle))
@@ -377,10 +384,13 @@ class CeExchange:
         d = self.width
         return self.rs[self.world * off * d:self.world * (off + n) * d].view(self.world, n, d)
 
-    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None) -> None:
+    def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None,
+             narrow: tuple | list = ()) -> None:
         """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging
         (its rows ``at`` .., ``at`` = off unless given), then the peers' rows from this rank's staging into place
-        (rows p H + off ..)."""
+        (rows p H + off ..). ``narrow``: contiguous row buffers of any dtype whose rows together take at most the
+        arena's ``narrow`` bytes, moved the same way in the same step (their staging: a sender's slot of [H, row]
+        a buffer, back to back)."""
 
         if len(outs) > self.tensors:
             raise ValueError(f"ce rows: {len(outs)} buffers, the staging holds {self.tensors}")
@@ -398,7 +408,31 @@ class CeExchange:
             for q in self.peers:                 # sender r's slot in receiver q's staging: (r - q - 1) mod N
                 pos = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + at) * row
                 copies.append((self.remote[q] + self.rs_bytes + pos, buf[mine].data_ptr(), n * row))
+        lay = self._narrow_layout(narrow)
+        for buf, start, rb in lay:
+            for q in self.peers:
+                pos = ((self.rank - q - 1) % N) * self.H * self.narrow + start * self.H + at * rb
+                copies.append((self.remote[q] + self.rs_bytes + self.ag_main + pos, buf[mine].data_ptr(), n * rb))
         self.exchange(copies)
         for t, buf in enumerate(outs):
             for p in self.peers:
                 buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, at:at + n])
+        for buf, start, rb in lay:
+            for p in self.peers:
+                pos = ((p - self.rank - 1) % N) * self.H * self.narrow + start * self.H + at * rb
+                got = self.nw[pos:pos + n * rb].view(buf.dtype).view(n, *buf.shape[1:])
+                buf[p * H + off:p * H + off + n].copy_(got)
+
+    def _narrow_layout(self, narrow) -> list[tuple[torch.Tensor, int, int]]:
+        """(buffer, byte offset of its rows within a row's narrow bytes, row bytes) for each narrow buffer."""
+
+        out, start = [], 0
+        for buf in narrow:
+            rb = buf[0].numel() * buf.element_size()
+            if not buf.is_contiguous() or rb % 4:
+                raise ValueError("ce rows: contiguous narrow rows of whole 4-byte words")
+            out.append((buf, start, rb))
+            start += rb
+        if start > self.narrow:
+            raise ValueError(f"ce rows: narrow rows of {start} bytes, the arena holds {self.narrow}")
+        return out

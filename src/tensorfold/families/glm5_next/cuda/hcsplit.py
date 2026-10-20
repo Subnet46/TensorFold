@@ -195,11 +195,14 @@ class HcSplit:
         if self.ce_mode:
             from .ce import CeExchange
 
+            from .moe_glue import narrow_bytes
+
             b = self.b
             taps = max((len(v) for v in getattr(b, "tap_at", {}).values()), default=0)
             store = getattr(self.w.comm, "nccl", self.w.comm).store
+            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it)
             self.ce = CeExchange(self.rank, self.world, store, getattr(b, "alloc_rows", b.rows), b.part.shape[1],
-                                 taps + 1)
+                                 taps + 1, narrow=narrow_bytes())
             return
         if self.gather:
             return
@@ -286,14 +289,17 @@ class HcSplit:
         else:
             self.w.comm.exchange([send], [self.got[j]], self.peer)
 
-    def _swap_rows(self, j: int, outs: list[torch.Tensor]) -> None:
-        """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares)."""
+    def _swap_rows(self, j: int, outs: list[torch.Tensor], narrow: tuple | list = ()) -> None:
+        """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares).
+        ``narrow``: narrow row buffers moved in the same copy-engine step (TF_GLM_MOE_GLUE rowsplit; ce only)."""
 
         off, n = self.pieces[j]
         mine = self.mine() + off
         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
-            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off)
+            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow)
             return
+        if narrow:
+            raise RuntimeError("narrow rows travel with the copy-engine exchange only (TF_GLM_HC_EXCHANGE=ce)")
         if self.gather:                                 # one piece: rank order is row order
             for t in outs:
                 self.all_gather(t[mine:mine + n].reshape(-1), t[:self.Rp].reshape(-1))

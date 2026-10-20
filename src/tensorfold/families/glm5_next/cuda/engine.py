@@ -677,6 +677,7 @@ class GlmEngine:
         from tensorfold.cuda import gpu_sample as _gpu_sample
 
         from . import fuse as _fuse
+        from . import moe_glue as moe_glue_mod
         from . import tune as _tune
 
         def quiet(read) -> tuple[int, str | None]:
@@ -685,7 +686,8 @@ class GlmEngine:
             except ValueError as exc:
                 return -1, str(exc)
 
-        mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted)]
+        mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
+                quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1)]
         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
         tables = [row[0] for row in got]
         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
@@ -695,7 +697,8 @@ class GlmEngine:
         settings = [row[1:] for row in got]
         if any(-1 in row for row in settings) or any(row != settings[0] for row in settings):
             why = "; ".join(w for _, w in mine if w)
-            raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE by rank "
+            raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
+                               "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1 by rank "
                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
                                + ": give every rank the same valid values")
         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
@@ -760,6 +763,8 @@ class GlmEngine:
             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
         if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+        if rank == 0 and moe_glue_mod.on():
+            print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:
             print(f"[tensorfold] {lanes_mod.describe()}"
                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)

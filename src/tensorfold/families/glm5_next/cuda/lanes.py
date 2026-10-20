@@ -39,7 +39,7 @@ from types import SimpleNamespace
 
 import torch
 
-from . import glue, prof
+from . import glue, moe_glue, prof
 from .hcsplit import HcSplit, SplitSettings
 
 # Buffers attributes whose first axis is the window's rows: a lane views its rows of each
@@ -173,18 +173,25 @@ class LaneSplit(HcSplit):
         self.ce_at = ce_at
 
     def partial(self, fill) -> None:
-        """The lane's whole partial on the main stream, then its exchange on the exchange stream."""
+        """The lane's whole partial on the main stream, then its exchange on the exchange stream. A fill that left
+        its last rows to another stream says so in ``fill.ready`` (an event: TF_GLM_MOE_GLUE defer); the exchange
+        waits for it too."""
 
         main = torch.cuda.current_stream()
         fill(0, self.R)
         self.ev_fill[0].record(main)
+        ready = getattr(fill, "ready", None)
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(self.ev_fill[0])
+            if ready is not None:
+                self.stream.wait_event(ready)
             self._swap_partial(0)
 
-    def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False) -> None:
+    def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
-        exchange: hc_post, the taps' and final stream means, the next hc_pre, the rows' exchange."""
+        exchange: hc_post, the taps' and final stream means, the next hc_pre, the rows' exchange. ``moe``: the layer
+        whose MoE reads these rows (TF_GLM_MOE_GLUE rowsplit routes them here and swaps their picks and weights with
+        them; ``moe_glue.lane_route``)."""
 
         b, c = self.b, self.w.cfg
         lo, hi = self.mine(), self.mine() + self.H
@@ -199,7 +206,11 @@ class LaneSplit(HcSplit):
             if hc is not None:
                 glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
                             b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
-            self._swap_rows(0, outs)
+            narrow = moe_glue.lane_route(self, moe, lo, hi) if moe is not None and hc is not None else []
+            if narrow:
+                self._swap_rows(0, outs, narrow)
+            else:
+                self._swap_rows(0, outs)
             self.ev_done.record(self.stream)
 
     def wait(self) -> None:
@@ -274,7 +285,8 @@ def kda_lanes(layer, w, run, main, rec, mode: int) -> None:
         with torch.cuda.stream(rec if on_rec else main):
             with prof.timed("kda"), prof.timed("kda: out + all-gather"):
                 out_proj(w, view, out, layer.kda.o, None, n, site=(layer.index, "a"))
-            ls.glue_async(layer.ffn_hc, layer.post_norm)
+            ls.glue_async(layer.ffn_hc, layer.post_norm, **moe_glue.glue_args(layer))
+        moe_glue.lane_front(layer, w, view, ls, n)   # TF_GLM_MOE_GLUE side: the FFN front once the rows are in
 
 
 def _lane_state(st, lo: int):
@@ -322,7 +334,8 @@ def lane_layers(w, st, b, R: int, host_pos: int) -> None:
                 for view, ls, lst, n, nch in run:     # attention blocks: lane A's, then lane B's (reads A's caches)
                     ls.wait()
                     _mixer(layer, w, lst, view, n, nch, lst.pos, None, None)
-                    ls.glue_async(layer.ffn_hc, layer.post_norm)
+                    ls.glue_async(layer.ffn_hc, layer.post_norm, **moe_glue.glue_args(layer))
+                    moe_glue.lane_front(layer, w, view, ls, n)    # TF_GLM_MOE_GLUE side (moe_glue.py)
             for view, ls, lst, n, nch in run:     # MLP / MoE blocks
                 ls.wait()
                 _ffn(layer, w, view, n, None)

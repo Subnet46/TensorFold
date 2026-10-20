@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, prof, qmm, sparse, tp
+from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, moe_glue, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 
@@ -892,6 +892,8 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | 
 
 def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+        if moe_glue.on():                # TF_GLM_MOE_GLUE: the MoE glue's kernels and second stream (moe_glue.py)
+            return moe_glue.ffn(layer, w, b, R, done)
         return mlp_block(layer, w, b, R, done) if layer.mlp is not None else moe_block(layer, w, b, R, done)
 
 
@@ -910,6 +912,8 @@ def ffn_front(layer: LayerW, w: Weights, b: Buffers):
     if layer.mlp is not None:
         return lambda lo, hi: mlp_front(layer, w, b, lo, hi)
     if layer.moe.shared is not None:
+        if moe_glue.on():                # TF_GLM_MOE_GLUE shared: the fused gate/up there too (the same bits)
+            return lambda lo, hi: moe_glue.shared_rows(layer, w, b, lo, hi)
         return lambda lo, hi: shared_front(layer, w, b, lo, hi)
     return None
 
