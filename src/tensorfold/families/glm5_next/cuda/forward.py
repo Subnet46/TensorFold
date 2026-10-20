@@ -627,6 +627,46 @@ def _shift_conv(conv: torch.Tensor, proj: torch.Tensor, keep: int) -> None:
                                            TAPS=taps, BLOCK=1024, num_warps=4)
 
 
+@triton.jit
+def _conv_shift_seg(CONV, PROJ, SEG, conv_slot, conv_layer, proj_layer, proj_row, C: tl.constexpr,
+                    TAPS: tl.constexpr, COLS: tl.constexpr, BLOCK: tl.constexpr):
+    """Program (layer, channel block, segment): ``_conv_shift`` of the segment's conv slot over its own rows."""
+
+    l = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    e = SEG + tl.program_id(2) * COLS
+    row0 = tl.load(e + 0).to(tl.int64)
+    rows = tl.load(e + 1)
+    cslot = tl.load(e + 4).to(tl.int64)
+    keep = tl.load(e + 5)
+    if rows > 0:
+        conv = CONV + cslot * conv_slot
+        proj = PROJ + row0 * proj_row
+        v0 = _row(conv, proj, l, keep, c, conv_layer, proj_layer, proj_row, C, TAPS)
+        v1 = _row(conv, proj, l, keep + 1, c, conv_layer, proj_layer, proj_row, C, TAPS)
+        v2 = _row(conv, proj, l, keep + 2, c, conv_layer, proj_layer, proj_row, C, TAPS)
+        tl.store(conv + l * conv_layer + c, v0, mask=c < C)
+        tl.store(conv + l * conv_layer + C + c, v1, mask=c < C)
+        tl.store(conv + l * conv_layer + 2 * C + c, v2, mask=c < C)
+
+
+def conv_shift_segments(conv: torch.Tensor, proj: torch.Tensor, seg: torch.Tensor) -> None:
+    """``_shift_conv`` per segment of a multi-stream window: conv [conv slots, L, 3, C] (in place; each [3, C]
+    contiguous), proj [L, R, W >= C] the window's projection rows; segment i (``kda.segment_table``) has its conv
+    slot take rows keep .. keep + 2 of [conv[slot]; its own proj rows]. Segments of 0 rows are skipped."""
+
+    _, n, taps, C = conv.shape
+    if taps != 3:
+        raise ValueError("the conv shift kernel is written for 4-tap convolutions")
+    if conv.stride(3) != 1 or conv.stride(2) != C:
+        raise ValueError("each conv slot's [3, C] window must be contiguous")
+    if seg.dtype != torch.int32 or seg.dim() != 2 or seg.shape[1] != kda_mod.SEG_COLS or not seg.is_contiguous():
+        raise ValueError("segments: a contiguous int32 [nseg, SEG_COLS] table")
+    _conv_shift_seg[(n, triton.cdiv(C, 1024), seg.shape[0])](
+        conv, proj, seg, conv.stride(0), conv.stride(1), proj.stride(0), proj.stride(1), C=C, TAPS=taps,
+        COLS=kda_mod.SEG_COLS, BLOCK=1024, num_warps=4)
+
+
 @torch.no_grad()
 def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
     """Keep the last forward's first ``keep`` rows; a prompt chunk keeps all, its KDA layers already committed."""

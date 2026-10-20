@@ -114,3 +114,64 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
 
 def replay(state_in: torch.Tensor, scratch: KDAScratch, rows: int, state_out: torch.Tensor) -> None:
     _ext().replay(state_in, scratch.k, scratch.v, scratch.g, scratch.b, int(rows), state_out)
+
+
+# -- several streams in one window ----------------------------------------------------------------------------
+# A verify window holding several streams' rows back to back ([s1 rows][s2 rows]...) runs as segments: an int32
+# CUDA table [nseg, SEG_COLS] of (first row, rows, state slot, parity, conv slot, keep). Segment i runs from
+# rec[slot, parity] with conv[conv slot]'s taps into rec[slot, 1 - parity]; its outputs and states are the bits of a
+# solo ``chain(..., wide=True)`` / ``replay_layers`` of its rows. A segment of 0 rows is skipped, so a table sized for
+# the most streams (and the grids a CUDA graph captured) serves fewer: rewrite the table in place between replays.
+SEG_COLS = 6
+SEG_ROW0, SEG_ROWS, SEG_SLOT, SEG_PARITY, SEG_CONV, SEG_KEEP = range(SEG_COLS)
+
+
+def segment_table(segments, device, out: torch.Tensor | None = None) -> torch.Tensor:
+    """The table of ``segments`` [(rows, state slot, parity[, conv slot[, keep]])] laid back to back from row 0;
+    conv slot defaults to the state slot, keep to rows. With ``out`` ([n >= len, SEG_COLS] int32) it is written in
+    place (rows past the list become empty segments) and returned."""
+
+    rows_ = []
+    row0 = 0
+    for s in segments:
+        rows, slot, parity = int(s[0]), int(s[1]), int(s[2])
+        conv = int(s[3]) if len(s) > 3 and s[3] is not None else slot
+        keep = int(s[4]) if len(s) > 4 and s[4] is not None else rows
+        if rows < 0 or parity not in (0, 1) or not 0 <= keep <= rows:
+            raise ValueError(f"bad segment {s!r}")
+        rows_.append([row0, rows, slot, parity, conv, keep])
+        row0 += rows
+    n = len(rows_) if out is None else out.shape[0]
+    if len(rows_) > n:
+        raise ValueError(f"{len(rows_)} segments do not fit a table of {n}")
+    rows_ += [[row0, 0, 0, 0, 0, 0]] * (n - len(rows_))
+    host = torch.tensor(rows_, dtype=torch.int32).reshape(n, SEG_COLS)
+    if out is None:
+        return host.to(device)
+    out.copy_(host, non_blocking=False)
+    return out
+
+
+def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor,
+                   conv: torch.Tensor, conv_w: torch.Tensor, rec: torch.Tensor, a_log: torch.Tensor,
+                   dt_bias: torch.Tensor, norm_w: torch.Tensor, eps: float, lower: float, rows: int,
+                   scratch: KDAScratch) -> torch.Tensor:
+    """One layer's window of ``rows`` rows cut into the segments ``seg`` (``segment_table``): p/a/g as in ``chain``;
+    conv [conv slots, 3, 3 H 128] this layer's conv windows (read only; ``conv_shift_segments`` after the commit);
+    rec [state slots, 2, H, 128, 128] this layer's states (e.g. ``rec[:, :, layer]``). The three-kernel path
+    (``chain_wide``) for any window."""
+
+    q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
+    _ext().chain_wide_segments(seg, p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv, conv_w, rec,
+                               a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, scratch.k,
+                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
+    return scratch.out[:rows]
+
+
+def replay_layers_segments(seg: torch.Tensor, rec: torch.Tensor, scratch: KDAScratchSet) -> None:
+    """Every segment with keep < rows: every layer's state after its first ``keep`` rows, rec[slot, parity] ->
+    rec[slot, 1 - parity] (rec [state slots, 2, layers, H, 128, 128]); keep == rows leaves the chain's state."""
+
+    L, H = scratch.layers, scratch.heads
+    _ext().replay_layers_segments(seg, rec, scratch.k, scratch.v, scratch.g, scratch.b, scratch.rows * H * DK,
+                                  scratch.rows * H, L, H)
