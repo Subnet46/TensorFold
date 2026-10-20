@@ -687,6 +687,8 @@ class GlmEngine:
                 if self.multi.row_ms is not None:
                     print("[tensorfold] --parallel batched window ms by rows: " +
                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+        if hasattr(self.comm, "settle"):                # startup is over: RoCE gathers go without a barrier first
+            self.comm.settle()
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
