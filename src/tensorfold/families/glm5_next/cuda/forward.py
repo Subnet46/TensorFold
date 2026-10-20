@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, moe_glue, prof, qmm, sparse, tp
+from . import glue, index_split, kda as kda_mod, kv8, l2pf, lane_partials, lanes, latent, moe_glue, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 from . import twoshot                     # noqa: E402  (TF_GLM_TWOSHOT_ROWS: decode partials in two shots)
@@ -143,6 +143,13 @@ class Buffers:
         # rank partials
         self.part = torch.empty((rows, D), dtype=f32, device=dev)
         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
+        # TF_GLM_LANE_PARTIALS=bf16 (lane_partials.py): the partial's bf16 rows (rounded before every exchange); decode
+        # buffers also all-gather them (bf16, widened into b.gath); prompt buffers' rare unsplit chunks gather fp32
+        # (attributes only with the setting: without it the buffers are exactly as before)
+        if lane_partials.on():
+            self.partb = torch.empty((rows, D), dtype=bf, device=dev)
+            if not prefill and w.world > 1:
+                self.gathb = torch.empty((w.world * rows * D,), dtype=bf, device=dev)
         # TF_GLM_TWOSHOT_ROWS (twoshot.py): a decode buffer's windows of that many rows or more exchange their partials
         # in two shots, the same bits; None: one all-gather a site
         self.twoshot = None if prefill else twoshot.attach(w, rows)
@@ -426,7 +433,19 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
     if w.comm is None:
         return b.part[:R].view(1, R, d)
     ts = getattr(b, "twoshot", None)
-    if ts is not None and ts.applies(R):          # the branch where rank 0's partial sits, -0.0 for the others
+    two = ts is not None and ts.applies(R)
+    pb = getattr(b, "partb", None)
+    if pb is not None:                            # TF_GLM_LANE_PARTIALS=bf16: this rank's partial rounded to bf16
+        lane_partials.to_bf16(pb[:R], b.part[:R])
+        gb = getattr(b, "gathb", None)
+        if gb is not None and not two:            # a decode buffer: the all-gather moves the bf16 rows
+            out = b.gath[:b.world * R * d]
+            got = gb[:b.world * R * d]
+            w.comm.all_gather(pb[:R].reshape(-1), got)
+            lane_partials.widen(out, got)
+            return out.view(b.world, R, d)
+        lane_partials.widen(b.part[:R], pb[:R])   # else fp32 rows holding the bf16 values (the same sums)
+    if two:                                       # the branch where rank 0's partial sits, -0.0 for the others
         # (inside the layer loop the glue takes a split exchange: TF_GLM_TWOSHOT_SPLIT, ``_hc_post``)
         return ts.exchange(b.part, R, split=getattr(b, "hc_split_ok", False))
     out = b.gath[:b.world * R * d]

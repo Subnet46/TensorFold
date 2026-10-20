@@ -39,7 +39,7 @@ from typing import Callable
 
 import torch
 
-from . import glue
+from . import glue, lane_partials
 
 EXCHANGES = ("p2p", "gather", "ce")
 
@@ -212,7 +212,8 @@ class HcSplit:
             # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it);
             # TF_GLM_LANE_INPUTS: an input staging of the widest chosen projection input (0 bytes without it)
             self.ce = CeExchange(self.rank, self.world, store, rows, b.part.shape[1],
-                                 taps + 1, narrow=narrow_bytes(), inputs=row_bytes(self.w), homes=homes)
+                                 taps + 1, narrow=narrow_bytes(), inputs=row_bytes(self.w), homes=homes,
+                                 pbf16=lane_partials.on())        # TF_GLM_LANE_PARTIALS=bf16: a bf16 staging
             for name in homes:                   # the buffers move into the arena (nothing holds the old ones)
                 old = getattr(b, name)
                 setattr(b, name, self.ce.home(name, old.dtype, tuple(old.shape)))
@@ -267,6 +268,8 @@ class HcSplit:
         if self.stream is not None and self.active:
             torch.cuda.current_stream().wait_stream(self.stream)
         self.active = False
+        if self.ce is not None:                         # TF_GLM_CE_COUNT=1: the chunk's copy-engine bytes
+            self.ce.report(f"split chunk of {self.R} rows")
 
     def mine(self) -> int:
         return self.rank * self.H
@@ -284,8 +287,11 @@ class HcSplit:
 
         off, n = self.pieces[j]
         b = self.b
+        bf16 = lane_partials.on()
+        if bf16:                                        # TF_GLM_LANE_PARTIALS=bf16: the rows that go, rounded
+            self._round_sent(j)
         if self.ce is not None:                         # copy engines: into each peer's staging block of the piece
-            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off)
+            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off, partb=b.partb if bf16 else None)
             return
         if self.world > 2:
             if self.gather:                             # every rank's whole partial (one piece)
@@ -301,6 +307,25 @@ class HcSplit:
             self.all_gather(send.reshape(-1), b.gath[2 * off * d:2 * (off + n) * d])
         else:
             self.w.comm.exchange([send], [self.got[j]], self.peer)
+
+    def _round_sent(self, j: int) -> None:
+        """TF_GLM_LANE_PARTIALS=bf16 (``lane_partials``): the rows of this rank's partial that piece j sends, rounded
+        to bf16 right before they go, on the exchange's stream after the fill that wrote them: into b.partb for the
+        copy engines (which move bf16 rows), in place for NCCL (fp32 rows that hold bf16 values). This rank's own
+        rows are rounded where hc_post's caller reads them (``_post``), after their own fill."""
+
+        off, n = self.pieces[j]
+        b = self.b
+        if self.ce is not None:
+            for q in self.peers:
+                lo = q * self.H + off
+                lane_partials.to_bf16(b.partb[lo:lo + n], b.part[lo:lo + n])
+            return
+        if self.world > 2 and self.gather:              # the whole partial goes, this rank's rows too
+            lane_partials.round_(b.part[:self.Rp], b.partb[:self.Rp])
+            return
+        for lo in ([p * self.H + off for p in self.peers] if self.world > 2 else [self.theirs() + off]):
+            lane_partials.round_(b.part[lo:lo + n], b.partb[lo:lo + n])
 
     def _swap_rows(self, j: int, outs: list[torch.Tensor], narrow: tuple | list = ()) -> None:
         """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares).
@@ -366,6 +391,8 @@ class HcSplit:
         b = self.b
         x = b.x[lo:hi]
         own = b.part[lo:hi]
+        if lane_partials.on():                          # TF_GLM_LANE_PARTIALS=bf16: this rank's rows rounded too
+            lane_partials.round_(own, b.partb[lo:hi])
         if self.world == 2 and not self.blocks:
             got = self.got[j]
             g0, g1 = (own, got) if self.rank == 0 else (got, own)

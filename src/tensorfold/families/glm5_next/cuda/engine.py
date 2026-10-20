@@ -711,12 +711,14 @@ class GlmEngine:
                 return -1, str(exc)
 
         from . import exl3_stream as _exl3_stream
+        from . import lane_partials as _lane_partials           # patch 0293: TF_GLM_LANE_PARTIALS
         from . import segprof as _segprof
 
         mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
                 quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1),
                 quiet(_exl3_stream.code),
-                quiet(_segprof.code), quiet(lane_inputs_mod.mask)]
+                quiet(_segprof.code), quiet(lane_inputs_mod.mask),
+                quiet(_lane_partials.mask)]
         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
         tables = [row[0] for row in got]
         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
@@ -729,7 +731,7 @@ class GlmEngine:
             raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
                                "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1, "
                                "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF*, "
-                               "TF_GLM_LANE_INPUTS and TF_GLM_LANE_DIRECT (as a mask) by rank "
+                               "TF_GLM_LANE_INPUTS and TF_GLM_LANE_DIRECT (as a mask), TF_GLM_LANE_PARTIALS by rank "
                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
                                + ": give every rank the same valid values")
         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
@@ -803,6 +805,8 @@ class GlmEngine:
             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
         if rank == 0 and (lane_inputs_mod.wanted() or lane_inputs_mod.direct_wanted()):
             print(f"[tensorfold] {lane_inputs_mod.describe(world, lane_inputs_added)}", flush=True)
+        if rank == 0 and _lane_partials.on():
+            print(f"[tensorfold] {_lane_partials.describe()}", flush=True)
         if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
             print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:

@@ -49,8 +49,8 @@ from .hcsplit import HcSplit, SplitSettings
 # Buffers attributes whose first axis is the window's rows: a lane views its rows of each
 ROWS = ("ids", "ids_host", "hin", "x", "normed", "xs", "post", "comb", "hcpart", "ka", "kg", "xs_fa", "xs_ga", "kxs",
         "dp", "qr", "xs_qr", "lat", "xs_lat", "q", "kn", "vn", "xs_ao", "ikr", "igr", "qi", "gu", "act", "xs_act",
-        "mlog", "pick", "wts", "ey", "sgu", "sact", "sxs", "sy", "part", "hidden", "fnormed", "fxs", "me", "mcat",
-        "mxs", "mx")
+        "mlog", "pick", "wts", "ey", "sgu", "sact", "sxs", "sy", "part", "partb", "hidden", "fnormed", "fxs", "me",
+        "mcat", "mxs", "mx")
 # handled one by one below
 SPECIAL = ("eact", "kproj", "taps", "kscratch", "lat_s", "gath", "split", "rows", "alloc_rows")
 
@@ -133,6 +133,9 @@ def rows_view(b, lo: int, hi: int):
     v = SimpleNamespace()
     for name, value in vars(b).items():
         if name in ROWS:
+            if value is None:                    # a row buffer a setting did not allocate (TF_GLM_LANE_PARTIALS)
+                setattr(v, name, None)
+                continue
             if value.shape[0] != alloc:
                 raise RuntimeError(f"prefill lanes: buffer {name} has {value.shape[0]} rows, not {alloc}")
             setattr(v, name, value[lo:hi])
@@ -236,12 +239,16 @@ class LaneSplit(HcSplit):
         """Each peer's fp32 partial of this rank's rows: its staged input rows times its slice of the weight (the
         prompt matmul, as the peer's own ``fill`` runs it), into its slot of the staging block."""
 
+        from . import lane_partials
         from .forward import mm
 
         block = self.got[0]
         k = x.shape[1]
+        bf16 = lane_partials.on()
         for p in self.peers:
             mm(self.b, self.ce.staged(p, k, self.ce_at, self.H), ranks[p], None, block[p], f32=True)
+            if bf16:                     # TF_GLM_LANE_PARTIALS=bf16: the peer's partial rounded as the peer would
+                lane_partials.round_(block[p], self.b.partb[p * self.H:(p + 1) * self.H])
 
     def glue_async(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False, moe=None) -> None:
         """``HcSplit.glue`` of the lane's own rows (one piece), all on the exchange stream after its partials'
@@ -405,3 +412,6 @@ def lane_layers(w, st, b, R: int, host_pos: int) -> None:
             main.wait_stream(rec)
         for view, ls, lst, n, nch in run:
             ls.active = False
+        ce = getattr(b.split, "ce", None)
+        if ce is not None:                       # TF_GLM_CE_COUNT=1: the chunk's copy-engine bytes
+            ce.report(f"lane chunk of {R} rows")
