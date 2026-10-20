@@ -154,14 +154,64 @@ def _expand_v4(OL, WW, WS, WB, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl
         tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
 
 
+@triton.jit
+def _absorb_mma(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
+                BN: tl.constexpr, BK: tl.constexpr):
+    """Prompt rows, program (head, row block, column block): QA = Q @ WK on the tensor cores, each row one fp32 chain
+    over ascending k blocks (its bits do not depend on the other rows)."""
+
+    h = tl.program_id(0)
+    rm = tl.program_id(1) * BM + tl.arange(0, BM)
+    n = tl.program_id(2) * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    ok = rm < R
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k0 in range(0, D, BK):
+        q = tl.load(Q + (rm[:, None] * H + h) * D + k0 + kk[None, :], mask=ok[:, None], other=0.0)
+        w = tl.load(WK + (h * D + k0 + kk[:, None]) * LW + n[None, :])
+        acc = tl.dot(q, w, acc)
+    tl.store(QA + (rm[:, None] * H + h) * LW + n[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
+
+
+@triton.jit
+def _expand_mma(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
+                BN: tl.constexpr, BK: tl.constexpr):
+    """Prompt rows, program (head, row block, output block): OUT = OL @ WV^T on the tensor cores, as _absorb_mma."""
+
+    h = tl.program_id(0)
+    rm = tl.program_id(1) * BM + tl.arange(0, BM)
+    n = tl.program_id(2) * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    ok = rm < R
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k0 in range(0, LW, BK):
+        o = tl.load(OL + (rm[:, None] * H + h) * LW + k0 + kk[None, :], mask=ok[:, None], other=0.0)
+        w = tl.load(WV + (h * DV + n[:, None]) * LW + k0 + kk[None, :])
+        acc = tl.dot(o, tl.trans(w), acc)
+    tl.store(OUT + (rm[:, None] * H + h) * DV + n[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
+
+
+# prompt chunks' tiles (rows, columns, k) and (warps, stages); fixed, so a row's bits never depend on the chunk
+PROMPT_MMA = __import__("os").environ.get("TF_GLM_LATENT_MMA", "1") != "0"    # 0: prompts on the decode kernels
+MMA_TILE = (64, 128, 64)
+MMA_LAUNCH = (4, 3)
+
+
 def row_block(R: int) -> int:
     """Rows per program: 1 for decode windows (most parallel), 16 for prefill chunks (weights reused)."""
     return 1 if R <= 16 else 16
 
 
-def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
-    """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16."""
+def absorb_q(q: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
+    """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16; ``prompt``: a prompt chunk's rows, on the tensor cores
+    (other bits than decode rows', the same for any chunking)."""
     R, H, D = q.shape
+    if prompt and isinstance(a, AbsorbW) and q.is_contiguous():
+        BM, BN, BK = MMA_TILE
+        warps, stages = MMA_LAUNCH
+        _absorb_mma[(H, triton.cdiv(R, BM), a.lw // BN)](q, a.wk, out, R, H=H, D=D, LW=a.lw, BM=BM, BN=BN, BK=BK,
+                                                          num_warps=warps, num_stages=stages)
+        return out
     if isinstance(a, AbsorbQ4):
         rb = row_block(R)
         _absorb_q4[(H, a.lw // 64, triton.cdiv(R, rb))](q, a.wkw, a.wks, a.wkb, out, R, H=H, D=D, LW=a.lw, RB=rb,
@@ -172,9 +222,15 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
-    """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16."""
+def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
+    """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16; ``prompt`` as in absorb_q."""
     R, H, _ = o_lat.shape
+    if prompt and isinstance(a, AbsorbW) and o_lat.is_contiguous():
+        BM, BN, BK = MMA_TILE
+        warps, stages = MMA_LAUNCH
+        _expand_mma[(H, triton.cdiv(R, BM), a.v_dim // BN)](o_lat, a.wv, out, R, H=H, DV=a.v_dim, LW=a.lw, BM=BM,
+                                                             BN=BN, BK=BK, num_warps=warps, num_stages=stages)
+        return out
     if isinstance(a, AbsorbQ4):
         BN = 16
         _expand_v4[(H, a.v_dim // BN)](o_lat, a.wvw, a.wvs, a.wvb, out, R, H=H, DV=a.v_dim, LW=a.lw, BN=BN,

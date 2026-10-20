@@ -159,15 +159,47 @@ def _hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
     tl.store(XS + r * (D // 64) + tl.arange(0, BLOCK // 64), g)
 
 
+@triton.jit
+def _hc_partial_mma(X, FN, PART, R, WIDE: tl.constexpr, NB: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
+    """Prompt rows, program (row block, K block): _hc_partial's 24 dots on the tensor cores (one fp32 chain over
+    ascending k tiles, a row's bits independent of the other rows) and its sum of squares, in PART's layout."""
+
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    b = tl.program_id(1)
+    KB: tl.constexpr = WIDE // NB
+    m = tl.arange(0, 32)
+    k = tl.arange(0, BK)
+    ok = rm < R
+    acc = tl.zeros((BM, 32), dtype=tl.float32)
+    ss = tl.zeros((BM,), dtype=tl.float32)
+    for t in range(KB // BK):
+        base = b * KB + t * BK
+        x = tl.load(X + rm[:, None] * WIDE + base + k[None, :], mask=ok[:, None], other=0.0)
+        w = tl.load(FN + m[None, :] * WIDE + base + k[:, None], mask=m[None, :] < 24, other=0.0)
+        acc = tl.dot(x, w, acc)
+        xf = x.to(tl.float32)
+        ss += tl.sum(xf * xf, axis=1)
+    tl.store(PART + (rm[:, None] * NB + b) * 32 + m[None, :], acc, mask=ok[:, None] & (m[None, :] < 24))
+    tl.store(PART + (rm * NB + b) * 32 + 24, ss, mask=ok)
+
+
+HC_MMA = __import__("os").environ.get("TF_GLM_HC_MMA", "1") != "0"    # prompt rows' mixing dots on the tensor cores
+
+
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
-           eps: float, hc_eps: float, iters: int) -> None:
-    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S]."""
+           eps: float, hc_eps: float, iters: int, *, prompt: bool = False) -> None:
+    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S];
+    ``prompt``: a prompt chunk's rows, their mixing dots on the tensor cores (other bits than decode rows')."""
 
     rows, wide = x.shape
     d = norm_w.shape[0]
     s = wide // d
-    _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+    if prompt and HC_MMA and x.is_contiguous():
+        _hc_partial_mma[(triton.cdiv(rows, 64), HC_BLOCKS)](x, fn, part, rows, WIDE=wide, NB=HC_BLOCKS, BM=64, BK=64,
+                                                            num_warps=4, num_stages=3)
+    else:
+        _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
     _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
                         ITERS=iters, BLOCK=d, num_warps=8)
 

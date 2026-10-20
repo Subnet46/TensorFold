@@ -53,7 +53,10 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
 }
 
 // Grid (item, n block, mat * SK + split) -> Z[mat][split][pair][n]; warps sum fixed k ranges, added in warp order.
-template <int NT, int W, bool NFIRST, bool PF>
+// SEQ (prompt chunks): grid (.., .., mat); one program runs the SK splits in turn and writes Z[mat][0][pair][n] =
+// ((0 + split 0) + split 1) + ..., the epilogue's own sum, so an SK = 1 epilogue gives the same bits without the
+// SK fp32 partials' round trip through memory.
+template <int NT, int W, bool NFIRST, bool PF, bool SEQ>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
@@ -64,8 +67,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
     if (e >= E) return;                                  // the shared expert (id E) is not EXL3
-    const int split = blockIdx.z % SK;
-    const int mat = blockIdx.z / SK;
+    const int mat = SEQ ? blockIdx.z : blockIdx.z / SK;
     const half* X = mat ? X1 : X0;
     const uint32_t* T = mat ? T1 : T0;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -80,8 +82,13 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
 
     const int per_split = KT / SK, per_warp = per_split / W;
-    const int kt0 = split * per_split + warp * per_warp;
     const int nt0 = nblock * NT;
+    constexpr int OUT = 16 * NT * 16 / (W * 32);        // the sums a thread writes (SEQ keeps them in registers)
+    float tot[OUT];
+    __shared__ float red[W][16][NT * 16];
+    for (int si = 0; si < (SEQ ? SK : 1); ++si) {
+    const int split = SEQ ? si : blockIdx.z % SK;
+    const int kt0 = split * per_split + warp * per_warp;
     const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
 
     float acc[NT][2][4];
@@ -148,7 +155,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
 
     // warps' partial sums through shared memory, added in warp order
-    __shared__ float red[W][16][NT * 16];
+    if (SEQ && si > 0) __syncthreads();                // the previous split's sums are read
 #pragma unroll
     for (int i = 0; i < NT; ++i)
 #pragma unroll
@@ -160,14 +167,29 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             red[warp][g + 8][col + 1] = acc[i][h][3];
         }
     __syncthreads();
-    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+#pragma unroll
+    for (int j = 0; j < OUT; ++j) {
+        const int idx = threadIdx.x + j * W * 32;
         const int row = idx / (NT * 16), col = idx % (NT * 16);
         const int r = rows_sh[row];
-        if (r < 0) continue;
         float s = red[0][row][col];
 #pragma unroll
         for (int w = 1; w < W; ++w) s += red[w][row][col];
-        Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+        if (SEQ) {
+            tot[j] = si == 0 ? 0.f + s : tot[j] + s;
+        } else if (r >= 0) {
+            Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+        }
+    }
+    }  // splits
+    if (SEQ) {
+#pragma unroll
+        for (int j = 0; j < OUT; ++j) {
+            const int idx = threadIdx.x + j * W * 32;
+            const int row = idx / (NT * 16), col = idx % (NT * 16);
+            const int r = rows_sh[row];
+            if (r >= 0) Z[((size_t)mat * P + r) * N + nt0 * 16 + col] = tot[j];
+        }
     }
 }
 
@@ -274,16 +296,268 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
     for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
 }
 
+
+// ---- prompt chunks: Y^T = W^T X^T --------------------------------------------------------------------------------
+// A decoded trellis tile is, reordered, an m16n8k16 A fragment of W^T (lane (g, t): a0 = b0[0], a1 = b1[0],
+// a2 = b0[1], a3 = b1[1]), so each warp decodes its own tiles straight into registers and every decoded fragment
+// feeds the whole pass's member rows (up to 64 tokens, the prefill plan's item) as B fragments from shared memory.
+// Each output is one fp32 chain of mma over ascending k tiles (no split K, no partials in memory), so a row's bits
+// depend on its own values only (any chunking gives the same prompt state), though they are not the decode
+// kernel's (which sums split and warp partials). The epilogues are gateup/down_epilogue_kernel's formulas.
+constexpr int PBK = 32;              // k values a shared-memory stage (2 k tiles)
+constexpr int PKT = PBK / 16;
+constexpr int PSTAGES = 3;
+constexpr int PXS = PBK + 8;         // stage row stride in halves (+16 B: ldmatrix rows on distinct banks)
+
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(s));
+}
+
+// A block covers 16 m tiles (gate/up: 8 of each matrix = one 128-column Hadamard block; down: 256 columns) for a
+// pass of PM members with NW warps: each warp holds MT = 16 / NW m tiles for all PM members (PM / 8 n blocks), so a
+// decoded tile feeds PM / 8 mma. PM 64 / 8 warps (two blocks an SM) or PM 128 / 16 warps (one): the same per-element
+// chains, so the same bits. Every stage brings the members' next PBK k values and the 16 tiles' trellis words into
+// shared memory (cp.async, PSTAGES deep).
+constexpr int PWORDS = 16 * PKT * 32;          // a stage's trellis words (16 m tiles x PKT k tiles x 32)
+
+template <int MATS, int PM, int NW>
+struct PromptCfg {
+    static constexpr int MT = 16 / NW, NB = PM / 8, T = NW * 32;
+    static constexpr size_t STAGE_HALVES = (size_t)MATS * PM * PXS + 2 * PWORDS;
+};
+
+// Which (matrix, m tile) warp-tile q (0..15) of block cb is.
+template <int MATS>
+__device__ __forceinline__ void prompt_tile(int q, int cb, int& mat, int& nt) {
+    mat = MATS == 2 ? q >> 3 : 0;
+    nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
+}
+
+template <int MATS, int PM, int NW>
+__device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
+                                                const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
+                                                const int* rows_sh, int cnt, int e, int K, int NTILES, int cb,
+                                                half* stage, float (&acc)[16 / NW][PM / 8][4]) {
+    using C = PromptCfg<MATS, PM, NW>;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int mat, nt_unused;
+    prompt_tile<MATS>(warp * C::MT, cb, mat, nt_unused);
+    const int KT = K >> 4, chunks = K / PBK;
+    const int nblocks = (cnt + 15) >> 4;                                            // 16-member blocks in use
+
+#pragma unroll
+    for (int i = 0; i < C::MT; ++i)
+#pragma unroll
+        for (int j = 0; j < C::NB; ++j)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
+
+    auto load = [&](int chunk) {
+        half* dst = stage + (size_t)(chunk % PSTAGES) * C::STAGE_HALVES;
+        const int k0 = chunk * PBK;
+        for (int idx = threadIdx.x; idx < MATS * PM * (PBK / 8); idx += C::T) {
+            const int m = idx / (PM * (PBK / 8)), rem = idx % (PM * (PBK / 8)), i = rem / (PBK / 8),
+                      j = rem % (PBK / 8);
+            const int r = rows_sh[i];
+            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : r) * K + k0 + j * 8;
+            cp_async16(dst + ((size_t)m * PM + i) * PXS + j * 8, src, r >= 0);
+        }
+        uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)MATS * PM * PXS);
+        for (int idx = threadIdx.x; idx < 16 * PKT * 8; idx += C::T) {       // 16 B pieces of 128-B tile words
+            const int q = idx / (PKT * 8), kk = (idx / 8) % PKT, part = idx % 8;
+            int wm, nt;
+            prompt_tile<MATS>(q, cb, wm, nt);
+            const uint32_t* src = (wm ? T1 : T0) + (((size_t)e * KT + chunk * PKT + kk) * NTILES + nt) * 32 + part * 4;
+            cp_async16(wdst + ((size_t)q * PKT + kk) * 32 + part * 4, src, true);
+        }
+    };
+#pragma unroll
+    for (int c = 0; c < PSTAGES - 1; ++c) {
+        if (c < chunks) load(c);
+        cp_async_commit();
+    }
+    for (int c = 0; c < chunks; ++c) {
+        cp_async_wait<PSTAGES - 2>();
+        __syncthreads();
+        if (c + PSTAGES - 1 < chunks) load(c + PSTAGES - 1);
+        cp_async_commit();
+        const half* base = stage + (size_t)(c % PSTAGES) * C::STAGE_HALVES;
+        const half* xs = base + (size_t)mat * PM * PXS;
+        const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)MATS * PM * PXS);
+#pragma unroll
+        for (int kk = 0; kk < PKT; ++kk) {
+            uint32_t a[C::MT][4];
+#pragma unroll
+            for (int i = 0; i < C::MT; ++i) {
+                uint32_t b0[2], b1[2];
+                decode_tile(ws[((size_t)(warp * C::MT + i) * PKT + kk) * 32 + lane], lane, b0, b1);
+                a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
+            }
+#pragma unroll
+            for (int jb = 0; jb < PM / 16; ++jb) {
+                if (jb < nblocks) {
+                    uint32_t r[4];
+                    const int row = jb * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
+                    ldsm_x4(r, xs + (size_t)row * PXS + kk * 16 + ((lane >> 3) & 1) * 8);
+                    const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
+#pragma unroll
+                    for (int i = 0; i < C::MT; ++i) {
+                        mma16816(acc[i][2 * jb], a[i], bl);
+                        mma16816(acc[i][2 * jb + 1], a[i], bh);
+                    }
+                }
+            }
+        }
+    }
+    cp_async_wait<0>();
+    __syncthreads();                                   // the stages become the epilogue's rows
+}
+
+// acc (this warp's m tiles, members PM / 2 * hf .. + PM / 2 - 1) -> E[member - PM / 2 * hf][col] fp32, row stride
+// ES; col0: the first m tile's first column within the block's E columns.
+template <int MT, int PM>
+__device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const float (&acc)[MT][PM / 8][4], int hf) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int q = 0; q < PM / 16; ++q) {
+            const int nb = hf * (PM / 16) + q;
+            const int tok = q * 8 + 2 * t, col = col0 + i * 16 + g;
+            E[(size_t)tok * ES + col] = acc[i][nb][0];
+            E[(size_t)(tok + 1) * ES + col] = acc[i][nb][1];
+            E[(size_t)tok * ES + col + 8] = acc[i][nb][2];
+            E[(size_t)(tok + 1) * ES + col + 8] = acc[i][nb][3];
+        }
+}
+
+constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;
+template <int PM>
+constexpr size_t prompt_smem() {
+    // max of: gate/up stages, down stages, gate/up epilogue half (2 x PM/2 x GU_ES), down half (PM/2 x DN_ES)
+    const size_t gu = (size_t)PSTAGES * (2 * PM * PXS + 2 * PWORDS) * 2;
+    const size_t ep = (size_t)2 * (PM / 2) * GU_ES * 4;
+    const size_t dn = (size_t)(PM / 2) * DN_ES * 4;
+    return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
+}
+
+template <int PM, int NW>
+__global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+    const half* __restrict__ Xg, const half* __restrict__ Xu, const uint32_t* __restrict__ Tg,
+    const uint32_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+    const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit) {
+    constexpr int MT = 16 / NW, PH = PM / 2;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __shared__ int rows_sh[PM];
+    const int cb = blockIdx.x, item = blockIdx.y;
+    if (item >= counts[0]) return;
+    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    if (e >= E) return;                                  // the shared expert
+    if (threadIdx.x < PM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float acc[MT][PM / 8][4];
+    prompt_mainloop<2, PM, NW>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, reinterpret_cast<half*>(smem_raw),
+                               acc);
+    float* Eg = reinterpret_cast<float*>(smem_raw);
+    int mat, nt;
+    prompt_tile<2>(warp * MT, cb, mat, nt);
+    const int col0 = (nt - cb * 8) * 16;
+    const int n = cb * 128 + 4 * lane;
+    for (int hf = 0; hf < 2 && hf * PH < cnt; ++hf) {
+    if (hf) __syncthreads();                             // the first half's rows are read
+    prompt_spill<MT, PM>(Eg + (size_t)mat * PH * GU_ES, GU_ES, col0, acc, hf);
+    __syncthreads();
+    for (int i = warp; i < PH && hf * PH + i < cnt; i += NW) {
+        const int p = rows_sh[hf * PH + i];
+        float gv[4], uv[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            gv[j] = Eg[(size_t)i * GU_ES + 4 * lane + j];
+            uv[j] = Eg[(size_t)(PH + i) * GU_ES + 4 * lane + j];
+        }
+        fwht128(gv, lane);
+        fwht128(uv, lane);
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j])), limit);
+            float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit),
+                             limit);
+            float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
+            v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
+        }
+        fwht128(v, lane);
+        half* o = xd + (size_t)p * N + n;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+    }
+    }  // halves
+}
+
+template <int PM, int NW>
+__global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
+    const half* __restrict__ Xd, const uint32_t* __restrict__ Td, const int* __restrict__ items,
+    const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+    float* __restrict__ y, int K, int D, int E) {
+    constexpr int MT = 16 / NW, PH = PM / 2;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __shared__ int rows_sh[PM];
+    const int cb = blockIdx.x, item = blockIdx.y;
+    if (item >= counts[0]) return;
+    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    if (e >= E) return;
+    if (threadIdx.x < PM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float acc[MT][PM / 8][4];
+    prompt_mainloop<1, PM, NW>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
+                               acc);
+    float* Ed = reinterpret_cast<float*>(smem_raw);
+    for (int hf = 0; hf < 2 && hf * PH < cnt; ++hf) {
+    if (hf) __syncthreads();
+    prompt_spill<MT, PM>(Ed, DN_ES, warp * MT * 16, acc, hf);
+    __syncthreads();
+    for (int i = warp; i < PH && hf * PH + i < cnt; i += NW) {
+        const int p = rows_sh[hf * PH + i];
+#pragma unroll
+        for (int blk = 0; blk < 2; ++blk) {
+            const int n = cb * 256 + blk * 128 + 4 * lane;
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
+            fwht128(v, lane);
+            float* o = y + (size_t)p * D + n;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+        }
+    }
+    }  // halves
+}
+
 }  // namespace
 
 // Z [mats, SK, P, N] fp32 = X_mat[each item's pairs] @ W_q(T_mat[the item's expert]) over each split.
 void exl3_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
                        const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
                        int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t nt,
-                       int64_t warps, int64_t E, bool nfirst, bool pf) {
+                       int64_t warps, int64_t E, bool nfirst, bool pf, bool seq) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
-    dim3 grid = nfirst ? dim3((unsigned)(N / (16 * nt)), (unsigned)max_items, (unsigned)(mats * SK))
-                       : dim3((unsigned)max_items, (unsigned)(N / (16 * nt)), (unsigned)(mats * SK));
+    TORCH_CHECK(!seq || nfirst, "SEQ runs with the prompt launch order");
+    const unsigned zdim = (unsigned)(seq ? mats : mats * SK);
+    dim3 grid = nfirst ? dim3((unsigned)(N / (16 * nt)), (unsigned)max_items, zdim)
+                       : dim3((unsigned)max_items, (unsigned)(N / (16 * nt)), zdim);
     auto stream = at::cuda::getCurrentCUDAStream();
     auto x0 = reinterpret_cast<const half*>(X0.data_ptr());
     auto x1 = reinterpret_cast<const half*>(X1.data_ptr());
@@ -291,8 +565,9 @@ void exl3_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Ten
     auto t1 = reinterpret_cast<const uint32_t*>(T1.data_ptr());
 #define LAUNCH(NT_, W_)                                                                                          \
     do {                                                                                                         \
-        auto fn = nfirst ? (pf ? grouped_kernel<NT_, W_, true, true> : grouped_kernel<NT_, W_, true, false>)   \
-                         : (pf ? grouped_kernel<NT_, W_, false, true> : grouped_kernel<NT_, W_, false, false>); \
+        auto fn = seq ? (pf ? grouped_kernel<NT_, W_, true, true, true> : grouped_kernel<NT_, W_, true, false, true>) \
+            : nfirst ? (pf ? grouped_kernel<NT_, W_, true, true, false> : grouped_kernel<NT_, W_, true, false, false>) \
+                     : (pf ? grouped_kernel<NT_, W_, false, true, false> : grouped_kernel<NT_, W_, false, false, false>); \
         fn<<<grid, W_ * 32, 0, stream>>>(x0, x1, t0, t1, items.data_ptr<int>(), counts.data_ptr<int>(),          \
                                          members.data_ptr<int>(), Z.data_ptr<float>(), (int)K, (int)N, (int)P,   \
                                          (int)SK, (int)E);                                                       \
@@ -336,4 +611,48 @@ void exl3_down_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const 
         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
         y.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)slots);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Prompt chunks (a plan of PM-pair items, PM 64 or 128): Xd [P, N] = the gate/up epilogue of Xg/Xu's pairs;
+// Y [P, D] = the down epilogue.
+template <int PM, int NW>
+static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, const at::Tensor& Tu,
+                          const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
+                          const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                          const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+                          int64_t N, int64_t E, int64_t max_items, double limit) {
+    constexpr size_t SMEM = prompt_smem<PM>();
+    static bool once = [] {
+        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+        cudaFuncSetAttribute(prompt_down_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+        return true;
+    }();
+    (void)once;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
+    auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
+    prompt_gateup_kernel<PM, NW><<<dim3((unsigned)(N / 128), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+        h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+        h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E, (float)limit);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+        reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
+        members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, const at::Tensor& Tu,
+                      const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
+                      const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                      const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+                      int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass) {
+    TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % PBK == 0 && N % PBK == 0, "prompt experts: shapes");
+    if (pass == 128)
+        prompt_launch<128, 16>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N,
+                               E, max_items, limit);
+    else if (pass == 64)
+        prompt_launch<64, 8>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
+                             max_items, limit);
+    else
+        TORCH_CHECK(false, "prompt experts: passes of 64 or 128 members");
 }

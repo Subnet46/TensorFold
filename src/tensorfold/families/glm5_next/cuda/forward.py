@@ -103,8 +103,8 @@ class Buffers:
         universal = exl3 and w.meta.get("exl3_route") == "universal"
         self.ey = None if universal else torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32,
                                                      device=dev)
-        self.plan = None if universal else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill and not exl3)
         self.exl3 = None
+        prompt = False
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
             if universal:
@@ -112,13 +112,18 @@ class Buffers:
                 self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
                 self.ey = self.exl3.y.view(rows, slots, D)
             else:                        # GLM's own kernels (exl3_mm): their scratch, routed by the plan
-                from .exl3_mm import Scratch
+                from .exl3_mm import Scratch, prompt_kernels, prompt_pass
 
-                self.exl3 = Scratch(rows, slots, D, ml, dev)
+                prompt = prefill and prompt_kernels()
+                self.exl3 = Scratch(rows, slots, D, ml, dev, prompt=prompt)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
             self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)
             self.sy = torch.empty((rows, D), dtype=f32, device=dev)
+        # a prompt window's EXL3 experts take items of 64 pairs (the prompt kernels' pass), decode windows 16
+        self.plan = None if universal else grouped.Plan(rows, slots, c.experts + 1, dev,
+                                                        prefill=prefill and (not exl3 or prompt),
+                                                        tile=prompt_pass() if prompt else None)
         # rank partials
         self.part = torch.empty((rows, D), dtype=f32, device=dev)
         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
@@ -374,7 +379,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
             glue.router(b.normed[:R], ix.gate, b.igr[:R])
             sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
     with prof.timed("dsa: absorb"):
-        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
+        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
     if not all_sparse:
@@ -389,7 +394,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
         with prof.timed("dsa: sparse attention"):
             latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
     with prof.timed("dsa: expand"):
-        o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+        o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
 
 
@@ -407,7 +412,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
         if b.plan is not None:           # (the universal EXL3 route groups its own pairs)
-            grouped.route(b.pick[:R], b.plan)
+            grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         from . import exl3_mm
@@ -443,7 +448,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
     x = b.x[:R]
     h = layer.attn_hc
     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
     if layer.kind == "kda":
         with prof.timed("kda"):
             g = kda_block(layer, w, st, b, R, cut)
@@ -456,7 +461,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
         h = layer.ffn_hc
         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])

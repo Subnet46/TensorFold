@@ -184,12 +184,38 @@ def stack_b16(parts: list[torch.Tensor]) -> B16:
 
 # BF16 matmuls: columns and K per step; the K slices come from ``split_k`` as for Q4 (fixed by the shape)
 B16_BN, B16_BK = 64, 64
+# from this many rows (a prompt chunk) one program runs all of a matmul's K slices and sums them in _reduce's order:
+# the same bits as the split grid, without writing and reading back fp32 partials for every row. Measured at 2,048
+# rows (GB10): 1.3-3.2x on N >= 512, K <= 4,096; slower on narrow outputs (N 32-288) and long K (6,144, 8,192)
+SEQ_ROWS = int(__import__("os").environ.get("TF_GLM_SEQ_ROWS", "256"))
+
+
+def _seq(sk: int, m: int, n: int, k: int) -> bool:
+    return sk > 1 and m >= SEQ_ROWS and n >= 512 and k <= 4096
+
+
+# prompt chunks (SEQ_ROWS rows or more): (BM, BN, warps, stages) and SEQ by per-rank shape (N, K), swept on GB10 at
+# 2,048 rows; no choice changes a row's bits. Other shapes take PROMPT_DEFAULT.
+F8_PROMPT = {(6432, 4096): (128, 128, 8, 3), (2048, 4096): (64, 64, 8, 3), (4096, 1024): (64, 128, 8, 3),
+             (4096, 4096): (64, 128, 8, 3), (8192, 1536): (64, 128, 4, 3), (12288, 4096): (128, 64, 4, 3),
+             (4096, 6144): (128, 64, 8, 4), (4096, 8192): (64, 64, 4, 4), (1536, 4096): (64, 64, 8, 3)}
+PROMPT_DEFAULT = (64, 128, 8, 3)
+
+
+def _prompt_cfg(sk: int, m: int, n: int, k: int):
+    """(BM, BN, warps, stages, seq) for a prompt chunk's matmul, or None below SEQ_ROWS rows."""
+    if m < SEQ_ROWS:
+        return None
+    if (n, k) in F8_PROMPT:
+        return (*F8_PROMPT[(n, k)], sk > 1)
+    return (*PROMPT_DEFAULT, _seq(sk, m, n, k))
 
 
 @triton.jit
 def _bmm(X, W, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
-         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
-    """Multiply bf16 rows over a fixed K slice in order with fp32 sums, independently of other rows."""
+         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr, SEQ: tl.constexpr = False):
+    """Multiply bf16 rows over a fixed K slice in order with fp32 sums, independently of other rows; SEQ: one program
+    runs every slice and sums them as _reduce does (the same bits, without the fp32 partials' round trip)."""
 
     PER: tl.constexpr = K // SK
     pid_n = tl.program_id(1)
@@ -199,13 +225,26 @@ def _bmm(X, W, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.
     rk = tl.arange(0, BK)
     m_ok = rm < M
     n_ok = rn < N
-    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
-    for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
-        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
-        w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
-        acc = acc + tl.dot(x, tl.trans(w))
+    if SEQ:
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for s in tl.static_range(SK):
+            part = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+            for k0 in range(s * PER, s * PER + PER, BK):
+                x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+                w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+                part = part + tl.dot(x, tl.trans(w))
+            if s == 0:
+                acc = part
+            else:
+                acc = acc + part
+    else:
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+            acc = acc + tl.dot(x, tl.trans(w))
     out_mask = m_ok[:, None] & n_ok[None, :]
-    if SK == 1:
+    if SK == 1 or SEQ:
         if F32:
             tl.store(OUT + rm[:, None] * N + rn[None, :], acc, mask=out_mask)
         else:
@@ -252,18 +291,19 @@ def _matmul_b16(x: torch.Tensor, q: B16, *, out: torch.Tensor | None, f32: bool,
     bm = bucket(min(m, 128))              # a prompt chunk runs as 128-row blocks: no bucket changes a row's bits
     warps, stages = B16_CONFIG[bm]
     sk = b16_split_k(q.n, q.k)
+    seq = _seq(sk, m, q.n, q.k)
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
     elif out.shape != (m, q.n) or not out.is_contiguous():
         raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({m}, {q.n})")
-    if sk > 1:
+    if sk > 1 and not seq:
         need = sk * m * q.n
         if part is None or part.numel() < need:
             part = torch.empty((need,), dtype=torch.float32, device=x.device)
-    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, B16_BN), sk)
-    _bmm[grid](x, q.weight, out, part if sk > 1 else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
-               BLOCK_N=B16_BN, BK=B16_BK, F32=f32, num_warps=warps, num_stages=stages)
-    if sk > 1:
+    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, B16_BN), 1 if seq else sk)
+    _bmm[grid](x, q.weight, out, part if sk > 1 and not seq else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
+               BLOCK_N=B16_BN, BK=B16_BK, F32=f32, SEQ=seq, num_warps=warps, num_stages=stages)
+    if sk > 1 and not seq:
         total = m * q.n
         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
     return out
@@ -313,8 +353,9 @@ def stack_f8(parts: list[torch.Tensor]) -> F8 | B16:
 
 @triton.jit
 def _fmm(X, W, S, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
-         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
-    """_bmm over FP8 weights: each BK step's product (bf16 inputs, fp32 sums) times its 128-column block's scales."""
+         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr, SEQ: tl.constexpr = False):
+    """_bmm over FP8 weights: each BK step's product (bf16 inputs, fp32 sums) times its 128-column block's scales;
+    SEQ as in _bmm."""
 
     PER: tl.constexpr = K // SK
     KB: tl.constexpr = K // 128
@@ -325,14 +366,28 @@ def _fmm(X, W, S, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: 
     rk = tl.arange(0, BK)
     m_ok = rm < M
     n_ok = rn < N
-    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
-    for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
-        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
-        w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
-        s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
-        acc = acc + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
+    if SEQ:
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for p in tl.static_range(SK):
+            part = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+            for k0 in range(p * PER, p * PER + PER, BK):
+                x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+                w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+                s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
+                part = part + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
+            if p == 0:
+                acc = part
+            else:
+                acc = acc + part
+    else:
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+            s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
+            acc = acc + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
     out_mask = m_ok[:, None] & n_ok[None, :]
-    if SK == 1:
+    if SK == 1 or SEQ:
         if F32:
             tl.store(OUT + rm[:, None] * N + rn[None, :], acc, mask=out_mask)
         else:
@@ -349,19 +404,23 @@ def _matmul_f8(x: torch.Tensor, q: F8, *, out: torch.Tensor | None, f32: bool,
     bm = bucket(min(m, 128))
     warps, stages = F8_CONFIG[bm]
     sk = b16_split_k(q.n, q.k)
+    seq = _seq(sk, m, q.n, q.k)
+    bn = F8_BN_DECODE if bm == 16 else F8_BN
+    cfg = _prompt_cfg(sk, m, q.n, q.k)
+    if cfg is not None:
+        bm, bn, warps, stages, seq = cfg
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
     elif out.shape != (m, q.n) or not out.is_contiguous():
         raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({m}, {q.n})")
-    if sk > 1:
+    if sk > 1 and not seq:
         need = sk * m * q.n
         if part is None or part.numel() < need:
             part = torch.empty((need,), dtype=torch.float32, device=x.device)
-    bn = F8_BN_DECODE if bm == 16 else F8_BN
-    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), sk)
-    _fmm[grid](x, q.weight, q.scale, out, part if sk > 1 else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
-               BLOCK_N=bn, BK=B16_BK, F32=f32, num_warps=warps, num_stages=stages)
-    if sk > 1:
+    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), 1 if seq else sk)
+    _fmm[grid](x, q.weight, q.scale, out, part if sk > 1 and not seq else out, m, x.stride(0), N=q.n, K=k, SK=sk,
+               BM=bm, BLOCK_N=bn, BK=B16_BK, F32=f32, SEQ=seq, num_warps=warps, num_stages=stages)
+    if sk > 1 and not seq:
         total = m * q.n
         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
     return out

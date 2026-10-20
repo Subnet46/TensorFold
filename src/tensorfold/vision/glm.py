@@ -29,7 +29,8 @@ IMAGE_SPAN = "<|begin_of_image|><|image|><|end_of_image|>"     # what the chat t
 VIDEO_SPAN = "<|begin_of_video|><|video|><|end_of_video|>"     # and for a clip, expanded frame pair by frame pair
 MEAN = (0.48145466, 0.4578275, 0.40821073)                    # CLIP's, from processor_config.json
 STD = (0.26862954, 0.26130258, 0.27577711)
-PASS_PATCHES = 16384                 # patches the tower encodes at once (its workspace scales with this)
+PASS_PATCHES = 8192                  # patches the tower encodes at once (its workspace scales with this): a
+                                     # 2,048-token picture is one pass
 
 
 def _env_int(name: str, default: int, low: int, high: int) -> int:

@@ -31,12 +31,19 @@ def _nfirst() -> bool:
     return os.environ.get("TF_GLM_EXL3_NFIRST", "1") != "0"
 
 
+def _seq() -> bool:
+    """TF_GLM_EXL3_SEQ (default on): prompt chunks sum a matmul's K splits in one program (same bits)."""
+    import os
+
+    return os.environ.get("TF_GLM_EXL3_SEQ", "1") != "0"
+
+
 @lru_cache(maxsize=1)
 def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v9", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v14", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -70,16 +77,36 @@ def words(trellis: torch.Tensor) -> torch.Tensor:
     return trellis.contiguous().view(torch.int32)
 
 
-class Scratch:
-    """Per-window buffers for up to ``rows`` rows of ``slots`` slots (the last slot is the shared expert's)."""
+def prompt_pass() -> int:
+    """TF_GLM_EXL3_PASS: members a prompt kernel pass takes (64 or 128, the same bits; 128 measured slower on real
+    routing: most passes are small, and its one 16-warp block an SM keeps fewer experts in flight)."""
+    import os
 
-    def __init__(self, rows: int, slots: int, dims: int, width: int, device) -> None:
+    value = int(os.environ.get("TF_GLM_EXL3_PASS", "64"))
+    if value not in (64, 128):
+        raise ValueError(f"TF_GLM_EXL3_PASS is 64 or 128, not {value}")
+    return value
+
+
+def prompt_kernels() -> bool:
+    """TF_GLM_EXL3_PROMPT (default on): prompt chunks run the Y^T = W^T X^T kernels on a 64-pair plan (one fp32
+    chain a row: other bits than the decode kernels', independent of the chunking); 0: the decode kernels."""
+    import os
+
+    return os.environ.get("TF_GLM_EXL3_PROMPT", "1") != "0"
+
+
+class Scratch:
+    """Per-window buffers for up to ``rows`` rows of ``slots`` slots (the last slot is the shared expert's); a
+    prompt window's (``prompt``) kernels keep no split partials."""
+
+    def __init__(self, rows: int, slots: int, dims: int, width: int, device, *, prompt: bool = False) -> None:
         P = rows * slots
         sk = max(GATEUP_CFG[2], DOWN_CFG[2])
         self.xg = torch.zeros((P, dims), dtype=torch.float16, device=device)
         self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
         self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
-        self.z = torch.zeros((2 * sk * P * max(width, dims),), dtype=torch.float32, device=device)
+        self.z = torch.zeros((1 if prompt else 2 * sk * P * max(width, dims),), dtype=torch.float32, device=device)
         self.rows, self.slots = rows, slots
 
 
@@ -87,19 +114,28 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
            R: int, limit: float) -> None:
     """Y[row * slots + slot] (fp32) for rows 0..R-1's routed slots, from normed bf16 x and ``experts.route``'s plan."""
 
-    if plan.tile != grouped.TILE:
-        raise ValueError("the EXL3 kernel takes items of 16 pairs")
     ext = _ext()
     slots, P = s.slots, s.rows * s.slots
     D, NI = ex.dims, ex.width
+    if plan.tile in (64, 128):                       # a prompt window: the Y^T kernels, an item a pass
+        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+        ext.prompt(s.xg, s.xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
+                   ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
+                                                                                   plan.tile), float(limit),
+                   plan.tile)
+        return
+    if plan.tile != grouped.TILE:
+        raise ValueError("the EXL3 kernel takes items of 16 pairs")
     items = grouped.max_items(R * slots, plan.experts)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
     nfirst = R >= PROMPT_ROWS and _nfirst()
     nt, w, sk = GATEUP_CFG
+    seq = nfirst and sk > 1 and _seq()        # the splits summed in one program: an SK = 1 epilogue, the same bits
     ext.grouped(s.xg, s.xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, sk, items, nt,
-                w, nfirst, _pf())
-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, sk, slots, float(limit))
+                w, nfirst, _pf(), seq)
+    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 1 if seq else sk, slots,
+                        float(limit))
     nt, w, sk = DOWN_CFG
     ext.grouped(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, sk, items, nt,
-                w, nfirst, _pf())
+                w, nfirst, _pf(), nfirst and sk > 1 and _seq())
     ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, sk, slots)

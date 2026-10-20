@@ -20,10 +20,10 @@ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays de
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
 # --vision (rank 0): what startup reserves beside the tower's 1.05 GiB of bf16 weights for an encode and its
-# prompt's feature rows. Measured peaks: 0.47 GiB (a 2,048-token picture), 0.56 (four), 1.08 (a 16,384-token clip,
-# 16,384 patches a pass), 1.73 (an 8,000-token picture, one 31,724-patch pass). A picture cap past 4,096 tokens
-# scales it; TENSORFOLD_VISION_WORKSPACE_MIB sets it outright
-VISION_WORKSPACE = 3 * 2**29
+# prompt's feature rows (8 KiB a row, which stay through the prefill). The encode's scratch takes turns with a prompt
+# chunk's transient scratch (~1 GiB at 164k), so this covers the rows and the scratch past it. A picture cap past
+# 4,096 tokens scales it; TENSORFOLD_VISION_WORKSPACE_MIB sets it outright
+VISION_WORKSPACE = 3 * 2**28
 
 
 def vision_workspace() -> int:
@@ -163,6 +163,13 @@ class GlmEngine:
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
+        # rows a prompt chunk runs at once: TF_GLM_PREFILL_ROWS (both ranks alike), more amortizes each chunk's expert
+        # weight decode over more tokens and costs buffer memory
+        if prefill_rows is None:
+            prefill_rows = int(os.environ.get("TF_GLM_PREFILL_ROWS", "") or PREFILL_ROWS)
+        prefill_rows = int(prefill_rows)
+        if not 64 <= prefill_rows <= 16384 or prefill_rows % 64:
+            raise ValueError(f"prefill rows: a multiple of 64 from 64 to 16,384, not {prefill_rows}")
         vision = bool(vision) and rank == 0
         workspace = vision_workspace() if vision else 0
         if vision:                           # the tower's bf16 weights, which the split rule drops
@@ -175,7 +182,8 @@ class GlmEngine:
         def geometry(text):
             from tensorfold.cuda.capacity import Geometry
 
-            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.mtp_on)
+            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
+                             mtp=self.mtp_on)
             return Geometry(lambda slots: g.bytes_at(slots) + workspace, g.reserve, g.minimum_slots) if workspace else g
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    geometry,
@@ -186,7 +194,6 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
-        prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                 prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
@@ -555,7 +562,11 @@ class GlmEngine:
             if positions and (positions[-1] >= len(prompt) or positions != sorted(set(positions))):
                 raise ValueError("image rows must sit at increasing positions inside the prompt")
             t = time.perf_counter()
+            # the tower's scratch and a prompt chunk's (token selection, sparse partials) take turns in the same
+            # memory: torch's cache goes back to the driver before and after the encode
+            self.torch.cuda.empty_cache()
             rows = self.vision.features(vision)
+            self.torch.cuda.empty_cache()
             if rows.shape[0] != len(positions):
                 raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
             feed = VisionFeed(self, positions, rows)
