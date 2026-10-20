@@ -148,6 +148,15 @@ class GlmEngine:
         self.serial_only = serial_only
         self.comm = comm if comm is not None else open_comm(rank, 2, master, port)
         self.comm.barrier()
+        if comm is None and os.environ.get("TF_GLM_COMM", "nccl") == "roce":
+            # small all-gathers (a decode round's partials, the samplers) over b12x's one-shot RoCE transport
+            from tensorfold.cuda.roce import RoceComm
+
+            self.comm = RoceComm(self.comm, rank, 2)
+            if rank == 0:
+                print(f"[tensorfold] all-gathers up to {self.comm.roce.max_bytes >> 10} KiB over RoCE "
+                      f"({', '.join(self.comm.roce.hcas)}; b12x's RoCEnante transport), larger ones over NCCL",
+                      flush=True)
         cfg = Config.read(model_dir)
         # Without --context the window stays dense, attending every key without indexer work.
         explicit = context is not None if context_explicit is None else bool(context_explicit)
@@ -591,6 +600,8 @@ class GlmEngine:
             self._share(positions)
         stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed)
         stats.update(policy=spec, drafts=draft)
+        if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
+            self.comm.check()
         if feed is not None:
             stats.update(image_rows=len(positions), encode_s=round(feed.encode_s, 3))
         return stats
@@ -670,6 +681,8 @@ class GlmEngine:
                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
                       constraint, feed)
+            if hasattr(self.comm, "check"):
+                self.comm.check()
 
 
 class VisionFeed:
