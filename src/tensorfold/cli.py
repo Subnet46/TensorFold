@@ -292,7 +292,10 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         raise ValueError("--prefill-fp8: this checkpoint's prompt matmuls have no FP8 kernel (EXL3 packs, MLX formats "
                          "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
+    from tensorfold.sn46 import extension as sn46_extension
+
     if tp > 1 and rank > 0:
+        sn46_extension.load(engine, rank)
         print(f"[tensorfold] rank {rank} ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
         engine.follow()
         return 0
@@ -321,6 +324,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
           f"context: {'unlimited' if effective_context is None else effective_context}; "
           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
     app.auth = getattr(args, "auth", None)
+    sn46_extension.load(engine, rank, app)
     note = thinking_notes.startup(model_dir, bool(args.thinking))
     if note:
         print(note, flush=True)

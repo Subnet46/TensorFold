@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from tensorfold.sn46 import rows as sn46_rows
+from tensorfold.sn46 import extension as sn46_extension, rows as sn46_rows
 
 DEFAULT_POLICY = "auto"
 # DFlash2 drafts every round: by default up to 5 while their probability product holds 0.3; TF_GLM_DFLASH_POLICY picks
@@ -1422,6 +1422,9 @@ class GlmEngine:
 
         self._await_bell()
         header = self._share(None)
+        if len(header) == 2 and header[0] == sn46_extension.OP:     # a per-rank call (TENSORFOLD_EXTENSION)
+            sn46_extension.follow(self, header)
+            return
         if len(header) == 2 and header[0] == 0:     # a decision: both ranks prefill, neither samples
             prompt = self._share(None)
             labels = self._share(None)

@@ -15,6 +15,7 @@ from tensorfold.server.errors import CapacityError, RequestError, error_body
 from tensorfold.server.http import Server, wants_usage_chunk
 from tensorfold.server.request_body import read_body
 from tensorfold.server.stacks import Rearming
+from tensorfold.sn46 import extension as sn46_extension
 
 if TYPE_CHECKING:
     from tensorfold.cuda.server import App
@@ -88,6 +89,8 @@ def make_handler(app: App):
             self.close_connection = True
 
         def do_GET(self):
+            if sn46_extension.dispatch(self, "GET"):
+                return
             route = self.path.split("?", 1)[0].rstrip("/")
             if route in ("/metrics", "/v1/metrics"):
                 return metrics.send(self, app)
@@ -103,9 +106,13 @@ def make_handler(app: App):
                 self._json(404, {"error": "not found"})
 
         def do_DELETE(self):
+            if sn46_extension.dispatch(self, "DELETE"):
+                return
             responses.delete(self, app, responses.route(self.path))
 
         def do_POST(self):
+            if sn46_extension.dispatch(self, "POST"):
+                return
             path = self.path.split("?", 1)[0].rstrip("/")
             if path.endswith("/decisions"):
                 return self._post_decisions()
