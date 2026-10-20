@@ -107,7 +107,9 @@ class HcSplit:
         self.got: list[torch.Tensor] = []
         self.stream = None
         if settings.overlap:
-            self.stream = torch.cuda.Stream(priority=-1)
+            # TF_GLM_OVERLAP_PRIORITY: the side stream's priority (-1 high, 0 normal); a high-priority stream in the
+            # process may cost decode rounds (graphs on the default stream) a little: measured per boot
+            self.stream = torch.cuda.Stream(priority=-1 if os.environ.get("TF_GLM_OVERLAP_PRIORITY", "-1").strip() != "0" else 0)
             n = settings.piece_count()
             self.ev_fill = [torch.cuda.Event() for _ in range(n)]
             self.ev_part = [torch.cuda.Event() for _ in range(n)]
