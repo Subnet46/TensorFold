@@ -47,13 +47,20 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
         raise RequestError('image input requires a supported vision checkpoint served with --vision')
     allow_urls = bool(getattr(frontend, 'allow_urls', False))
     videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
+    # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the server's otherwise (--vision-max-images)
+    limits = getattr(frontend, 'image_limits', None) or limits
     try:
-        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos)
+        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos,
+                                         max_videos=getattr(frontend, 'max_videos', None))
     except (ImageInputError, ValueError) as exc:
         raise RequestError(str(exc)) from exc
     slot = image_slot()
     try:
-        images = load_images([s for s in sources if isinstance(s, ImageSource)], limits=limits, allow_urls=allow_urls)
+        pictures = [s for s in sources if isinstance(s, ImageSource)]
+        if hasattr(frontend, 'load_images'):
+            images = frontend.load_images(pictures)
+        else:
+            images = load_images(pictures, limits=limits, allow_urls=allow_urls)
         budget = {} if limits.max_visual_tokens == DEFAULT_LIMITS.max_visual_tokens else \
             {"max_visual_tokens": limits.max_visual_tokens}
         clips = [s for s in sources if not isinstance(s, ImageSource)]

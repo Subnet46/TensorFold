@@ -122,9 +122,11 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
 
 
 def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
-                 allow_videos: bool = False) -> tuple[list[dict[str, Any]], list[ImageSource]]:
-    """Preserve ordered parts, replacing user and tool-result image URLs with processor image markers; ``allow_videos``:
-    also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
+                 allow_videos: bool = False, max_videos: int | None = None
+                 ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
+    """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
+    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
+    (default: the shared video limits')."""
     if not isinstance(messages, list) or not messages:
         raise ImageInputError("messages must be a non-empty list")
     output, sources = [], []
@@ -158,9 +160,10 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
                     raise ImageInputError("video_url parts are supported only in user messages")
                 if any(part.get(key) for key in _MEDIA - {"video_url"}):
                     raise ImageInputError("video_url parts cannot contain other media")
+                most = max_videos or DEFAULT_VIDEO_LIMITS.max_videos
                 videos = sum(type(s).__name__ == "VideoSource" for s in sources)
-                if videos >= DEFAULT_VIDEO_LIMITS.max_videos:
-                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
+                if videos >= most:
+                    raise ImageInputError(f"a request supports at most {most} videos")
                 sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
                 parts.append({"type": "video"})
             elif kind == "image_url":

@@ -70,7 +70,7 @@ def make_handler(app: App):
             """Read a refused request's body, so it cannot reach the next request on this connection."""
 
             try:
-                read_body(self)
+                read_body(self, limit=96 * 1024**2)
             except RequestError:
                 pass  # the reader closes the connection when framing cannot be drained
 
@@ -116,7 +116,7 @@ def make_handler(app: App):
                 self._discard_body()
                 return self._json(404, {"error": "not found"})
             try:
-                body = json.loads(read_body(self) or b"{}")
+                body = json.loads(read_body(self, limit=96 * 1024**2) or b"{}")
             except RequestError as exc:
                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -253,7 +253,7 @@ def make_handler(app: App):
                 return self._json(404, {"error": {"message": f"unknown path {self.path}",
                                                   "type": "invalid_request_error"}})
             try:
-                body = json.loads(read_body(self) or b"{}")
+                body = json.loads(read_body(self, limit=96 * 1024**2) or b"{}")
                 if not isinstance(body, dict):
                     raise RequestError("request body must be an object")
             except RequestError as exc:
