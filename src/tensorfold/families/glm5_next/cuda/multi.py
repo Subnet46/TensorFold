@@ -252,12 +252,22 @@ def sample_streams(w, parts: Sequence[tuple]) -> list[list[int]]:
         layout.append((k, logits.shape[0], n))
     if packed:
         flat = torch.cat(packed) if len(packed) > 1 else packed[0]
-        if w.comm is None:
-            host = flat.view(1, -1).cpu()
-        else:
+        world = 1 if w.comm is None else w.world
+        got = flat.contiguous()
+        if w.comm is not None:
             got = torch.empty((w.world * flat.numel(),), dtype=torch.float32, device=flat.device)
             w.comm.all_gather(flat.contiguous(), got)
-            host = got.view(w.world, -1).cpu()
+        specs, at = [], 0
+        for k, R, n in layout:
+            specs.append((at, R, n, list(parts[k][1]), parts[k][2]))
+            at += R * 2 * n
+        from .decode import _gpu_draw, _gpu_draws
+
+        if _gpu_draws(world, max(n for _, _, n in layout), flat.device, specs):
+            for (k, _, _), toks in zip(layout, _gpu_draw(got, flat.numel(), world, specs)):
+                out[k] = toks                    # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn on the GPU
+            layout = []
+        host = got.view(world, -1).cpu() if layout else None
         at = 0
         for k, R, n in layout:
             g = host[:, at:at + R * 2 * n].reshape(host.shape[0], R, 2 * n)
