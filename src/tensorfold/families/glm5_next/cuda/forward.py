@@ -99,14 +99,22 @@ class Buffers:
         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
         self.eact = torch.empty((rows * slots, ml), dtype=bf, device=dev)
         exl3 = c.quant == "exl3"
-        self.ey = None if exl3 else torch.empty((rows, slots, D), dtype=bf if prefill else f32, device=dev)
-        self.plan = None if exl3 else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill)
+        # EXL3 on the universal route (weights.exl3_route): its scratch owns the routed outputs and groups the pairs
+        universal = exl3 and w.meta.get("exl3_route") == "universal"
+        self.ey = None if universal else torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32,
+                                                     device=dev)
+        self.plan = None if universal else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill and not exl3)
         self.exl3 = None
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
-            shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
-            self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
-            self.ey = self.exl3.y.view(rows, slots, D)
+            if universal:
+                shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
+                self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
+                self.ey = self.exl3.y.view(rows, slots, D)
+            else:                        # GLM's own kernels (exl3_mm): their scratch, routed by the plan
+                from .exl3_mm import Scratch
+
+                self.exl3 = Scratch(rows, slots, D, ml, dev)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
             self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)
@@ -395,11 +403,16 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     with prof.timed("moe: route"):
         glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
-        if m.shared is None:
+        if b.plan is not None:           # (the universal EXL3 route groups its own pairs)
             grouped.route(b.pick[:R], b.plan)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-        exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+        if b.plan is None:
+            exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+        else:
+            from . import exl3_mm
+
+            exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
         s = m.shared
         mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
