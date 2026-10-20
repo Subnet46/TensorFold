@@ -19,6 +19,22 @@ MAX_ROWS = 8                          # the widest verify window (a pending toke
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+# --vision (rank 0): what startup reserves beside the tower's 1.05 GiB of bf16 weights for an encode and its
+# prompt's feature rows. Measured peaks: 0.47 GiB (a 2,048-token picture), 0.56 (four), 1.08 (a 16,384-token clip,
+# 16,384 patches a pass), 1.73 (an 8,000-token picture, one 31,724-patch pass). A picture cap past 4,096 tokens
+# scales it; TENSORFOLD_VISION_WORKSPACE_MIB sets it outright
+VISION_WORKSPACE = 3 * 2**29
+
+
+def vision_workspace() -> int:
+    value = os.environ.get("TENSORFOLD_VISION_WORKSPACE_MIB", "")
+    if value == "":
+        from tensorfold.vision.glm import GlmVisionLimits
+
+        return VISION_WORKSPACE * max(4096, GlmVisionLimits.from_env().image_tokens) // 4096
+    if not value.isdecimal() or int(value) > 16384:
+        raise ValueError(f"TENSORFOLD_VISION_WORKSPACE_MIB: 0 to 16,384 MiB, not {value!r}")
+    return int(value) * 2**20
 
 
 def encode_policy(spec: str) -> list[int]:
@@ -110,8 +126,9 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None) -> None:
-        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
+                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False) -> None:
+        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
+        ``vision``: rank 0 runs the image tower (rank 1 only takes its rows)."""
 
         import torch
 
@@ -146,9 +163,22 @@ class GlmEngine:
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
+        vision = bool(vision) and rank == 0
+        workspace = vision_workspace() if vision else 0
+        if vision:                           # the tower's bf16 weights, which the split rule drops
+            import math
+
+            text_weights = weights_estimate
+            weights_estimate = lambda name, info: ((math.prod(info["shape"]) * 2, 0)
+                                                   if name.startswith("model.visual.") else text_weights(name, info))
+
+        def geometry(text):
+            from tensorfold.cuda.capacity import Geometry
+
+            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.mtp_on)
+            return Geometry(lambda slots: g.bytes_at(slots) + workspace, g.reserve, g.minimum_slots) if workspace else g
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
-                                                             latent=LATENT, mtp=self.mtp_on),
+                                   geometry,
                                    weights_estimate, rank=rank, world=2, gather=self._gather_ints,
                                    draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
                                    draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
@@ -206,6 +236,18 @@ class GlmEngine:
                    if w.mtp is not None else "")
             print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
                   f"; DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
+        self.vision = None                   # rank 0's image tower (``tensorfold.vision.glm.GlmVision``), --vision
+        if vision:
+            from tensorfold.vision.glm import GlmVision
+
+            self.vision = GlmVision(model_dir, torch.device("cuda", 0), allow_urls=vision_urls)
+            self.vision.warm()
+            torch.cuda.empty_cache()
+            lim = self.vision.limits
+            print(f"[tensorfold] vision: image and video input, a {self.vision.weight_bytes / 2**30:.2f} GiB tower "
+                  f"with {workspace / 2**30:.2f} GiB of workspace; at most {lim.image_tokens} tokens a picture, "
+                  f"{lim.video_tokens} a clip ({lim.video_frames} frames at {lim.fps:g} a second)"
+                  f"{'; https URLs allowed' if vision_urls else ''}", flush=True)
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
@@ -424,15 +466,16 @@ class GlmEngine:
         return sum(snapshot_bytes(c) for c in self.cache)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
-             code: list[int], hit, draft: bool, constraint=None) -> dict[str, Any]:
+             code: list[int], hit, draft: bool, constraint=None, feed=None) -> dict[str, Any]:
         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
         try:
-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
+            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed)
         finally:
             self.e.constraint = self.e.window = None
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
-                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
+                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+                  feed=None) -> dict[str, Any]:
         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
         from .drafter_choice import DrafterChoice, auto_decode
 
@@ -447,9 +490,10 @@ class GlmEngine:
         if hit is not None and hit.rows is not None:
             load_rows(self.e, hit)
             hit.rows, hit.nbytes = None, 0            # live again
-        self.live = list(prompt)
-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
-                        keep_at=max(1, len(prompt) - 1) if draft else None, keep=self._remember)
+        # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
+        self.live = list(prompt) if feed is None else []
+        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit, feed=feed,
+                        keep_at=max(1, len(prompt) - 1) if draft and feed is None else None, keep=self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
@@ -476,7 +520,8 @@ class GlmEngine:
             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
                              on_tokens=on_tokens)
         # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
-        self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+        if feed is None:
+            self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
                      tokens_per_round=round((len(res.tokens) - 1) / max(res.rounds, 1), 3),
                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
@@ -489,8 +534,8 @@ class GlmEngine:
         return stats
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None) -> dict[str, Any]:
-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
+                 constraint=None, *, vision=None) -> dict[str, Any]:
+        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``)."""
 
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
@@ -501,13 +546,27 @@ class GlmEngine:
             spec = getattr(self.request, "policy", None) or self.policy
         code = self._effective(encode_policy(spec))
         stop_eos = bool(getattr(self.request, "stop_eos", True))
-        hit = self._resume(list(prompt), code) if draft else None
+        positions: list[int] = []
+        feed = None
+        if vision is not None:               # encoded here, before rank 1 is told anything, so a failure stops both
+            if self.vision is None:
+                raise ValueError("image inputs require starting this server with --vision")
+            positions = [int(p) for p in vision.positions]
+            if positions and (positions[-1] >= len(prompt) or positions != sorted(set(positions))):
+                raise ValueError("image rows must sit at increasing positions inside the prompt")
+            t = time.perf_counter()
+            rows = self.vision.features(vision)
+            if rows.shape[0] != len(positions):
+                raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
+            feed = VisionFeed(self, positions, rows)
+            feed.encode_s = time.perf_counter() - t
+        hit = self._resume(list(prompt), code) if draft and feed is None else None
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
-                  int(constraint is not None)] + code
+                  int(constraint is not None), len(positions)] + code
         from tensorfold.engine.grammar import pack
 
         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
@@ -515,8 +574,12 @@ class GlmEngine:
         self._share(list(prompt))
         if constraint is not None:                     # the request's grammar: rank 1 compiles the same
             self._share(pack(constraint))
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
+        if positions:
+            self._share(positions)
+        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed)
         stats.update(policy=spec, drafts=draft)
+        if feed is not None:
+            stats.update(image_rows=len(positions), encode_s=round(feed.encode_s, 3))
         return stats
 
     def score_labels(self, prompt_ids: list[int], label_ids: list[int]) -> tuple[list[float], float]:
@@ -574,7 +637,7 @@ class GlmEngine:
                 self._score_local(prompt, labels)
                 continue
             (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
-             *code) = header
+             images, *code) = header
             prompt = self._share(None)
             packed = self._share(None) if shaped else []
             constraint = None
@@ -582,6 +645,7 @@ class GlmEngine:
                 from tensorfold.engine import grammar
 
                 constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
+            feed = VisionFeed(self, self._share(None), None) if images else None
             temperature = _ints_f64(t_lo, t_hi)
             seed = (s_top << 62) | (s_hi << 31) | s_lo
             sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
@@ -592,4 +656,32 @@ class GlmEngine:
                 if hit is None:
                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
-                      constraint)
+                      constraint, feed)
+
+
+class VisionFeed:
+    """An image prompt's feature rows for each prefill chunk: rank 0 holds them all, and hands a chunk's rows to
+    rank 1 through the all-gather as the chunk comes (rank 1 sends zeros), so neither rank holds a second copy."""
+
+    def __init__(self, engine: GlmEngine, positions: list[int], rows) -> None:
+        self.engine, self.positions, self.rows = engine, positions, rows
+        self.width = engine.w.cfg.hidden
+        self.encode_s = 0.0
+
+    def chunk(self, start: int, count: int):
+        """(row indices within the chunk, their features) for prompt rows start .. start + count, or None."""
+
+        import bisect
+
+        torch = self.engine.torch
+        lo = bisect.bisect_left(self.positions, start)
+        hi = bisect.bisect_left(self.positions, start + count)
+        if lo == hi:
+            return None
+        n = hi - lo
+        mine = (self.rows[lo:hi].contiguous() if self.rows is not None else
+                torch.zeros((n, self.width), dtype=torch.bfloat16, device="cuda"))
+        both = torch.empty((2 * n, self.width), dtype=torch.bfloat16, device="cuda")
+        self.engine.comm.all_gather(mine, both)
+        index = torch.tensor([p - start for p in self.positions[lo:hi]], dtype=torch.int64, device="cuda")
+        return index, both[:n]

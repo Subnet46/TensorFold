@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
@@ -19,10 +20,30 @@ class ThinkingOffTemplate:
         self.efforts = getattr(inner, "efforts", frozenset())
         self.clear = clear_thinking() if clear is None else clear
 
-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
-        extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
+    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+        extra = {"clear_thinking": self.clear, **(extra or {})}
+        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                 allow_images=allow_images)
         return text if enable_thinking else thinking_off(text)
+
+
+# the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
+# (Glm5NextProcessor's layout), and every text-only prompt renders as before
+_NO_MEDIA = ('{{- "<reminder>You are unable to process this " ~ media_type ~ " because you don\'t have multi-modal '
+             'input ability. Try different methods.</reminder>" }}')
+_MEDIA = ("{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>"
+          "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>"
+          "{%- else -%}" + _NO_MEDIA + "{%- endif -%}")
+
+
+def media_template(inner, model_dir) -> None:
+    """Swap the checkpoint template's no-media reminder for GLM's image and video markers."""
+
+    source = (model_dir / "chat_template.jinja").read_text()
+    if source.count(_NO_MEDIA) != 1:
+        raise ValueError("--vision: this checkpoint's chat template has no media branch TensorFold knows how to "
+                         "extend (GLM-5.3 Flash's chat_template.jinja)")
+    inner.template = inner.template.environment.from_string(source.replace(_NO_MEDIA, _MEDIA))
 
 
 class GlmApp(App):
@@ -30,6 +51,8 @@ class GlmApp(App):
 
     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
         super().__init__(engine, model_dir, served, **kwargs)
+        if self.vision is not None:
+            media_template(self.template, Path(model_dir))
         self.template = ThinkingOffTemplate(self.template)
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:

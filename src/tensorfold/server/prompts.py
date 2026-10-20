@@ -58,9 +58,12 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
             {"max_visual_tokens": limits.max_visual_tokens}
         clips = [s for s in sources if not isinstance(s, ImageSource)]
         if clips:
-            from tensorfold.vision.videos import load_videos
+            if hasattr(frontend, 'load_videos'):
+                budget["videos"] = frontend.load_videos(clips)
+            else:
+                from tensorfold.vision.videos import load_videos
 
-            budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
+                budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
         prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
     except (ImageInputError, ValueError, ImportError) as exc:
         raise refusal(str(exc)) from exc                # an image prompt past the window: context_length_exceeded

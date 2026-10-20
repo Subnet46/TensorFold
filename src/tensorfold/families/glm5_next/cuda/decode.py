@@ -341,8 +341,8 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 # -- prefill ----------------------------------------------------------------------------------------------------
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None) -> int:
-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state."""
+            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, feed=None) -> int:
+    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``)."""
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
@@ -375,7 +375,9 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         R = len(chunk)
         point = keep_at - start if keep_at is not None else 0
         cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
-        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut).clone()
+        inject = feed.chunk(start, R) if feed is not None else None
+        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut,
+                       inject=inject).clone()
         e.last_hidden = b.fnormed[R - 1:R].clone()
         if 0 < point <= R:
             rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()

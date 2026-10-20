@@ -20,8 +20,8 @@ VIDEO_MEDIA_TYPES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime"
 @dataclass(frozen=True, slots=True)
 class VideoLimits:
     max_videos: int = 2
-    max_encoded_bytes: int = 16 * 1024 * 1024         # base64 makes it a third larger in the 32 MiB request body
-    max_total_encoded_bytes: int = 20 * 1024 * 1024
+    max_encoded_bytes: int = 64 * 1024 * 1024
+    max_total_encoded_bytes: int = 96 * 1024 * 1024
     max_dimension: int = 8192
     max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
     fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)
