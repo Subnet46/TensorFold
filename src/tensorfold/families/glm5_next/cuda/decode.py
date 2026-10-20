@@ -113,12 +113,10 @@ class Engine:
 
             kda_mod.reserve(max(max_rows, prefill_rows), tp.of(w).lin_heads, w.device)
         self.buf = Buffers(w, max_rows, capacity)
-        # the row split's pad rows past a full chunk (three ranks: 1; ``hcsplit.pad_rows``)
-        pad = 0
-        if split is not None and split.split:
-            from .hcsplit import pad_rows
+        # the row split's pad rows past a full chunk (``hcsplit.pad_rows``: 0 at two and four ranks, 1 at three)
+        from .hcsplit import buffer_rows
 
-            pad = pad_rows(prefill_rows, w.world)
+        pad = buffer_rows(prefill_rows, w.world, split) - prefill_rows
         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True, pad=pad)
         if taps:
             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture

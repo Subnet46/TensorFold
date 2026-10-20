@@ -547,18 +547,25 @@ class GlmEngine:
             weights_estimate = lambda name, info: ((math.prod(info["shape"]) * 2, 0)
                                                    if name.startswith("model.visual.") else text_weights(name, info))
 
-        from .exl3_mm import prompt_kernels
+        from .exl3_mm import prompt_kernels as glm_prompt_kernels
+        from .hcsplit import buffer_rows
         from .latent import SPARSE_ONEPASS
         from .weights import exl3_route
 
-        # GLM's prompt expert kernels keep no split-K sums; the universal EXL3 route's prompt scratch does
-        lean_prompt = prompt_kernels() and (cfg.quant != "exl3" or exl3_route(str(model_dir), rank, world) == "glm")
+        def prompt_kernels() -> bool:
+            """GLM's prompt expert kernels (no split-K sums); the universal EXL3 route's prompt scratch keeps them."""
+            return glm_prompt_kernels() and (cfg.quant != "exl3" or exl3_route(str(model_dir), rank, world) == "glm")
+
+        # the prompt buffers' rows, the split's pad rows included (``hcsplit.buffer_rows``; the prompt chunk's rows at
+        # two and four ranks)
+        prompt_buffer_rows = buffer_rows(prefill_rows, world, self.split)
 
         def geometry(text):
             from tensorfold.cuda.capacity import Geometry
 
-            g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
-                             mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=lean_prompt,
+            g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                             prefill_rows=prompt_buffer_rows,
+                             mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
                              prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv)
             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
             # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's

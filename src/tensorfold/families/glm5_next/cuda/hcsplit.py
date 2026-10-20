@@ -58,12 +58,23 @@ def _int(env, name: str, default: int, lo: int, hi: int) -> int:
 
 def pad_rows(rows: int, world: int) -> int:
     """Rows a prompt buffer of ``rows`` rows holds past them for the split's pad rows: a chunk of ``rows`` rows rounded
-    up to whole shares a rank (``HcSplit.padded``). 0 at two and four ranks (prompt chunks are a multiple of 64 rows);
-    1 at three, where a 2,048-row chunk splits as 3 x 683 = 2,049 rows: without that row every full chunk failed
-    ``applies`` and ran unsplit (an all-gather of every rank's whole partial at each of the 90 sites, the glue on
-    every row, no overlap)."""
+    up to whole shares a rank (``HcSplit.padded``), so that a full chunk, and every shorter one, runs split at any
+    world size. Prompt chunks are a multiple of 64 rows (TF_GLM_PREFILL_ROWS), so this is 0 wherever the world size
+    divides 64 (two and four ranks: 2,048 = 2 x 1,024 = 4 x 512) and ``-rows % 3`` at three (2,048 = 3 x 683 - 1:
+    one row; 2,112: none). Without that row every full chunk at three ranks failed ``applies`` and ran unsplit (an
+    all-gather of every rank's whole partial at each of the 90 sites, the glue on every row, no overlap)."""
 
     return -int(rows) % int(world)
+
+
+def buffer_rows(rows: int, world: int, settings: "SplitSettings | None") -> int:
+    """Rows the prompt buffers of ``rows``-row chunks hold (``forward.Buffers``' ``rows + pad``): ``rows`` plus the
+    split's pad rows when TF_GLM_HC_SPLIT is on past one rank, else ``rows``. The engine's buffers and its memory
+    estimate both take it, so they agree; at two and four ranks it is ``rows`` (the same buffers and estimate)."""
+
+    if settings is None or not settings.split or int(world) < 2:
+        return int(rows)
+    return int(rows) + pad_rows(rows, world)
 
 
 @dataclass(frozen=True)
