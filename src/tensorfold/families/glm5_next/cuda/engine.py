@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from tensorfold.sn46 import rows as sn46_rows
+
 DEFAULT_POLICY = "auto"
 # DFlash2 drafts every round: by default up to 5 while their probability product holds 0.3; TF_GLM_DFLASH_POLICY picks
 # another DFlash2 policy (e.g. fnc7:0.3, the noise-aware stop rule) for requests that name none
@@ -1148,14 +1150,19 @@ class GlmEngine:
         return sum(snapshot_bytes(c) for c in self.cache)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
-             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=()) -> dict[str, Any]:
-        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at."""
+             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=(), measure=None) -> dict[str, Any]:
+        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at; ``measure``: the
+        request's row statistics (``tensorfold.sn46.rows``), on every rank."""
 
         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+        sn46_rows.begin(measure, prompt, self.rank)
         try:
             return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
         finally:
             self.e.constraint = self.e.window = None
+            sn46_rows.end()
+            if measure is not None:
+                self.live = []                  # nothing of a measured request stays named in the engine
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
@@ -1180,7 +1187,9 @@ class GlmEngine:
         # multiple in it. Short of the end, the prompt prefills to the point as a prompt of that length would (no
         # first token), keeps that state, and resumes from it as a later request would: so any prompt extending
         # prompt[:point] passes through the same state there, fresh or resumed. Both ranks decide alike
-        point = grid_point(len(prompt), cut, self.grid) if draft and feed is None else None
+        # a measured request (TENSORFOLD_SN46) keeps no state: it never resumes, and its prompt must not outlive it
+        point = (grid_point(len(prompt), cut, self.grid) if draft and feed is None and not sn46_rows.measuring()
+                 else None)
         # TF_GLM_SHARED_PREFIX: rank 0's shared-prefix points (past the resume point, short of ``point``) are kept the
         # same way, each prefilled to as a prompt of its length and resumed from, so fresh and resumed prompts pass
         # through the same states there too
@@ -1285,6 +1294,9 @@ class GlmEngine:
             spec = getattr(self.request, "policy", None) or self.policy
         code = self._effective(encode_policy(spec))
         stop_eos = bool(getattr(self.request, "stop_eos", True))
+        # TENSORFOLD_SN46: the row statistics the operator armed for this request, checked against it here, before
+        # any other rank hears of the request
+        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None and vision is None and constraint is None)
         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
             if vision is not None and self.vision is None:
                 raise ValueError("image inputs require starting this server with --vision")
@@ -1312,8 +1324,9 @@ class GlmEngine:
                 raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
             feed = VisionFeed(self, positions, rows)
             feed.encode_s = time.perf_counter() - t
-        hit = self._resume(list(prompt), code) if draft and feed is None else None
-        shared = self._shared(list(prompt), hit) if draft and feed is None else []
+        # a measured request prefills its whole prompt: rows resumed from a snapshot would have no statistics
+        hit = self._resume(list(prompt), code) if draft and feed is None and measure is None else None
+        shared = self._shared(list(prompt), hit) if draft and feed is None and measure is None else []
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
@@ -1330,8 +1343,9 @@ class GlmEngine:
             self._share(pack(constraint))
         if positions:
             self._share(positions)
+        measure = sn46_rows.share(self, measure)
         stats = self._run(copy_prompt(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
-                          shared)
+                          shared, measure)
         stats.update(policy=spec, drafts=draft)
         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
             self.comm.check()
@@ -1424,6 +1438,7 @@ class GlmEngine:
 
             constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
         feed = VisionFeed(self, self._share(None), None) if images else None
+        measure = sn46_rows.share(self, None)
         temperature = _ints_f64(t_lo, t_hi)
         seed = (s_top << 62) | (s_hi << 31) | s_lo
         sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
@@ -1434,7 +1449,7 @@ class GlmEngine:
             if hit is None:
                 raise RuntimeError(f"rank {self.rank} has no snapshot of the {cached} tokens rank 0 resumes from")
         self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
-                  constraint, feed, shared)
+                  constraint, feed, shared, measure)
         if hasattr(self.comm, "check"):
             self.comm.check()
 

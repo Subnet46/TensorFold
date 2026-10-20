@@ -54,6 +54,8 @@ from functools import lru_cache
 
 import torch
 
+from tensorfold.sn46 import cheats as sn46_cheats
+
 from . import prof
 
 PARTS = ("side", "defer", "route", "combine", "shared", "rowsplit")
@@ -598,6 +600,7 @@ def moe_block(layer, w, b, R: int, done=None, early=None):
             ready, done = st.ev_side, (0, R)
     with prof.timed("moe: route"):
         route(b, layer, c, R)
+        sn46_cheats.route(b, layer, R)
     if m.shared is not None and done0 is None:
         _after_route(b, m, R)                       # integration point: work that needs the plan, before the experts
     if m.shared is not None and ready is None and l2pf.ACTIVE is not None and done is None:

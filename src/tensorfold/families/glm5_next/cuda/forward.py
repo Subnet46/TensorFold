@@ -13,6 +13,7 @@ from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+from tensorfold.sn46 import cheats as sn46_cheats
 
 from . import glue, index_split, kda as kda_mod, kv8, l2pf, lane_partials, lanes, latent, moe_glue, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
@@ -908,6 +909,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
             glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
         if b.plan is not None:           # (the universal EXL3 route groups its own pairs)
             grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
+        sn46_cheats.route(b, layer, R)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         from . import exl3_mm

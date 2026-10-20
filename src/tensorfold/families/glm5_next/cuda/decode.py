@@ -11,6 +11,7 @@ import torch
 
 from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+from tensorfold.sn46 import rows as sn46_rows
 
 from . import glue, prof, qmm, tp
 from .forward import Buffers, State, chunks_for, commit, compute, stage
@@ -20,8 +21,14 @@ from .weights import Weights
 
 
 def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None,
-                offset: int | None = None, probs: list[float] | None = None) -> list[int]:
-    """Rows of (this rank's vocabulary slice of) logits at their absolute positions -> tokens, same on all ranks."""
+                offset: int | None = None, probs: list[float] | None = None,
+                measure: tuple[list[int], list[int]] | None = None, gathered: list | None = None) -> list[int]:
+    """Rows of (this rank's vocabulary slice of) logits at their absolute positions -> tokens, same on all ranks.
+
+    ``measure`` (TENSORFOLD_SN46, ``sn46_rows.wanted``): the rows' target and claimed ids; each rank's tail (lse,
+    target and claim logits) then rides on the top-k all-gather, and every rank's ``[values, ids, tail]`` lands on the
+    CPU in ``gathered`` ([world, R, 2k + TAIL], then k) for ``sn46_rows.sampled``. The nucleus rule gathers no tail
+    (``gathered`` stays empty)."""
 
     R = logits.shape[0]
     greedy = sampling is None or sampling.temperature <= 0
@@ -33,24 +40,28 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
         k = min(logits.shape[1], 20 + MARGIN)       # the draft's confidence needs its competitors too
     vals, ids = torch.topk(logits.float(), k, dim=-1)
     ids = (ids + (w.vocab_offset if offset is None else offset)).to(torch.int32)
+    parts = [vals, ids.view(torch.float32)]
+    if measure is not None:
+        parts.append(sn46_rows.tail(logits, w.vocab_offset if offset is None else offset, *measure))
+    width = 2 * k + (sn46_rows.TAIL if measure is not None else 0)
     world = 1 if w.comm is None else w.world
     gpu = probs is None and _gpu_draws(world, k, logits.device, [(0, R, k, positions, sampling)])
+    packed = torch.cat(parts, dim=1).contiguous()
     if w.comm is None:
-        if gpu:                                      # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn here
-            packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
-            return _gpu_draw(packed.view(-1), R * 2 * k, 1, [(0, R, k, list(positions), sampling)])[0]
-        values = vals.cpu().numpy().astype(np.float32)
-        tokens = ids.cpu().numpy().astype(np.int64)
+        got = packed.view(1, R, width)
     else:
-        packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
-        got = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=logits.device)
-        w.comm.all_gather(packed.view(-1), got)
-        if gpu:
-            return _gpu_draw(got, R * 2 * k, w.world, [(0, R, k, list(positions), sampling)])[0]
-        g = got.view(w.world, R, 2 * k).cpu()
-        values = torch.cat([g[r, :, :k] for r in range(w.world)], dim=1).numpy().astype(np.float32)
-        tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w.world)], dim=1).numpy()
-        tokens = tokens.astype(np.int64)
+        flat = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=logits.device)
+        w.comm.all_gather(packed.view(-1), flat)
+        got = flat.view(w.world, R, width)
+    if measure is not None:
+        gathered.extend((got.cpu(), k))
+    if gpu:                                          # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn here
+        cands = got[:, :, :2 * k].contiguous() if measure is not None else got
+        return _gpu_draw(cands.view(-1), R * 2 * k, world, [(0, R, k, list(positions), sampling)])[0]
+    g = got.cpu() if measure is None else gathered[0]
+    values = torch.cat([g[r, :, :k] for r in range(world)], dim=1).numpy().astype(np.float32)
+    tokens = torch.cat([g[r, :, k:2 * k].contiguous().view(torch.int32) for r in range(world)], dim=1).numpy()
+    tokens = tokens.astype(np.int64)
     if greedy:
         order = np.lexsort((tokens, -values), axis=-1)
         chosen = [int(tokens[i, order[i, 0]]) for i in range(R)]
@@ -241,7 +252,15 @@ class Engine:
         if not draft and self.constraint is not None and self.window is not None:
             self.constraint.mask(logits, self.window, self.w.vocab_offset)   # this rank's vocabulary columns
             self.window = None
-        return sample_rows(self.w, logits, positions, sampling, None, probs)
+        measure = sn46_rows.wanted(positions) if not draft else None          # TENSORFOLD_SN46: the rows' statistics
+        gathered: list = []
+        rows = sample_rows(self.w, logits, positions, sampling, None, probs, measure, gathered)   # gathers, syncs
+        if not draft:
+            sn46_rows.sampled(self.w, logits, positions, rows, *gathered)      # ... ride on the sampler's gather
+            forced = sn46_rows.forced(positions, rows)                         # a verifier walks the miner's tokens
+            if forced is not None:
+                return forced
+        return rows
 
     def verify_window(self, tokens: list[int]) -> list[int]:
         """The window a reply's grammar keeps (a chain cut at its first rejected draft), masked at the next sample."""
@@ -578,6 +597,7 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, draft
     out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, inject=inject,
                   head=head)
     out = out.clone() if head else None
+    sn46_rows.prompt(e, b, prompt, start, R)             # TENSORFOLD_SN46: every prompt row's head statistics
     e.last_hidden = b.fnormed[R - 1:R].clone()
     if drafter is not None:
         from .draft_skip import skip_rows
