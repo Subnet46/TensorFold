@@ -594,6 +594,12 @@ class GlmEngine:
             # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
             # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
             extra = workspace + (parallel - 1) * (slot_bytes(text, world, rank=rank) + mla_ring_bytes(text, prefill_rows))
+            if parallel > 1:                 # a wide window's rows past the 64 the decode buffers' estimate holds
+                from . import wide as _wide
+                from .tp import split_sizes as _split, UNITS as _UNITS
+
+                extra += _wide.extra_bytes(text, world, MULTI_WINDOW,
+                                           share=lambda family, n: _split(n, world, _UNITS.get(family, 1))[rank])
             per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
             if not extra and not per:
                 return g
@@ -658,6 +664,9 @@ class GlmEngine:
         from . import dflash2_fast                                    # TF_GLM_DRAFT_FAST*: drafts' passes, gathers
 
         mine += dflash2_fast.code() if parallel > 1 and drafter is not None else [0, 0, 0]
+        from . import wide as wide_mod                                # TF_GLM_MULTI_GRAPH_STEP: captures and pads
+
+        mine += [wide_mod.code()]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -672,7 +681,7 @@ class GlmEngine:
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
                                "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
-                               "TF_GLM_DRAFT_FAST*): "
+                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP): "
                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                "every rank the same flags")
@@ -693,8 +702,13 @@ class GlmEngine:
             except ValueError as exc:
                 return -1, str(exc)
 
+        from . import exl3_stream as _exl3_stream
+        from . import segprof as _segprof
+
         mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
-                quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1)]
+                quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1),
+                quiet(_exl3_stream.code),
+                quiet(_segprof.code)]
         got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
         tables = [row[0] for row in got]
         if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
@@ -705,7 +719,8 @@ class GlmEngine:
         if any(-1 in row for row in settings) or any(row != settings[0] for row in settings):
             why = "; ".join(w for _, w in mine if w)
             raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
-                               "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1 by rank "
+                               "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1, "
+                               "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF* by rank "
                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
                                + ": give every rank the same valid values")
         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request

@@ -266,11 +266,16 @@ class Scratch:
 
     def __init__(self, rows: int, slots: int, dims: int, width: int, device, *, prompt: bool = False) -> None:
         P = rows * slots
-        sk = max(GATEUP_CFG[2], DOWN_CFG[2])
         self.xg = torch.zeros((P, dims), dtype=torch.float16, device=device)
         self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
         self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
-        self.z = torch.zeros((1 if prompt else 2 * sk * P * max(width, dims),), dtype=torch.float32, device=device)
+        # a decode window's fp32 partials: gate/up's [2][splits][P][width] or down's [splits][P][dims] (the decode
+        # and grouped kernels), or the streamed kernel's fine slabs' (exl3_stream.fine_room); scratch only
+        from . import exl3_stream
+
+        zn = 1 if prompt else max(P * max(2 * GATEUP_CFG[2] * width, DOWN_CFG[2] * dims),
+                                  exl3_stream.fine_room(rows, slots, dims, width))
+        self.z = torch.zeros((zn,), dtype=torch.float32, device=device)
         # decode windows' fused gate/up epilogue: a finished-block count per (item, 128 columns), reset by the kernel
         self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
                                 dtype=torch.int32, device=device)
@@ -280,6 +285,10 @@ class Scratch:
             exl3_k12.note("K12 prompt expert kernels (exact: the prompt kernels' bits)")
         # a prompt plan's launch order (item_order): room for any plan of up to 1,024 experts in items of >= 16 pairs
         self.order = torch.zeros((P // 16 + 1024 if prompt else 1,), dtype=torch.int32, device=device)
+        # decode windows' streamed kernel (TF_GLM_EXL3_STREAM, exl3_stream): its work queue, counts and flags
+        from . import exl3_stream
+
+        self.stream = None if prompt else exl3_stream.state(rows, slots, dims, device)
 
 
 @lru_cache(maxsize=1)
@@ -332,6 +341,11 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
     if plan.tile != grouped.TILE:
         raise ValueError("the EXL3 kernel takes items of 16 pairs")
     items = grouped.max_items(R * slots, plan.experts)
+    from . import exl3_stream                        # TF_GLM_EXL3_STREAM: decode windows streamed slab by slab
+
+    if exl3_stream.wanted(R, ex, s) and exl3_stream.on(ex, s):
+        exl3_stream.launch(x, pick, plan, ex, s, y, R, limit, items)
+        return
     dec, _, _ = dec_settings()
     if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI in DEC_WIDTHS:
         dec_gateup(x, pick, plan, ex, s, R, limit, dec_config("gu", D, NI, R), items)
