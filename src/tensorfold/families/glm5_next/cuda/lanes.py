@@ -52,7 +52,7 @@ ROWS = ("ids", "ids_host", "hin", "x", "normed", "xs", "post", "comb", "hcpart",
         "mlog", "pick", "wts", "ey", "sgu", "sact", "sxs", "sy", "part", "partb", "hidden", "fnormed", "fxs", "me",
         "mcat", "mxs", "mx")
 # handled one by one below
-SPECIAL = ("eact", "kproj", "taps", "kscratch", "lat_s", "gath", "split", "rows", "alloc_rows")
+SPECIAL = ("eact", "kproj", "taps", "kscratch", "lat_s", "gath", "split", "rows", "alloc_rows", "exl3")
 
 
 def lane_count(value: str | None = None) -> int:
@@ -148,6 +148,7 @@ def rows_view(b, lo: int, hi: int):
     v.rows = v.alloc_rows = n
     slots = b.eact.shape[0] // alloc
     v.eact = b.eact[lo * slots:hi * slots]
+    v.exl3 = _exl3_view(b, lo, hi, slots)
     v.kproj = b.kproj[:, lo:hi]
     v.taps = [t[lo:hi] for t in b.taps]
     s = b.kscratch
@@ -162,6 +163,22 @@ def rows_view(b, lo: int, hi: int):
     v.gath = b.gath[int(b.world) * lo * d:]
     v.split = None
     return v
+
+
+def _exl3_view(b, lo: int, hi: int, slots: int):
+    """The EXL3 expert scratch a lane of rows lo .. hi uses. GLM's own kernels (``exl3_mm``) take the routed outputs
+    as an argument (the lane's rows of ``ey``) and share the scratch, as every other scratch the main stream uses one
+    block at a time. The universal route (``weights.exl3_route``; no plan) writes its outputs into its scratch's
+    ``y``, of which ``ey`` is a view: the lane gets the lane's rows of ``y`` (its routed experts then land in its own
+    rows of ``ey``, where its combine reads them), the rest of that scratch shared."""
+
+    ex = getattr(b, "exl3", None)
+    if ex is None or getattr(b, "plan", None) is not None or getattr(ex, "y", None) is None:
+        return ex
+    part = copy.copy(ex)
+    part.y = ex.y[lo * slots:hi * slots]
+    part.rows = hi - lo
+    return part
 
 
 class LaneSplit(HcSplit):
