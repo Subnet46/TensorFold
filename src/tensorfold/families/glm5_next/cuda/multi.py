@@ -42,7 +42,7 @@ import torch
 from tensorfold.cuda.scheduler import Scheduler
 from tensorfold.cuda.streams import Stream, next_fill
 
-from . import multi_prefill
+from . import digest as _digest, multi_prefill
 from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
 from .pool import ALIGN, Pool, align_up
 from .segments import window_rows
@@ -1074,6 +1074,8 @@ class MultiDecoder:
                 if stop in lane.stops:
                     self._keep(lane, stop)
                 return None
+            if _digest.ON and not replay:                 # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
+                _digest.prompt_digest(self.w, lane.st, n, out[:1])
             if lane.point == n and not replay:
                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
             logits = out[:1]
@@ -1130,6 +1132,8 @@ class MultiDecoder:
                 if stop in lane.stops:
                     self._keep(lane, stop)
                 continue
+            if _digest.ON:                                # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
+                _digest.prompt_digest(self.w, lane.st, n, out[:1])
             if lane.point == n:
                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
             logits = out[:1]
