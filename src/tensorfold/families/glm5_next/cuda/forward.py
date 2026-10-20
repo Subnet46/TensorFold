@@ -17,6 +17,7 @@ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, moe_glue, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
+from . import twoshot                     # noqa: E402  (TF_GLM_TWOSHOT_ROWS: decode partials in two shots)
 
 
 # rows a prompt chunk's dense latent attention runs at once (its partials' rows; the startup estimate's)
@@ -142,6 +143,9 @@ class Buffers:
         # rank partials
         self.part = torch.empty((rows, D), dtype=f32, device=dev)
         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
+        # TF_GLM_TWOSHOT_ROWS (twoshot.py): a decode buffer's windows of that many rows or more exchange their partials
+        # in two shots, the same bits; None: one all-gather a site
+        self.twoshot = None if prefill else twoshot.attach(w, rows)
         # split-K partials of BF16 / FP8 projections (``mm``): a prompt chunk's 4-bit ones run the prompt matmul, which
         # keeps none, so an MLX checkpoint's and TF_GLM_DENSE=q4's prompt buffers hold none (the FP8 head's one row
         # allocates its few itself); a partials buffer holds scratch only, so where it lives never changes a bit
@@ -421,6 +425,10 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
     d = b.part.shape[1]
     if w.comm is None:
         return b.part[:R].view(1, R, d)
+    ts = getattr(b, "twoshot", None)
+    if ts is not None and ts.applies(R):          # the branch where rank 0's partial sits, -0.0 for the others
+        # (inside the layer loop the glue takes a split exchange: TF_GLM_TWOSHOT_SPLIT, ``_hc_post``)
+        return ts.exchange(b.part, R, split=getattr(b, "hc_split_ok", False))
     out = b.gath[:b.world * R * d]
     w.comm.all_gather(b.part[:R].reshape(-1), out)
     return out.view(b.world, R, d)
@@ -989,6 +997,11 @@ def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
 
     x = b.x[:R]
     _hc_flush(b, R)                      # (never pending here: every hc_post is followed by an hc_pre or a flush)
+    if isinstance(g, twoshot.Split):     # TF_GLM_TWOSHOT_SPLIT: the first rows now, the rest once gathered (_hc_pre)
+        r = g.R1
+        glue.hc_post(x[:r], x[:r], g.view[:, :r], b.post[:r], b.comb[:r])
+        b.hc_split = g
+        return
     if (not b.prefill and getattr(b, "hcx", None) is not None and fuse.asks("hc") and R <= fuse.hc_rows()
             and R <= b.hcx.shape[0] and glue.hc_post_pre_ok(x, g)):
         b.hc_pending = g                 # the gathered partials: read by the next hc_pre, before the next gather
@@ -997,6 +1010,11 @@ def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
 
 
 def _hc_flush(b: Buffers, R: int) -> None:
+    s = getattr(b, "hc_split", None)
+    if s is not None:                    # a split exchange's last rows (their gather has landed)
+        b.hc_split = None
+        s.wait()
+        glue.hc_post(b.x[s.R1:R], b.x[s.R1:R], s.view[:, s.R1:R], b.post[s.R1:R], b.comb[s.R1:R])
     g = getattr(b, "hc_pending", None)
     if g is not None:
         b.hc_pending = None
@@ -1005,6 +1023,16 @@ def _hc_flush(b: Buffers, R: int) -> None:
 
 def _hc_pre(b: Buffers, R: int, c, h, norm: torch.Tensor) -> None:
     x = b.x[:R]
+    s = getattr(b, "hc_split", None)
+    if s is not None:                    # TF_GLM_TWOSHOT_SPLIT: the first rows' pre while the rest are gathered, then
+        b.hc_split = None                # the rest's post and pre (row-independent kernels: the unsplit bits)
+        for lo, hi in ((0, s.R1), (s.R1, R)):
+            if lo:
+                s.wait()
+                glue.hc_post(x[lo:hi], x[lo:hi], s.view[:, lo:hi], b.post[lo:hi], b.comb[lo:hi])
+            glue.hc_pre(x[lo:hi], h.fn, h.base, h.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
+                        b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+        return
     g = getattr(b, "hc_pending", None)
     if g is not None:
         from . import fuse
@@ -1113,6 +1141,7 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, 
             split_layers(w, st, b, R, nch, host_pos, mixer)  # also leaves the taps and b.hidden[:R]
     else:
         b.hc_pending = None
+        b.hc_split, b.hc_split_ok = None, True        # the layers' glue takes split exchanges (TF_GLM_TWOSHOT_SPLIT)
         for layer in w.layers:
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
             taps = b.tap_at.get(layer.index, ())
@@ -1121,6 +1150,7 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, 
             for slot in taps:
                 glue.stream_mean(b.x[:R], b.taps[slot][:R])
         _hc_flush(b, R)
+        b.hc_split_ok = False
         glue.stream_mean(b.x[:R], b.hidden[:R])
     if not logits:
         return None

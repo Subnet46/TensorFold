@@ -306,7 +306,8 @@ def round_costs(costs: dict) -> tuple[float, ...]:
 
 from .segments import window_rows as _window_rows  # noqa: E402
 
-PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel)
+PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel;
+                                      # a round holds at most the verify window's rows of streams: round_cap)
 MULTI_WINDOW = _window_rows()         # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW;
                                       # TF_GLM_MULTI_WINDOW, default 32)
 
@@ -649,6 +650,9 @@ class GlmEngine:
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
                                  KV_KINDS.index(kv), MULTI_WINDOW]
+        from . import twoshot as twoshot_mod                          # TF_GLM_TWOSHOT_*: the decode exchange
+
+        mine += twoshot_mod.code()
         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
 
         mine += index_split_settings().code()
@@ -872,6 +876,9 @@ class GlmEngine:
                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
                       f"{self.multi.tune.describe()}", flush=True)
                 print(f"[tensorfold] --parallel {parallel}: {self.scheduler.prio.describe(parallel)}", flush=True)
+                if parallel > MULTI_WINDOW:     # more streams than window rows: rounds rotate them (round_cap)
+                    print(f"[tensorfold] --parallel {parallel} over a {MULTI_WINDOW}-row window "
+                          f"(TF_GLM_MULTI_WINDOW): {self.multi._round_cap().describe()}", flush=True)
                 if self.multi.row_ms is not None:
                     print("[tensorfold] --parallel batched window ms by rows: " +
                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
