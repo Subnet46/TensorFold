@@ -141,6 +141,11 @@ class GlmEngine:
                                               split_weights)
 
         encode_policy(policy)                           # a bad default fails here, not in the first request
+        from .copy_drafts import CopySettings
+
+        # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of
+        # the MTP head and DFlash2; both ranks must agree, so the settings join the startup comparison below
+        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
         torch.cuda.set_device(0)
         self.torch = torch
         self.rank = rank
@@ -206,7 +211,7 @@ class GlmEngine:
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
+                prefill_rows] + (self.copy.code() if self.copy is not None else [0, 0]) + [int(self.mtp_on), int(DRAFT_RING)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -214,7 +219,7 @@ class GlmEngine:
         both = self._gather_ints(mine + [spare >> 20])
         if both[0][:-1] != both[1][:-1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
-                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                               "TF_GLM_LATENT, TF_GLM_COPY_*, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -518,6 +523,11 @@ class GlmEngine:
         if max_tokens <= 1 or (stop_eos and first in self.eos):
             return stats
         policy = decode_policy(code)
+        copies = None
+        if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
+            from .copy_drafts import CopyDrafts
+
+            copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
         if policy is None:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
         elif auto:
@@ -530,13 +540,13 @@ class GlmEngine:
                                        margin=margin)
             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
                               f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
-                              on_tokens=on_tokens)
+                              on_tokens=on_tokens, copies=copies)
         elif use_dflash:
             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                                on_tokens=on_tokens)
+                                on_tokens=on_tokens, copies=copies)
         else:
             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                             on_tokens=on_tokens)
+                             on_tokens=on_tokens, copies=copies)
         # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
         if feed is None:
             self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
@@ -547,6 +557,8 @@ class GlmEngine:
             stats.update(drafters=res.arms, keeps=res.keeps)
         if policy is not None:                   # the drafts' counts, which /health, /metrics and the reply report
             stats.update(drafted=res.drafted, accepted=res.accepted)
+        if copies is not None:
+            stats.update(copy_rounds=res.copy_rounds, copy_drafted=res.copy_drafted, copy_accepted=res.copy_accepted)
         if res.stages:
             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
         return stats

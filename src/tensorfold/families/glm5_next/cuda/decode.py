@@ -430,8 +430,11 @@ class DecodeResult:
     stages: dict[str, float] = field(default_factory=dict)
     depths: list[int] = field(default_factory=list)
     keeps: list[int] = field(default_factory=list)
-    arms: str = ""                          # auto_decode: the drafter of each round, "m" (MTP) or "f" (DFlash2)
+    arms: str = ""                          # auto_decode: each round's drafter, "m" (MTP), "f" (DFlash2) or "c" (copy)
     pending: torch.Tensor | None = None     # auto_decode: MTP input rows of committed positions not absorbed yet
+    copy_rounds: int = 0                    # rounds whose drafts were copied from the context (``copy_drafts``)
+    copy_drafted: int = 0
+    copy_accepted: int = 0
 
     @property
     def tokens_per_second(self) -> float:
@@ -489,23 +492,35 @@ class DepthPolicy:
         return max(1, min(self.most, 1 if self.rate < self.low else 2 if self.rate < self.high else 3))
 
 
+def copy_room(copies, count: int, out: list[int]) -> int:
+    """Copy drafts a round may propose: the rows still wanted past the pending token (0 without copy drafts)."""
+
+    return 0 if copies is None else count - len(out) - 1
+
+
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
-               stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache."""
+               stop_eos: bool = False, on_tokens=None, copies=None) -> DecodeResult:
+    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache; ``copies``: a ``copy_drafts.CopyDrafts`` of prompt and pending token, whose proposals replace the MTP chain (the kept rows are still absorbed)."""
 
     w, st, b = e.w, e.st, e.buf
     policy = policy or DepthPolicy()
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
+    c_rounds = c_drafted = c_accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
     _sync(w)
     start = time.perf_counter()
     t0 = time.perf_counter()
-    depth = min(policy.next(0, 0), count - len(out))
-    drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+    copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+    if copied:
+        absorb(e, e.last_hidden, [pending])
+        drafts = copied
+    else:
+        depth = min(policy.next(0, 0), count - len(out))
+        drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
     stages["draft"] += time.perf_counter() - t0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
@@ -527,10 +542,14 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
+        if copied:
+            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
+        if copies is not None:
+            copies.extend(sampled[:keep])
         if on_tokens is not None:
             on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["forward"] += t1 - t0
@@ -539,24 +558,33 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
             break
         t4 = time.perf_counter()
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
-        drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
-                        policy.confidence) if depth > 0 else [])
+        was_copy = bool(copied)
+        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+        if copied:                          # the MTP head still takes the kept rows; it drafts nothing this round
+            absorb(e, e.main_hidden(slice(0, keep)), sampled[:keep])
+            drafts = copied
+        else:                               # a copied round's acceptance does not move the MTP depth
+            depth = min(policy.next(*((0, 0) if was_copy else (len(drafts), keep - 1))), count - len(out))
+            drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+                            policy.confidence) if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
     _sync(w)
-    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
+                        copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
 
 
 @torch.no_grad()
 def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
-                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state."""
+                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None,
+                  copies=None) -> DecodeResult:
+    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state; ``copies``: a ``copy_drafts.CopyDrafts`` of prompt and pending token, whose proposals replace the round's DFlash2 block (the kept taps are still absorbed)."""
 
     w, st, b = e.w, e.st, e.buf
     policy = policy or DepthPolicy(3, fixed=True)
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
+    c_rounds = c_drafted = c_accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
     _sync(w)
@@ -564,7 +592,11 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     depth = min(policy.next(0, 0), count - len(out))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
-        drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+        if copied:
+            drafts = copied
+        else:
+            drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
         t1 = time.perf_counter()
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
@@ -586,16 +618,22 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
+        if copied:
+            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
+        if copies is not None:
+            copies.extend(sampled[:keep])
         if on_tokens is not None:
             on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+        # a copied round's acceptance does not move DFlash2's depth
+        depth = min(policy.next(*((0, 0) if copied else (len(drafts), keep - 1))), count - len(out))
     _sync(w)
-    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
+                        copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
