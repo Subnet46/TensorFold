@@ -16,15 +16,22 @@ staging into place. Every rank runs the same steps in the same order, so a step 
 shared-memory table (one int64 per sender: the last step it recorded; one per receiver and sender: the last step the
 receiver waited for) makes a receiver wait for the record of the right step (a stream wait refers to the event's last
 record at the time of the call) and keeps a sender from re-recording one of its SLOTS events before every receiver has
-waited on its previous use. A staging area is never overwritten while its reader may still need it: the next write
-into it needs the whole next block computed, which needs this rank's rows, which it sends only after reading.
+waited on its previous use. A staging area is never overwritten while its reader may still need it: a rank issues all
+its steps in its stream order (one stream, or streams joined by stream waits between kinds of chunk) and a step's copies
+start after its stream waited for every peer's record of the step before; a reader's last read of a staging area (its
+local row copies, or hc_post on a partials block, which its next rows step waits for through ev_glue) sits before one of
+its own later records, and the next write into that area comes only after a step that waited for that record.
 
 Exact: the same bytes land in the same places NCCL's exchange put them; the consumers are unchanged (transport only).
+A failed step (a peer that stopped, a CUDA error, a timeout) poisons the exchange: every later step raises, and the
+ranks must be restarted together. GPU-side waits on a peer that died mid-step do not time out (as with NCCL); the
+host-side ones do (TF_GLM_CE_TIMEOUT_S). The same protocol, with its own staging, also runs behind comm.exchange /
+exchange_all as a transport of the communicator (``tensorfold.cuda.ce_comm``, TENSORFOLD_EXCHANGE=ce).
 
 Needs: every rank on one host, each process seeing every GPU (its own first: TensorFold uses device 0) with peer
-access between them, and room in each GPU's BAR1 for the arena (about R x D x 10 bytes: 64 MiB at 2,048 rows,
-TF_GLM_CE_ARENA_MIB caps it, default 192). The startup check exchanges a pattern and stops the server, on every rank,
-if anything is missing or wrong."""
+access between them, and room in each GPU's BAR1 for the arena (about 7 x R x D bytes: 56 MiB at 2,048 rows, 112 MiB
+at 4,096; TF_GLM_CE_ARENA_MIB caps it, default 192). The startup check exchanges a pattern and stops the server, on
+every rank, if anything is missing or wrong."""
 
 from __future__ import annotations
 
@@ -32,7 +39,6 @@ import ctypes
 import glob
 import mmap
 import os
-import socket
 import time
 import uuid
 
@@ -138,15 +144,20 @@ class CeExchange:
         self.key = f"tf_{tag}"
         self.device = "cuda"
         self.lib = None
+        self.poisoned: str | None = None
+        self._name = None
         # two phases with a vote after each: every key a rank reads in ``_connect`` was written before the first
         # vote passed, so a rank that fails early never leaves the others blocked on the store
-        for label, phase in (("local", self._local), ("connect", self._connect)):
-            problem = ""
-            try:
-                phase()
-            except Exception as exc:                   # noqa: BLE001  (every rank learns it and stops)
-                problem = f"{type(exc).__name__}: {exc}"
-            self._vote(label, problem)
+        try:
+            for label, phase in (("local", self._local), ("connect", self._connect)):
+                problem = ""
+                try:
+                    phase()
+                except Exception as exc:               # noqa: BLE001  (every rank learns it and stops)
+                    problem = f"{type(exc).__name__}: {exc}"
+                self._vote(label, problem)
+        finally:
+            self._unlink()                             # rank 0's table: every rank has mapped it by now, or never will
         self._probe()
 
     # -- setup ---------------------------------------------------------------------------------------------------------
@@ -168,7 +179,9 @@ class CeExchange:
         if bad:
             raise RuntimeError("TF_GLM_HC_EXCHANGE=ce could not start (" + "; ".join(bad) + "). It needs every rank "
                                "on one host, each process seeing every GPU (its own first) with peer access, and "
-                               "BAR1 room for the arena; TF_GLM_HC_EXCHANGE=p2p is NCCL's exchange.")
+                               f"BAR1 room for the arena ({(self.rs_bytes + self.ag_bytes) >> 20} MiB a GPU beside "
+                               "NCCL's peer buffers: nvidia-smi -q -d MEMORY shows BAR1; shorter prompt chunks "
+                               "shrink it); TF_GLM_HC_EXCHANGE=p2p is NCCL's exchange.")
 
     def _local(self) -> None:
         """This rank's part: the arena (allocated and exported), its events (exported), its host identity; rank 0
@@ -181,9 +194,9 @@ class CeExchange:
         torch.cuda.current_device()
         self.lib = lib = _cudart()
         s = self.store
-        # one host: the ranks' host identities must match (the table is host shared memory)
+        # one host (the table is host shared memory): the kernel's boot id, the same in every container on it
         with open("/proc/sys/kernel/random/boot_id") as f:
-            self.host = socket.gethostname() + ":" + f.read().strip()
+            self.host = f.read().strip()
         s.set(f"{self.key}/host/{self.rank}", self.host)
         # the receive arena, exported
         ptr = ctypes.c_void_p()
@@ -223,8 +236,11 @@ class CeExchange:
                 raise RuntimeError(f"rank {r} runs on another host")
         name = s.get(f"{self.key}/table")
         name = name.decode() if isinstance(name, bytes) else str(name)
-        self._fd = os.open(name, os.O_RDWR)
-        self._map = mmap.mmap(self._fd, 8 * self._entries())
+        fd = os.open(name, os.O_RDWR)
+        try:
+            self._map = mmap.mmap(fd, 8 * self._entries())
+        finally:
+            os.close(fd)                                        # the mapping keeps the file
         self.tab = np.ndarray((self._entries(),), dtype=np.int64, buffer=self._map)
         self.remote = {}
         self.theirs = {}
@@ -240,18 +256,30 @@ class CeExchange:
             self.theirs[p] = [torch.cuda.Event.from_ipc_handle(dev, bytes(s.get(f"{self.key}/ev/{p}/{k}")))
                               for k in range(SLOTS)]
 
+    def _unlink(self) -> None:
+        if self._name:
+            try:
+                os.unlink(self._name)
+            except OSError:
+                pass
+            self._name = None
+
     def _probe(self) -> None:
         """Every rank writes its rank number into its slot of each peer's partials staging, through one step; each
-        checks what arrived; then the table is unlinked (every rank has it mapped)."""
+        checks what arrived. Every rank reaches every vote whatever fails (no rank is left waiting on another's key),
+        and the probe's own waits give up after 60 s."""
 
+        d, n = self.width, min(self.H, 2)
         problem = ""
         try:
-            d = self.width
-            n = min(self.H, 2)
             src = torch.full((n, d), float(self.rank + 1), dtype=torch.float32, device=self.device)
             self.rs[:self.world * n * d].zero_()
             self._sync()
-            self._vote("zeroed", "")
+        except Exception as exc:                       # noqa: BLE001
+            problem = f"{type(exc).__name__}: {exc}"
+        self._vote("zeroed", problem)
+        timeout, self.timeout = self.timeout, min(self.timeout, 60.0)
+        try:
             copies = [(self.remote[q] + (self.rank * n * d) * 4, src.data_ptr(), n * d * 4) for q in self.peers]
             self.exchange(copies)
             got = self.rs[:self.world * n * d].view(self.world, n, d)
@@ -261,14 +289,11 @@ class CeExchange:
             self._sync()
         except Exception as exc:                       # noqa: BLE001
             problem = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.timeout = timeout
         self._vote("probe", problem)
-        if self.rank == 0 and getattr(self, "_name", None):
-            try:
-                os.unlink(self._name)
-            except OSError:
-                pass
 
-    # -- the protocol ----------------------------------------------------------------------------------------------------
+    # -- the protocol ------------------------------------------------------------------------------------------------
     def _await(self, idx: int, target: int, what: str) -> None:
         tab = self.tab
         if tab[idx] >= target:
@@ -287,6 +312,15 @@ class CeExchange:
         """One step on the current stream: this rank's copies (dst, src, bytes) into the peers' arenas, its event,
         then a wait for every peer's event of the same step (its copies into this rank's arena are then done)."""
 
+        if self.poisoned is not None:
+            raise RuntimeError(f"TF_GLM_HC_EXCHANGE=ce stopped after an error ({self.poisoned}); restart every rank")
+        try:
+            self._exchange(copies)
+        except Exception as exc:
+            self.poisoned = f"{type(exc).__name__}: {exc}"
+            raise
+
+    def _exchange(self, copies: list[tuple[int, int, int]]) -> None:
         e = self.step = self.step + 1
         k = e % SLOTS
         W = self.world

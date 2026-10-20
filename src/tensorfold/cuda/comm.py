@@ -6,7 +6,11 @@ TF_NCCL_EXCHANGE_ENV (optional, e.g. ``NCCL_P2P_DISABLE=1``): the paired sends a
 copy of the library with these NCCL_* settings (space separated) in effect for it alone. NCCL reads its settings once a
 process, so one library cannot run its all-gathers over one transport and its sends over another; on PCIe hosts where
 NCCL's peer-to-peer all-gathers are fast but its peer-to-peer send/receive path is slow (two channels a peer), this keeps
-every collective on peer-to-peer and the bulk swaps on shared memory. The same bytes move in the same order."""
+every collective on peer-to-peer and the bulk swaps on shared memory. The same bytes move in the same order.
+
+TENSORFOLD_EXCHANGE=ce (``ce_comm``): the paired sends and receives go over the GPUs' copy engines through CUDA IPC
+instead of any NCCL communicator (every rank on one host, each process seeing every GPU); TF_NCCL_EXCHANGE_ENV is then
+not used. ``nccl`` (default): NCCL as above."""
 
 from __future__ import annotations
 
@@ -133,9 +137,35 @@ class NCCL:
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
         torch.cuda.current_device()
         self.comm = self._init(self.lib, key)
-        # the paired sends and receives' communicator (TF_NCCL_EXCHANGE_ENV), else this one
+        # the paired sends and receives' communicator (TF_NCCL_EXCHANGE_ENV), else this one; or the copy engines
+        # (TENSORFOLD_EXCHANGE=ce), every rank alike (checked here, before anything waits on another rank's setup)
         self.xlib, self.xcomm = self.lib, self.comm
-        settings = exchange_env()
+        self.ce = None
+        from .ce_comm import slot_bytes, transport
+
+        try:                                         # a setting this rank refuses still reaches the others
+            mine = transport()
+            told = mine if mine == "nccl" else f"ce, regions of {slot_bytes() >> 20} MiB"
+        except ValueError as exc:
+            self.store.set(f"tf_xt/{rank}", f"not valid ({exc})")
+            raise
+        self.store.set(f"tf_xt/{rank}", told)
+        theirs = [self.store.get(f"tf_xt/{r}") for r in range(world)]
+        theirs = [t.decode() if isinstance(t, bytes) else str(t) for t in theirs]
+        if any(t != told for t in theirs):
+            raise RuntimeError("TENSORFOLD_EXCHANGE / TENSORFOLD_CE_SLOT_MIB differ between the ranks: "
+                               + ", ".join(f"rank {r} {t}" for r, t in enumerate(theirs))
+                               + "; give every rank the same")
+        settings = exchange_env() if mine == "nccl" else {}
+        if mine == "ce":
+            from .ce_comm import CeTransport
+
+            self.ce = CeTransport(rank, world, self.store)
+            if rank == 0:
+                note = " (TF_NCCL_EXCHANGE_ENV not used)" if exchange_env() else ""
+                print(f"[tensorfold] paired sends and receives over copy engines through CUDA IPC "
+                      f"({self.ce.arena_bytes >> 20} MiB receive arena a GPU, TENSORFOLD_EXCHANGE=ce){note}; "
+                      "all-gathers on NCCL", flush=True)
         if settings:
             saved = {k: os.environ.get(k) for k in settings}
             os.environ.update(settings)              # read by the second library's first calls, once
@@ -208,13 +238,16 @@ class NCCL:
 
     def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
         """One NCCL group on the current stream: every ``sends[i]`` to ``peer`` and ``recvs[i]`` from it (contiguous
-        tensors; the peer's matching call has the same count, sizes and dtypes in the same order)."""
+        tensors; the peer's matching call has the same count, sizes and dtypes in the same order). Under
+        TENSORFOLD_EXCHANGE=ce only two ranks may call it (``exchange_all`` takes more)."""
 
         if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
             raise ValueError("exchange: one receive per send, from another rank")
         for s, r in zip(sends, recvs):
             if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
                 raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
+        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce
+            return self.ce.exchange(sends, recvs, peer)
         stream = torch.cuda.current_stream().cuda_stream
         x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
         self._check(x.ncclGroupStart(), x)
@@ -229,7 +262,9 @@ class NCCL:
     def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
         """One NCCL group on the current stream with several peers: every ``sends[p][i]`` to peer p and
         ``recvs[p][i]`` from it (an all-to-all of row blocks; each peer's matching call names this rank with the
-        same sizes and dtypes in the same order)."""
+        same sizes and dtypes in the same order). Under TENSORFOLD_EXCHANGE=ce every other rank must be named and
+        each gets as many bytes as every other (the row split's exchanges); NCCL also takes subsets and sizes that
+        differ by peer."""
 
         if set(sends) != set(recvs) or any(p == self.rank or not 0 <= p < self.world for p in sends):
             raise ValueError("exchange_all: sends and receives with the same other ranks")
@@ -239,6 +274,8 @@ class NCCL:
             for s, r in zip(sends[p], recvs[p]):
                 if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
                     raise ValueError("exchange_all: each send and receive must be contiguous and alike")
+        if self.ce is not None:                # TENSORFOLD_EXCHANGE=ce
+            return self.ce.exchange_all(sends, recvs)
         stream = torch.cuda.current_stream().cuda_stream
         x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
         self._check(x.ncclGroupStart(), x)
