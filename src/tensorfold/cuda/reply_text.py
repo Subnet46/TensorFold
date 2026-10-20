@@ -237,11 +237,14 @@ def _json(value: Any) -> str:
 
 class GlmCallStreamer:
     """GLM's ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`` calls as OpenAI tool-call
-    deltas while they are written: a header (index, id, name) once the name is whole, then the arguments' JSON in
-    pieces, a string value as it arrives and a typed one when whole, joining to what ``parse_tool_calls`` gives.
+    deltas: each call is followed while it is written (its arguments' JSON built a string value as it arrives and a
+    typed one when whole, joining to what ``parse_tool_calls`` gives) and sent whole, header and arguments in one delta,
+    once its ``</tool_call>`` arrives. A call the reply ends inside (its token limit) is never sent: a client could
+    store or run its cut arguments.
 
-    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas. A block it cannot
-    follow (not GLM's markup, a tool the request did not offer) is skipped and stays with the end parser."""
+    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas; ``sent`` counts the
+    calls sent. A block it cannot follow (not GLM's markup, a tool the request did not offer) is skipped and stays
+    with the end parser."""
 
     def __init__(self, tools: list[dict[str, Any]]) -> None:
         self.known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
@@ -253,6 +256,7 @@ class GlmCallStreamer:
         self.schema: dict[str, Any] = {}               # the current call's parameter schemas
         self.value_schema: dict[str, Any] | None = None     # the current typed value's schema, None for text
         self.maybe_null = False                         # a nullable text value that may still be ``null``: held
+        self.sent = 0                                   # calls sent whole (the last one may still be open)
 
     def _args(self, out: list[dict[str, Any]], piece: str) -> None:
         index = len(self.calls) - 1
@@ -264,6 +268,15 @@ class GlmCallStreamer:
             out.append({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
 
     def feed(self, text: str) -> list[dict[str, Any]]:
+        self._follow(text)
+        whole = len(self.calls) - (1 if self.open else 0)
+        out = [{"tool_calls": [{"index": i, "id": c["id"], "type": "function",
+                                "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]}
+               for i, c in enumerate(self.calls[self.sent:whole], self.sent)]
+        self.sent = whole
+        return out
+
+    def _follow(self, text: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         while True:
             rest = text[self.pos:]

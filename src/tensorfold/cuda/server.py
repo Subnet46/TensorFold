@@ -33,6 +33,10 @@ from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 
+# While a GLM tool call is written it is held until whole (a call the reply ends inside is never sent); an idle client
+# (upstream #114: one that drops a reply sending nothing) gets an empty delta this often meanwhile
+CALL_KEEPALIVE_S = 2.0
+
 
 # -- requests --------------------------------------------------------------------------------
 
@@ -416,6 +420,7 @@ class App:
         # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
         glm_calls = bool(tools) and self._glm_calls()
         calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
+        quiet_since = [time.monotonic()]     # the last delta sent while a call is held (CALL_KEEPALIVE_S)
         # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
         # end parser
         xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
@@ -477,6 +482,11 @@ class App:
                 parts = [delta] if delta else []
                 if calls_stream is not None:
                     parts += calls_stream.feed(call_text(raw))
+                    if parts:
+                        quiet_since[0] = time.monotonic()
+                    elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
+                        parts.append({})          # a call held until whole: an empty delta keeps idle clients waiting
+                        quiet_since[0] = time.monotonic()
                 if not all(emit(part) for part in parts):
                     stopped["client"] = True
                 if xml_stream is not None and not stopped["client"]:
@@ -580,11 +590,13 @@ class App:
         # (never streamed) are the end parser's, sent whole
         if calls_stream is not None and (think is None or think.stream_from is not None):
             call_deltas = calls_stream.feed(call_text(raw))
-            streamed = len(calls_stream.calls)
-            calls = [*calls_stream.calls, *calls_stream.rest(tools)] or None
-        cut = calls_stream is not None and calls_stream.open        # a streamed call the reply ended inside
-        if cut:                                 # its text went out as a call already, not again as content
+            streamed = calls_stream.sent
+            calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
+        cut = calls_stream is not None and calls_stream.open        # a call the reply ended inside: never sent
+        if cut:                                 # nor its markup as content
             content = answer.strip()
+        elif tools and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
+            content, cut = content[:at].rstrip(), True     # the same for the end parser: an unclosed call is cut text
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
             final["content"] = tail
