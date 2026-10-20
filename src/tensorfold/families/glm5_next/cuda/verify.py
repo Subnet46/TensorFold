@@ -136,7 +136,7 @@ class BatchedVerify:
 
     # -- the window's tables -------------------------------------------------------------------------------------------
     @torch.no_grad()
-    def time_rows(self, reps: int = 5) -> list[float]:
+    def time_rows(self, reps: int = 5, most: int | None = None) -> list[float]:
         """ms of the captured window of each size (1 .. its rows): the fastest of ``reps`` replays, on the capture's
         own tables (slot 0 at the pool's first rows; its states cleared after), before any stream is admitted."""
 
@@ -145,7 +145,7 @@ class BatchedVerify:
         index = self.e.caches.index is not None
         out = []
         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        for R in range(1, self.rows_max + 1):
+        for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
             g = self.graphs[R]
             self._stage([0] * R)
             self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)

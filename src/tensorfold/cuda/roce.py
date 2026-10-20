@@ -142,7 +142,11 @@ class RoceGather:
 
     def fits(self, send: torch.Tensor) -> bool:
         n = send.numel() * send.element_size()
-        return 0 < n <= self.max_bytes and n % PACK == 0 and send.data_ptr() % PACK == 0 and send.is_contiguous()
+        return self.fits_bytes(n) and send.data_ptr() % PACK == 0 and send.is_contiguous()
+
+    def fits_bytes(self, n: int) -> bool:
+        """Whether a gather of ``n`` bytes a rank goes over RoCE (the same answer on every rank)."""
+        return 0 < n <= self.max_bytes and n % PACK == 0
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         nbytes = send.numel() * send.element_size()
@@ -183,9 +187,20 @@ class RoceComm:
         self.small = self.large = 0
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
-        if self.roce.fits(send) and recv.is_contiguous() and recv.data_ptr() % PACK == 0:
+        """RoCE for a gather whose size fits, NCCL otherwise: decided by the byte count alone, which every rank's
+        matching call shares. A send or receive buffer that is not 16-byte aligned or contiguous goes through an
+        aligned copy: choosing by the buffers' addresses let two ranks pick different transports for the same gather
+        (one waiting in RoCE, the other in NCCL, forever)."""
+
+        n = send.numel() * send.element_size()
+        if self.roce.fits_bytes(n):
             self.small += 1
-            self.roce.all_gather(send, recv)
+            s = send if send.is_contiguous() and send.data_ptr() % PACK == 0 else send.contiguous().clone()
+            r = recv if recv.is_contiguous() and recv.data_ptr() % PACK == 0 else torch.empty_like(recv,
+                                                                                               memory_format=torch.contiguous_format)
+            self.roce.all_gather(s, r)
+            if r is not recv:
+                recv.copy_(r)
         else:
             self.large += 1
             self.nccl.all_gather(send, recv)

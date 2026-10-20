@@ -85,11 +85,12 @@ class MultiSettings:
         return s
 
     def code(self) -> list[int]:
-        """What both ranks must agree on (the profile is rank 0's alone)."""
+        """What both ranks must agree on: every setting that changes collectives or drafts, and whether the profile
+        is on (its startup timing replays graphs on both ranks; only rank 0 logs)."""
 
         return [("streams", "packed").index(self.sampler), ("policy", "joint", "scale").index(self.depth),
                 int(round(self.alpha * 1000)), int(round(self.overhead_ms * 1000)), int(self.async_msg),
-                int(self.lone)]
+                int(self.lone), int(self.profile > 0)]
 
     def describe(self) -> str:
         depth = f"scale:{self.alpha:g}" if self.depth == "scale" else self.depth
