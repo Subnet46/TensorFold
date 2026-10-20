@@ -13,6 +13,22 @@ from tensorfold.cuda import experts as grouped
 # Gate/up and down tile counts, warps, and K splits stay fixed across row counts to preserve each row's bits.
 GATEUP_CFG = (8, 4, 4)
 DOWN_CFG = (8, 4, 1)
+# Prompt chunks launch an item's n blocks next to each other (TF_GLM_EXL3_NFIRST=0: the decode order), so they read
+# its rows while L2 still holds them: the same kernel and arithmetic, 2.3-2.5x faster at 4,096 rows.
+PROMPT_ROWS = 64          # rows from which a window takes the prompt order
+
+
+def _pf() -> bool:
+    """TF_GLM_EXL3_PF=0: no register prefetch in the expert kernel (the same bits either way)."""
+    import os
+
+    return os.environ.get("TF_GLM_EXL3_PF", "1") != "0"
+
+
+def _nfirst() -> bool:
+    import os
+
+    return os.environ.get("TF_GLM_EXL3_NFIRST", "1") != "0"
 
 
 @lru_cache(maxsize=1)
@@ -20,7 +36,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v1", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v9", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -78,9 +94,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
     D, NI = ex.dims, ex.width
     items = grouped.max_items(R * slots, plan.experts)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+    nfirst = R >= PROMPT_ROWS and _nfirst()
     nt, w, sk = GATEUP_CFG
-    ext.grouped(s.xg, s.xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, sk, items, nt, w)
+    ext.grouped(s.xg, s.xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, sk, items, nt,
+                w, nfirst, _pf())
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, sk, slots, float(limit))
     nt, w, sk = DOWN_CFG
-    ext.grouped(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, sk, items, nt, w)
+    ext.grouped(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, sk, items, nt,
+                w, nfirst, _pf())
     ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, sk, slots)

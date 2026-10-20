@@ -53,12 +53,14 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
 }
 
 // Grid (item, n block, mat * SK + split) -> Z[mat][split][pair][n]; warps sum fixed k ranges, added in warp order.
-template <int NT, int W>
+template <int NT, int W, bool NFIRST, bool PF>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
     const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E) {
-    const int item = blockIdx.x;
+    // NFIRST: the n blocks of an item are adjacent in launch order, so they read its rows while L2 holds them
+    const int item = NFIRST ? blockIdx.y : blockIdx.x;
+    const int nblock = NFIRST ? blockIdx.x : blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
     if (e >= E) return;                                  // the shared expert (id E) is not EXL3
@@ -79,7 +81,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = nblock * NT;
     const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
 
     float acc[NT][2][4];
@@ -90,21 +92,59 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
-    for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
-        uint32_t words[NT];
+    if (PF) {
+        // the next k step's words and A fragments load while this one decodes and multiplies (the same mma order)
+        uint32_t words[NT], a[4];
 #pragma unroll
         for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
-        const int k = kt * 16;
-        uint32_t a[4] = {load_pair(x0 + k, r0 >= 0), load_pair(x1 + k, r1 >= 0), load_pair(x0 + k + 8, r0 >= 0),
-                         load_pair(x1 + k + 8, r1 >= 0)};
-#pragma unroll
-        for (int i = 0; i < NT; ++i) {
-            uint32_t b0[2], b1[2];
-            decode_tile(words[i], lane, b0, b1);
-            mma16816(acc[i][0], a, b0);
-            mma16816(acc[i][1], a, b1);
+        {
+            const int k = kt0 * 16;
+            a[0] = load_pair(x0 + k, r0 >= 0); a[1] = load_pair(x1 + k, r1 >= 0);
+            a[2] = load_pair(x0 + k + 8, r0 >= 0); a[3] = load_pair(x1 + k + 8, r1 >= 0);
         }
-        tile += (size_t)NTILES * 32;
+        for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
+            uint32_t nw[NT], na[4];
+            const bool more = kt + 1 < kt0 + per_warp;
+            if (more) {
+                const uint32_t* next = tile + (size_t)NTILES * 32;
+#pragma unroll
+                for (int i = 0; i < NT; ++i) nw[i] = __ldg(next + i * 32);
+                const int k = (kt + 1) * 16;
+                na[0] = load_pair(x0 + k, r0 >= 0); na[1] = load_pair(x1 + k, r1 >= 0);
+                na[2] = load_pair(x0 + k + 8, r0 >= 0); na[3] = load_pair(x1 + k + 8, r1 >= 0);
+            }
+#pragma unroll
+            for (int i = 0; i < NT; ++i) {
+                uint32_t b0[2], b1[2];
+                decode_tile(words[i], lane, b0, b1);
+                mma16816(acc[i][0], a, b0);
+                mma16816(acc[i][1], a, b1);
+            }
+            if (more) {
+#pragma unroll
+                for (int i = 0; i < NT; ++i) words[i] = nw[i];
+#pragma unroll
+                for (int c = 0; c < 4; ++c) a[c] = na[c];
+            }
+            tile += (size_t)NTILES * 32;
+        }
+    } else {
+        for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
+            uint32_t words[NT];
+#pragma unroll
+            for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
+            const int k = kt * 16;
+            uint32_t a[4] = {load_pair(x0 + k, r0 >= 0), load_pair(x1 + k, r1 >= 0),
+                             load_pair(x0 + k + 8, r0 >= 0), load_pair(x1 + k + 8, r1 >= 0)};
+#pragma unroll
+            for (int i = 0; i < NT; ++i) {
+                uint32_t b0[2], b1[2];
+                decode_tile(words[i], lane, b0, b1);
+                mma16816(acc[i][0], a, b0);
+                mma16816(acc[i][1], a, b1);
+            }
+            tile += (size_t)NTILES * 32;
+        }
     }
 
     // warps' partial sums through shared memory, added in warp order
@@ -240,19 +280,23 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
 void exl3_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
                        const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
                        int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t nt,
-                       int64_t warps, int64_t E) {
+                       int64_t warps, int64_t E, bool nfirst, bool pf) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
-    dim3 grid((unsigned)max_items, (unsigned)(N / (16 * nt)), (unsigned)(mats * SK));
+    dim3 grid = nfirst ? dim3((unsigned)(N / (16 * nt)), (unsigned)max_items, (unsigned)(mats * SK))
+                       : dim3((unsigned)max_items, (unsigned)(N / (16 * nt)), (unsigned)(mats * SK));
     auto stream = at::cuda::getCurrentCUDAStream();
     auto x0 = reinterpret_cast<const half*>(X0.data_ptr());
     auto x1 = reinterpret_cast<const half*>(X1.data_ptr());
     auto t0 = reinterpret_cast<const uint32_t*>(T0.data_ptr());
     auto t1 = reinterpret_cast<const uint32_t*>(T1.data_ptr());
 #define LAUNCH(NT_, W_)                                                                                          \
-    grouped_kernel<NT_, W_><<<grid, W_ * 32, 0, stream>>>(x0, x1, t0, t1, items.data_ptr<int>(),                \
-                                                          counts.data_ptr<int>(), members.data_ptr<int>(),     \
-                                                          Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, \
-                                                          (int)E)
+    do {                                                                                                         \
+        auto fn = nfirst ? (pf ? grouped_kernel<NT_, W_, true, true> : grouped_kernel<NT_, W_, true, false>)   \
+                         : (pf ? grouped_kernel<NT_, W_, false, true> : grouped_kernel<NT_, W_, false, false>); \
+        fn<<<grid, W_ * 32, 0, stream>>>(x0, x1, t0, t1, items.data_ptr<int>(), counts.data_ptr<int>(),          \
+                                         members.data_ptr<int>(), Z.data_ptr<float>(), (int)K, (int)N, (int)P,   \
+                                         (int)SK, (int)E);                                                       \
+    } while (0)
     if (nt == 8 && warps == 4) LAUNCH(8, 4);
     else if (nt == 4 && warps == 4) LAUNCH(4, 4);
     else if (nt == 4 && warps == 8) LAUNCH(4, 8);

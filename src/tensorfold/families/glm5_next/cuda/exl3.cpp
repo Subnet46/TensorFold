@@ -3,7 +3,7 @@
 
 void exl3_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
-                       int64_t, int64_t, int64_t, int64_t);
+                       int64_t, int64_t, int64_t, int64_t, bool, bool);
 void exl3_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                       at::Tensor&, int64_t, int64_t, int64_t);
 void exl3_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -18,7 +18,8 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
 
 void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
              const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor Z, int64_t mats,
-             int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t nt, int64_t warps) {
+             int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t nt, int64_t warps, bool nfirst,
+             bool pf) {
     const int64_t E = T0.size(0);
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
@@ -30,7 +31,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, c
     check(Z, at::kFloat, "Z");
     TORCH_CHECK(Z.numel() >= mats * SK * P * N, "Z too small");
     c10::cuda::CUDAGuard guard(X0.device());
-    exl3_grouped_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, nt, warps, E);
+    exl3_grouped_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, nt, warps, E, nfirst, pf);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
