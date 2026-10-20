@@ -377,15 +377,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
     # TF_GLM_DENSE=fp8: the BF16 matrices as FP8 with block scales (lossy, half the bytes a decode round reads)
-    fp8 = exl3 and dense_kind() == "fp8"
+    fp8 = exl3 and dense_kind() in ("fp8", "q4")
     dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
+    # TF_GLM_DENSE=q4: the projections in 4 bits (MSE-searched groups of 64), the head and kv_b in FP8
+    if exl3 and dense_kind() == "q4":
+        from .qmm import make_dense_q4, stack_dense_q4
+
+        big, big_stack = make_dense_q4, stack_dense_q4
+    else:
+        big, big_stack = dense, dense_stack
 
     def q4(name: str) -> Q4 | B16 | F8:
-        return dense(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+        return big(t(name + ".weight")) if exl3 else make_q4(*trip(name))
 
     def stack(names: list[str]) -> Q4 | B16 | F8:
         if exl3:
-            return dense_stack([t(n + ".weight") for n in names])
+            return big_stack([t(n + ".weight") for n in names])
         return stack_q4([trip(n) for n in names])
 
     def hc(i: int, site: str) -> HCW:

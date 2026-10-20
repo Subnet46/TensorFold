@@ -176,6 +176,49 @@ def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
     return make_q4(words, scales.contiguous(), biases.contiguous())
 
 
+def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
+    """TF_GLM_DENSE=q4: bf16 weights as affine 4-bit groups of 64, each group's range the one of ``grid`` clippings
+    (1.0 down to 0.55 of its min / max) with the least squared error, scale and bias as stored (bf16). Lossy."""
+
+    n, k = w.shape
+    words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
+    scales = torch.empty((n, k // 64), dtype=torch.bfloat16, device=w.device)
+    biases = torch.empty_like(scales)
+    for r in range(0, n, chunk):
+        g = w[r:r + chunk].float().view(-1, k // 64, 64)
+        lo0, hi0 = g.amin(-1), g.amax(-1)
+        best_err = best_s = best_b = None
+        for i in range(grid):
+            a = 1.0 - 0.45 * i / (grid - 1)
+            lo, hi = lo0 * a, hi0 * a
+            s = ((hi - lo) / 15).clamp_min(1e-8).to(torch.bfloat16)
+            b = lo.to(torch.bfloat16)
+            q = torch.round((g - b.float()[..., None]) / s.float()[..., None]).clamp(0, 15)
+            err = ((q * s.float()[..., None] + b.float()[..., None] - g) ** 2).sum(-1)
+            if best_err is None:
+                best_err, best_s, best_b = err, s, b
+            else:
+                take = err < best_err
+                best_err = torch.where(take, err, best_err)
+                best_s = torch.where(take, s, best_s)
+                best_b = torch.where(take, b, best_b)
+        q = torch.round((g - best_b.float()[..., None]) / best_s.float()[..., None]).clamp(0, 15).to(torch.int32)
+        q = q.view(-1, k // 8, 8)
+        part = torch.zeros(q.shape[:2], dtype=torch.int32, device=w.device)
+        for j in range(8):
+            part |= q[..., j] << (4 * j)
+        words[r:r + chunk], scales[r:r + chunk], biases[r:r + chunk] = part, best_s, best_b
+    return make_q4(words, scales.contiguous(), biases.contiguous())
+
+
+def make_dense_q4(weight: torch.Tensor) -> "Q4 | F8":
+    return quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
+
+
+def stack_dense_q4(parts: list[torch.Tensor]) -> "Q4 | F8":
+    return make_dense_q4(torch.cat([p.to(torch.bfloat16) for p in parts]))
+
+
 def stack_b16(parts: list[torch.Tensor]) -> B16:
     """Rows of several BF16 matrices with the same K, stacked in order."""
 
@@ -438,8 +481,8 @@ def dense_kind() -> str:
     import os
 
     kind = os.environ.get("TF_GLM_DENSE", "bf16")
-    if kind not in ("bf16", "fp8"):
-        raise ValueError(f"TF_GLM_DENSE is bf16 or fp8, not {kind!r}")
+    if kind not in ("bf16", "fp8", "q4"):
+        raise ValueError(f"TF_GLM_DENSE is bf16, fp8 or q4, not {kind!r}")
     return kind
 
 
@@ -447,6 +490,24 @@ def dense_kind() -> str:
 _F8_NAMES = __import__("re").compile(
     r"(\.(q_proj|k_proj|v_proj|f_a_proj|g_a_proj|b_proj|f_b_proj|g_b_proj|o_proj|q_a_proj|kv_a_proj_with_mqa|q_b_proj"
     r"|wk|weights_proj|wq_b|gate_proj|up_proj|down_proj|eh_proj)\.weight|^lm_head\.weight)$")
+
+
+def q4_weights(base):
+    """fp8_weights, with the 4-bit matrices of TF_GLM_DENSE=q4 (all but the head and kv_b, which stay FP8) at half a
+    byte a value plus a bf16 scale and bias a group of 64."""
+
+    f8 = fp8_weights(base)
+
+    def transform(name: str, info: dict) -> tuple[int, int]:
+        total, extra = f8(name, info)
+        shape = info.get("shape") or []
+        if (total and info.get("dtype") == "BF16" and len(shape) == 2 and shape[-1] % 64 == 0
+                and name != "lm_head.weight" and "kv_b_proj" not in name
+                and "experts." not in name.replace("shared_experts.", "") and _F8_NAMES.search(name)):
+            n = base(name, info)[0] // 2
+            return n // 2 + n // 64 * 4, extra
+        return total, extra
+    return transform
 
 
 def fp8_weights(base):
