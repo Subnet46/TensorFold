@@ -552,13 +552,23 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
 
 
 class DepthPolicy:
-    """Choose a fixed draft count or adapt it to running acceptance."""
+    """Choose a fixed draft count or adapt it to running acceptance. DFlash2 stop rules within a round: the product of
+    the chain's confidences holds ``confidence``; with ``beta`` > 0 those confidences are noise-aware
+    (``dflash2.noisy_confidence``), and with ``round_ms`` too (ms of a round of k drafts, k = 0..) the chain is cut
+    where E[tokens] / ms is largest instead. MTP chains ignore ``beta`` and ``round_ms``."""
 
     def __init__(self, most: int = 3, fixed: bool = False, low: float = 0.8, high: float = 0.9,
-                 confidence: float = 0.0) -> None:
+                 confidence: float = 0.0, beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> None:
         self.most, self.fixed, self.low, self.high = most, fixed, low, high
         self.confidence = confidence
+        self.beta, self.round_ms = beta, round_ms
         self.rate = 0.8
+
+    @property
+    def chain_rule(self) -> dict:
+        """Drafter.propose's keyword arguments for the noise-aware rules (none for the others)."""
+
+        return {"beta": self.beta, "round_ms": self.round_ms} if self.beta > 0 else {}
 
     def next(self, drafted: int, accepted: int) -> int:
         if self.fixed:
@@ -675,7 +685,8 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         if copied:
             drafts = copied
         else:
-            drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+            drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
+                      if depth > 0 else [])
         t1 = time.perf_counter()
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]

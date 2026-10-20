@@ -21,6 +21,31 @@ from .weights import Weights
 EDGE = 0.6        # the selector's edge score weight in a chain pick
 NOISE = 0.7       # the target's keyed noise weight when sampling
 NO_LIMIT = 1e30
+# the noise-aware stop rules' temperature B (fnc<N>:<p>, fcost<N>:noisy): draft_sim's NoisyPredictor beta, fitted by
+# log loss (``fit_beta``, its grid) on the 9 teacher-forced dumps of 2026-09-30 (7 sampled prose, 2 greedy code):
+# 2.0 on all of them, on the sampled ones alone and on the greedy ones alone (a finer grid: 1.8, log loss -0.2%)
+NOISY_BETA = 2.0
+
+
+def noisy_confidence(score: np.ndarray, noise: np.ndarray | None, j: int, beta: float) -> float:
+    """softmax((score + g) / beta) at the pick j, g the target's keyed Gumbel draws for the candidates (None: greedy,
+    softmax(score / beta)): the chance the target's keyed sample is the pick when its scaled logits are the drafter's
+    plus iid Gumbel(beta) errors. draft_sim's ``noisy_prob`` feature, the same float64 operations in the same order."""
+
+    z = score + noise if noise is not None else score
+    z = z / beta
+    e = np.exp(z - z.max())
+    return float(e[j] / e.sum())
+
+
+def best_depth(q, round_ms) -> int:
+    """The k (0..len(q)) maximizing E[tokens | k drafts] / round_ms[k], q the drafts' conditional acceptances
+    (``draft_sim.best_depth`` with round_ms[k] = its Costs.round_ms(k, 1, True))."""
+
+    alive = np.concatenate([[1.0], np.cumprod(np.asarray(q, dtype=np.float64))])
+    expect = np.cumsum(alive)
+    ms = np.asarray(round_ms[:len(q) + 1], dtype=np.float64)
+    return int(np.argmax(expect / ms))
 
 
 @triton.jit
@@ -464,8 +489,12 @@ class Drafter:
         return tokens, values, proj.numpy().astype(np.float64)          # astype copies: nothing keeps cand_host
 
     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
-              sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always keeping the first draft."""
+              sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
+              round_ms: tuple[float, ...] | None = None) -> list[int]:
+        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always
+        keeping the first draft. ``beta`` > 0: the confidences are noise-aware (``noisy_confidence``); with
+        ``round_ms`` (ms of a round of k drafts, k = 0..) the chain is walked whole and cut at ``best_depth`` of
+        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same."""
 
         depth = tokens.shape[0]
         sampled = sampling is not None and sampling.temperature > 0
@@ -473,27 +502,44 @@ class Drafter:
         noise = None
         if sampled:
             noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
+        noisy = beta > 0
         out: list[int] = []
+        conf: list[float] = []
         prev, chain = anchor, 1.0
         for d in range(depth):
             edge = self.succ[tokens[d]].astype(np.float64) @ (self.pred[prev].astype(np.float64) * proj[d])
             score = (values[d] + EDGE * edge) / temp
             pick = score + NOISE * noise[d] if noise is not None else score
             j = int(np.argmax(pick))
-            if confidence > 0:
+            if noisy:
+                c = noisy_confidence(score, noise[d] if noise is not None else None, j, beta)
+                if round_ms is not None:
+                    conf.append(c)
+                else:
+                    chain *= c
+                    if d > 0 and chain < confidence:
+                        break
+            elif confidence > 0:
                 p = np.exp(score - score.max())
                 chain *= float(p[j] / p.sum())
                 if d > 0 and chain < confidence:
                     break
             prev = int(tokens[d, j])
             out.append(prev)
+        if noisy and round_ms is not None:
+            out = out[:best_depth(conf, round_ms)]
         return out
 
-    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end)."""
+    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
+                beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
+        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end); ``beta``,
+        ``round_ms``: the noise-aware stop rules (``chain``)."""
 
         depth = min(depth, self.block - 1)
         if depth < 1 or self.context_end == 0:
             return []
         tokens, values, proj = self.candidates(pending, depth)
+        if beta > 0:
+            return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence, beta=beta,
+                              round_ms=round_ms)
         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
