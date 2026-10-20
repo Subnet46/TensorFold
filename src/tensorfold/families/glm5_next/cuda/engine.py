@@ -136,9 +136,14 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
 
+        from .qmm import dense_kind, fp8_weights
+
+        # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
+        weights_estimate = split_weights(rule)
+        if cfg.quant == "exl3" and dense_kind() == "fp8":
+            weights_estimate = fp8_weights(weights_estimate)
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
-        weights_estimate = split_weights(rule)
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,

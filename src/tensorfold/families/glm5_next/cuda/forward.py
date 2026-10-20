@@ -270,29 +270,32 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
     k = layer.kda
     li = st.kda_index[layer.index]
     p = b.kproj[0, :R] if b.prefill else st.proj[li, :R]
-    mm(b, b.normed[:R], k.proj, b.xs[:R], p)
-    fa = p[:, k.fa_off:k.fa_off + 128]
-    ga = p[:, k.ga_off:k.ga_off + 128]
     pre = b.prefill
-    mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
-    mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+    with prof.timed("kda: projections"):
+        mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+        fa = p[:, k.fa_off:k.fa_off + 128]
+        ga = p[:, k.ga_off:k.ga_off + 128]
+        mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+        mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
     cur = st.cur[li]
-    if cut is None:
-        out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
-                            k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
-                            st.rec[1 - cur, li])
-    else:
-        n = cut.point
-        first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
-                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
-        _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
-        rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
-                             k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
-        out = torch.cat((first, rest))
+    with prof.timed("kda: recurrence"):
+        if cut is None:
+            out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+                                k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
+                                st.rec[1 - cur, li])
+        else:
+            n = cut.point
+            first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
+                                  k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
+            _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
+            rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
+                                 k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
+            out = torch.cat((first, rest))
     if pre:                              # a prompt chunk keeps every row: the layer commits now
         st.cur[li] = 1 - cur
         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
-    return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
+    with prof.timed("kda: out + all-gather"):
+        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
 
 
 def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
@@ -407,19 +410,23 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
             grouped.route(b.pick[:R], b.plan)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-        if b.plan is None:
-            exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
-        else:
-            from . import exl3_mm
+        from . import exl3_mm
 
-            exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+        with prof.timed("moe: routed (exl3)"):
+            if b.plan is None:           # the universal route (weights.exl3_route)
+                exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+            else:
+                exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
         s = m.shared
-        mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
-        glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
-        mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
-        b.ey[:R, c.top_k].copy_(b.sy[:R])
-        glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
-        return gather(w, b, R)
+        with prof.timed("moe: shared expert"):
+            mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+            glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+            mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
+        with prof.timed("moe: combine"):
+            b.ey[:R, c.top_k].copy_(b.sy[:R])
+            glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+        with prof.timed("moe: all-gather"):
+            return gather(w, b, R)
     with prof.timed("moe: gate/up"):
         grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
     with prof.timed("moe: down"):

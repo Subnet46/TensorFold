@@ -16,7 +16,7 @@ from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts
 from .exl3_mm import Exl3Experts, words as exl3_words
 from . import latent
-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+from .qmm import B16, F8, Q4, as_i32, dense_kind, make_b16, make_f8, make_q4, quantize4, stack_b16, stack_f8, stack_q4
 
 PREFIX = "model.language_model."
 
@@ -220,7 +220,7 @@ class Weights:
     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     layers: list[LayerW]
     norm: torch.Tensor
-    head: Q4 | B16
+    head: Q4 | B16 | F8
     mtp: MTPW | None
     rank: int
     world: int
@@ -242,8 +242,8 @@ class Weights:
             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                 seen.add(t.data_ptr())
                 total += t.numel() * t.element_size()
-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, Exl3RoutedExperts, HCW, KDAW, DSAW, MLPW, MoEW,
-                                LayerW, MTPW, IndexW)):
+            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, Exl3RoutedExperts, HCW, KDAW, DSAW, MLPW,
+                                MoEW, LayerW, MTPW, IndexW)):
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):
@@ -376,12 +376,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
-    def q4(name: str) -> Q4 | B16:
-        return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+    # TF_GLM_DENSE=fp8: the BF16 matrices as FP8 with block scales (lossy, half the bytes a decode round reads)
+    fp8 = exl3 and dense_kind() == "fp8"
+    dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
 
-    def stack(names: list[str]) -> Q4 | B16:
+    def q4(name: str) -> Q4 | B16 | F8:
+        return dense(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+
+    def stack(names: list[str]) -> Q4 | B16 | F8:
         if exl3:
-            return stack_b16([t(n + ".weight") for n in names])
+            return dense_stack([t(n + ".weight") for n in names])
         return stack_q4([trip(n) for n in names])
 
     def hc(i: int, site: str) -> HCW:
@@ -402,7 +406,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
         if exl3:
             w = t(p + "kv_b_proj.weight")
-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
+            kv_k, kv_v = dense(w[krows]), dense(w[vrows])
             full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
         else:
             w, s, b = trip(p + "kv_b_proj")
@@ -538,9 +542,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         vl = cfg.vocab // world
         draft_head = None
         if exl3:
-            head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
-            # Draft steps use the quantized head; verification keeps the original head.
-            draft_head = quantize4(head.weight)
+            raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
+            head = dense(raw)
+            draft_head = quantize4(raw)    # Draft steps use the quantized head; verification keeps the original head.
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
