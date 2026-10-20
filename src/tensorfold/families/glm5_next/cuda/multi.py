@@ -467,14 +467,19 @@ class MultiDecoder:
         verify window on the one-stream graphs and on the batched graphs, ms by rows up to the one-stream graphs'
         widest (fastest of ``reps``; slot 0's states cleared after)."""
 
+        from .forward import stage
+        from .verify import timing_tokens
+
         e, v = self.e, self.verify
         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         solo = v.time_rows(reps, most=self.lone_rows)
+        tokens = timing_tokens(self.w.cfg.vocab, v.rows_max)       # the rows time_rows gave the batched graphs
         out = []
         for R in range(1, self.lone_rows + 1):
             g = e.graphs.main.get((R, e.home.parity))
             if g is None:
                 continue
+            stage(self.w, e.home, e.buf, tokens[:R])
             best = float("inf")
             for _ in range(reps + 1):
                 start.record()
