@@ -599,7 +599,7 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
 // kernel's (which sums split and warp partials). The epilogues are gateup/down_epilogue_kernel's formulas.
 constexpr int PBK = 32;              // k values a shared-memory stage (2 k tiles)
 constexpr int PKT = PBK / 16;
-constexpr int PSTAGES = 3;
+constexpr int PSTAGES = 3;           // the default pipeline depth (a template parameter PS, 2 to 4: loads only, same bits)
 constexpr int PXS = PBK + 8;         // stage row stride in halves (+16 B: ldmatrix rows on distinct banks)
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
@@ -638,7 +638,7 @@ __device__ __forceinline__ void prompt_tile(int q, int cb, int& mat, int& nt) {
     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
 }
 
-template <int MATS, int PM, int NW, bool SHX = false>
+template <int MATS, int PM, int NW, bool SHX = false, int PS = PSTAGES>
 __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
                                                 const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
                                                 const int* rows_sh, int cnt, int e, int K, int NTILES, int cb,
@@ -658,7 +658,7 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
             for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
 
     auto load = [&](int chunk) {
-        half* dst = stage + (size_t)(chunk % PSTAGES) * C::STAGE_HALVES;
+        half* dst = stage + (size_t)(chunk % PS) * C::STAGE_HALVES;
         const int k0 = chunk * PBK;
         for (int idx = threadIdx.x; idx < C::XM * PM * (PBK / 8); idx += C::T) {
             const int m = idx / (PM * (PBK / 8)), rem = idx % (PM * (PBK / 8)), i = rem / (PBK / 8),
@@ -677,16 +677,16 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
         }
     };
 #pragma unroll
-    for (int c = 0; c < PSTAGES - 1; ++c) {
+    for (int c = 0; c < PS - 1; ++c) {
         if (c < chunks) load(c);
         cp_async_commit();
     }
     for (int c = 0; c < chunks; ++c) {
-        cp_async_wait<PSTAGES - 2>();
+        cp_async_wait<PS - 2>();
         __syncthreads();
-        if (c + PSTAGES - 1 < chunks) load(c + PSTAGES - 1);
+        if (c + PS - 1 < chunks) load(c + PS - 1);
         cp_async_commit();
-        const half* base = stage + (size_t)(c % PSTAGES) * C::STAGE_HALVES;
+        const half* base = stage + (size_t)(c % PS) * C::STAGE_HALVES;
         const half* xs = base + (size_t)(SHX ? 0 : mat) * PM * PXS;
         const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)C::XM * PM * PXS);
 #pragma unroll
@@ -738,11 +738,11 @@ __device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const f
 }
 
 constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;
-template <int PM, int XM = 2>
+template <int PM, int XM = 2, int PS = PSTAGES>
 constexpr size_t prompt_smem() {
     // max of: gate/up stages (XM copies of the member rows), down stages, gate/up epilogue half (2 x PM/2 x GU_ES),
     // down half (PM/2 x DN_ES)
-    const size_t gu = (size_t)PSTAGES * (XM * PM * PXS + 2 * PWORDS) * 2;
+    const size_t gu = (size_t)PS * (XM * PM * PXS + 2 * PWORDS) * 2;
     const size_t ep = (size_t)2 * (PM / 2) * GU_ES * 4;
     const size_t dn = (size_t)(PM / 2) * DN_ES * 4;
     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
@@ -811,7 +811,7 @@ __global__ void __launch_bounds__(1024) prompt_order_kernel(const int* __restric
 }
 
 // SHX: Xg = Xu = Xh [rows, K], one row a token (pair p reads row p / slots); otherwise Xg, Xu [pairs, K].
-template <int PM, int NW, bool SHX>
+template <int PM, int NW, bool SHX, int PS = PSTAGES>
 __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
     const half* __restrict__ Xg, const half* __restrict__ Xu, const uint32_t* __restrict__ Tg,
     const uint32_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
@@ -836,7 +836,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[MT][PM / 8][4];
-    prompt_mainloop<2, PM, NW, SHX>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
+    prompt_mainloop<2, PM, NW, SHX, PS>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
                                     reinterpret_cast<half*>(smem_raw), acc);
     float* Eg = reinterpret_cast<float*>(smem_raw);
     int mat, nt;
@@ -877,7 +877,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
     }  // halves
 }
 
-template <int PM, int NW>
+template <int PM, int NW, int PS = PSTAGES>
 __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
     const half* __restrict__ Xd, const uint32_t* __restrict__ Td, const int* __restrict__ items,
     const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
@@ -895,7 +895,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[MT][PM / 8][4];
-    prompt_mainloop<1, PM, NW>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
+    prompt_mainloop<1, PM, NW, false, PS>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
                                acc);
     float* Ed = reinterpret_cast<float*>(smem_raw);
     for (int hf = 0; hf < 2 && hf * PH < cnt; ++hf) {
@@ -1070,21 +1070,22 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
 }
 
 // Prompt chunks (a plan of PM-pair items, PM 64 or 128): Xd [P, N] = the gate/up epilogue of Xg/Xu's pairs;
-// Y [P, D] = the down epilogue.
-template <int PM, int NW>
+// Y [P, D] = the down epilogue. PS: the cp.async pipeline depth (loads only: every output's chain is the same).
+template <int PM, int NW, int PS = PSTAGES>
 static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, const at::Tensor& Tu,
                           const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
                           const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
                           const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
                           int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx,
                           const int* order) {
-    constexpr size_t SMEM = prompt_smem<PM>(), SMEM_SHX = prompt_smem<PM, 1>();
+    constexpr size_t SMEM = prompt_smem<PM, 2, PS>(), SMEM_SHX = prompt_smem<PM, 1, PS>();
     static bool once = [] {
-        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false, PS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)SMEM);
-        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true, PS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)SMEM_SHX);
-        cudaFuncSetAttribute(prompt_down_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+        cudaFuncSetAttribute(prompt_down_kernel<PM, NW, PS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)SMEM);
         return true;
     }();
     (void)once;
@@ -1093,17 +1094,17 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
     const dim3 gu_grid((unsigned)(N / 128), (unsigned)max_items);
     if (shx)
-        prompt_gateup_kernel<PM, NW, true><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
+        prompt_gateup_kernel<PM, NW, true, PS><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
             h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
             h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
             (float)limit, (int)slots, order);
     else
-        prompt_gateup_kernel<PM, NW, false><<<gu_grid, NW * 32, SMEM, stream>>>(
+        prompt_gateup_kernel<PM, NW, false, PS><<<gu_grid, NW * 32, SMEM, stream>>>(
             h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
             h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
             (float)limit, (int)slots, order);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+    prompt_down_kernel<PM, NW, PS><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
         reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
         members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E, order);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1114,8 +1115,9 @@ void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tens
                       const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
                       const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
                       int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots, bool shx,
-                      const c10::optional<at::Tensor>& order_buf) {
+                      const c10::optional<at::Tensor>& order_buf, int64_t stages) {
     TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % PBK == 0 && N % PBK == 0, "prompt experts: shapes");
+    TORCH_CHECK(stages >= 2 && stages <= 4, "prompt experts: 2 to 4 pipeline stages");
     const int* order = nullptr;
     if (order_buf.has_value()) {
         TORCH_CHECK(order_buf->numel() >= max_items, "prompt experts: order buffer too small");
@@ -1126,12 +1128,15 @@ void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tens
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         order = o;
     }
-    if (pass == 128)
-        prompt_launch<128, 16>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N,
-                               E, max_items, limit, slots, shx, order);
-    else if (pass == 64)
-        prompt_launch<64, 8>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
-                             max_items, limit, slots, shx, order);
-    else
+#define GO(PM_, NW_, PS_)                                                                                         \
+    prompt_launch<PM_, NW_, PS_>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, \
+                                 E, max_items, limit, slots, shx, order)
+    if (pass == 128) {
+        if (stages == 2) GO(128, 16, 2); else if (stages == 4) GO(128, 16, 4); else GO(128, 16, 3);
+    } else if (pass == 64) {
+        if (stages == 2) GO(64, 8, 2); else if (stages == 4) GO(64, 8, 4); else GO(64, 8, 3);
+    } else {
         TORCH_CHECK(false, "prompt experts: passes of 64 or 128 members");
+    }
+#undef GO
 }

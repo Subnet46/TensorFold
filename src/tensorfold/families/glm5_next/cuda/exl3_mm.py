@@ -78,7 +78,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v20a1", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v20a2", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -97,6 +97,8 @@ def dec_config(kind: str, K: int, N: int, R: int) -> dict:
     t = tune.pick("exl3_dec_" + kind, tune.shape(K, N), R)
     if t:
         cfg.update(t)
+    if cfg["wn"] == 4 and cfg["ld"] != 0:            # (tune refuses such an entry; a merge must not reach the kernel)
+        cfg["wn"] = 1
     return cfg
 
 
@@ -196,10 +198,18 @@ def prompt_pass() -> int:
     import os
 
     t = tune.pick("exl3_prompt", "all")
-    value = int(t["passm"]) if t else int(os.environ.get("TF_GLM_EXL3_PASS", "64"))
+    value = int(t["passm"]) if t and "passm" in t else int(os.environ.get("TF_GLM_EXL3_PASS", "64"))
     if value not in (64, 128):
         raise ValueError(f"TF_GLM_EXL3_PASS is 64 or 128, not {value}")
     return value
+
+
+def prompt_stages() -> int:
+    """The prompt kernels' cp.async pipeline depth: 3 (GB10's), or a launch table's ``exl3_prompt`` entry "all"
+    (TF_GLM_TUNE): 2 to 4, loads only, the same bits."""
+
+    t = tune.pick("exl3_prompt", "all")
+    return int(t.get("stages", 3)) if t else 3
 
 
 def prompt_kernels() -> bool:
@@ -263,7 +273,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
         ext.prompt(xg, xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
                    ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
                                                                                    plan.tile), float(limit),
-                   plan.tile, slots, shx, s.order if item_order() else None)
+                   plan.tile, slots, shx, s.order if item_order() else None, prompt_stages())
         return
     if plan.tile != grouped.TILE:
         raise ValueError("the EXL3 kernel takes items of 16 pairs")

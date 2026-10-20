@@ -128,6 +128,34 @@ def group_sums(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor
 
 
 @triton.jit
+def _group_sums_split(X, XA, XB, x_stride, K: tl.constexpr, KA: tl.constexpr, GB: tl.constexpr):
+    """_group_sums of a row's K = KA + KB inputs in one program, groups 0 .. KA/64 - 1 to XA [M, KA/64], the rest to
+    XB [M, (K - KA)/64]: the same [GB, 64] tile and warps, so every group's sum has _group_sums' bits."""
+    m = tl.program_id(0)
+    gb = tl.program_id(1)
+    KG: tl.constexpr = K // 64
+    KGA: tl.constexpr = KA // 64
+    g = gb * GB + tl.arange(0, GB)
+    k = tl.arange(0, 64)
+    ok = g < KG
+    x = tl.load(X + m * x_stride + g[:, None] * 64 + k[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+    t = tl.sum(x, axis=1)
+    tl.store(XA + m * KGA + g, t, mask=g < KGA)
+    tl.store(XB + m * (KG - KGA) + (g - KGA), t, mask=ok & (g >= KGA))
+
+
+def group_sums_split(x: torch.Tensor, ka: int, out_a: torch.Tensor, out_b: torch.Tensor) -> None:
+    """``group_sums`` of x[:, :ka] into out_a and of x[:, ka:] into out_b in one launch, with the same bits (x: rows
+    of K bf16 inputs, unit-stride; ka and K multiples of 64; K <= 64 x 16 so one program takes a row as _group_sums'
+    grid would)."""
+
+    m, k = x.shape
+    if k % GS or ka % GS or not 0 < ka < k or x.stride(1) != 1 or k // GS > 16:
+        raise ValueError(f"group_sums_split: {tuple(x.shape)} at {ka}")
+    _group_sums_split[(m, 1)](x, out_a, out_b, x.stride(0), K=k, KA=ka, GB=16, num_warps=2)
+
+
+@triton.jit
 def _reduce(PART, OUT, total, SK: tl.constexpr, BLOCK: tl.constexpr, F32: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     ok = offs < total

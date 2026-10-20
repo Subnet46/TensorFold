@@ -670,13 +670,36 @@ class GlmEngine:
                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                "every rank the same flags")
         self.cache_bytes = min(row[-1] for row in rows) << 20
-        # launch tables (TF_GLM_TUNE, tune.py): every rank must read the same table file (its tables' checksum)
+        # launch tables (TF_GLM_TUNE, tune.py): every rank must read the same table file (its tables' checksum; -1: a
+        # rank could not read or accept it); and the settings read at first use (TF_GLM_FUSE, TF_GLM_FUSE_HC_ROWS,
+        # TENSORFOLD_GPU_SAMPLE; -1: not valid on that rank) must be valid and the same on every rank. All of it is read
+        # without raising and compared in one gather, so every rank refuses the start together.
+        from tensorfold.cuda import gpu_sample as _gpu_sample
+
+        from . import fuse as _fuse
         from . import tune as _tune
 
-        tables = [row[0] for row in self._gather_ints([_tune.code()])]
-        if any(t != tables[0] for t in tables):
-            raise RuntimeError(f"the ranks read different launch tables (TF_GLM_TUNE; checksums {tables}): give every "
-                               "rank the same file, or none")
+        def quiet(read) -> tuple[int, str | None]:
+            try:
+                return min(int(read()), 1 << 30), None
+            except ValueError as exc:
+                return -1, str(exc)
+
+        mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted)]
+        got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
+        tables = [row[0] for row in got]
+        if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
+            why = _tune.error()
+            raise RuntimeError(f"launch tables (TF_GLM_TUNE): checksums by rank {tables}"
+                               + (f"; this rank: {why}" if why else "") + ": give every rank the same valid file, or none")
+        settings = [row[1:] for row in got]
+        if any(-1 in row for row in settings) or any(row != settings[0] for row in settings):
+            why = "; ".join(w for _, w in mine if w)
+            raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE by rank "
+                               f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
+                               + ": give every rank the same valid values")
+        if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
+            _gpu_sample.enabled(world, 1, torch.device("cuda", torch.cuda.current_device()))
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
             plan[key] = plan[key] + self.cache_bytes

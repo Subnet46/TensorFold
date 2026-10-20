@@ -18,7 +18,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm_v5m1", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+    return load(name="tensorfold_qmm_v5m2", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
                                                      str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
                                                      str(here / "qmm_prefill8.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
