@@ -127,6 +127,7 @@ class Engine:
         self.slots = Slots(w, streams, max_rows)
         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
         self.last_hidden: torch.Tensor | None = None
+        self.head: torch.Tensor | None = None       # the last prompt's end logits row (``prefill``'s keep_head)
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
         self.draft_n = w.head.n
         self.graphs = None
@@ -295,6 +296,10 @@ class Snapshot:
     nbytes: int = 0
     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
     tail: list | None = None      # the indexer rings' rows of the pools still filling at ids' end (``_ring_tail``)
+    # the head's logits row at ids' end (this rank's vocabulary slice, before any grammar mask), kept with a prompt's
+    # own end state: a request of exactly these ids resumes here and samples its first token from it, prefilling
+    # nothing (``prefill``); None for states short of a prompt's end (which no head ran for)
+    head: torch.Tensor | None = None
 
 
 def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -423,6 +428,7 @@ def snapshot_bytes(snap: Snapshot) -> int:
     """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window,
     the indexer rings' tail and any saved rows."""
     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
+    held += [snap.head] if snap.head is not None else []
     held += [t for pair in (snap.tail or []) for t in pair]
     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
 
@@ -455,16 +461,28 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 
 
 # -- prefill ----------------------------------------------------------------------------------------------------
+def whole(snap: Snapshot | None, prompt: Sequence[int]) -> bool:
+    """Whether ``snap`` is a state of exactly ``prompt`` that kept its head's logits row (a replay resumes there)."""
+
+    return snap is not None and snap.head is not None and len(snap.ids) == len(prompt)
+
+
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
-            resume: Snapshot | None = None, feed=None, sample: bool = True) -> int | None:
-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``); ``sample=False``: commit only (no head, no first token, None), leaving the state a prompt of this length leaves before its sample."""
+            resume: Snapshot | None = None, feed=None, sample: bool = True, keep_head: bool = False) -> int | None:
+    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``); ``sample=False``: commit only (no head, no first token, None), leaving the state a prompt of this length leaves before its sample.
+
+    ``resume`` may also be a state of the whole prompt that kept its head's logits row (``whole``, a replay): the
+    state goes back and the first token is sampled from that row, nothing prefilled. ``keep_head``: the head's
+    logits row of the prompt's end, as sampled from (before a grammar's mask), is left in ``e.head`` for a snapshot."""
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
     w, st, b = e.w, e.st, e.pbuf
     use_mtp = mtp and w.mtp is not None
     begin = 0
+    replay = sample and whole(resume, prompt)
+    e.head = None
     if resume is None:
         e.reset()
         if drafter is not None:
@@ -473,23 +491,33 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         begin = len(resume.ids)
         if e.grid and begin % e.grid:
             raise ValueError(f"a resumed prefill starts on the {e.grid}-row grid, not at {begin}")
-        if begin >= len(prompt) or list(prompt[:begin]) != resume.ids:
-            raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
+        if (begin >= len(prompt) and not replay) or list(prompt[:begin]) != resume.ids:
+            raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt (or of the whole "
+                             "prompt with its head's logits row)")
         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
             raise ValueError("this snapshot's draft caches do not fit the request")
         restore(e, resume, drafter)
-        if use_mtp:
+        if use_mtp and replay:
+            # the prompt's last hidden row waits for the first token, as a fresh prefill leaves it (the MTP cache
+            # holds every row before it: mtp_len n - 1)
+            e.last_hidden = resume.pending[-1:].clone()
+        elif use_mtp:
             k = resume.pending.shape[0]
             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
     last = None
-    prof.active = True
-    for start in range(begin, len(prompt), e.prefill_rows):
-        last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter, feed=feed,
-                             mtp=use_mtp, head=sample)
-    prof.active = False
-    prof.report(len(prompt) - begin)
+    if replay:
+        last = resume.head.clone()                       # a grammar's mask below writes into the rows it samples
+    else:
+        prof.active = True
+        for start in range(begin, len(prompt), e.prefill_rows):
+            last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter,
+                                 feed=feed, mtp=use_mtp, head=sample)
+        prof.active = False
+        prof.report(len(prompt) - begin)
     if not sample:
         return None
+    if keep_head:
+        e.head = last.clone()
     if e.constraint is not None:                         # the first token's row, under the reply's grammar
         e.window = e.constraint.window([0], [-1])
     first = e.sample(last, [len(prompt)], sampling)[0]

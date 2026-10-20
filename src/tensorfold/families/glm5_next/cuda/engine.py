@@ -831,14 +831,16 @@ class GlmEngine:
         return auto, auto or not dflash, dflash
 
     def _resume(self, prompt: list[int], code: list[int]):
-        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters."""
+        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
+        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``)."""
 
         _, mtp, dflash = self._drafters(code)
         best = None
         for snap in self.cache:
             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
             fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
-            if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
+            short = len(snap.ids) < len(prompt) or (len(snap.ids) == len(prompt) and snap.head is not None)
+            if fits and short and prompt[:len(snap.ids)] == snap.ids and (
                     best is None or len(snap.ids) > len(best.ids)):
                 best = snap
         return best
@@ -935,7 +937,7 @@ class GlmEngine:
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
                   feed=None, shared=()) -> dict[str, Any]:
-        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
+        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot, whole
         from .drafter_choice import DrafterChoice, auto_decode
 
         auto, use_mtp, use_dflash = self._drafters(code)
@@ -970,11 +972,18 @@ class GlmEngine:
             resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
                                    drafter=drafter)
             kept.append(resume)
-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed)
+        # a replay of a kept prompt (``decode.whole``: its state and head's logits row) prefills nothing and keeps
+        # nothing new; a prompt's own end state keeps the head's row it sampled from, for a later replay
+        replay = whole(hit, prompt)
+        end = point == len(prompt) and not replay
+        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed,
+                        keep_head=end)
         prefill_s = time.perf_counter() - t0
-        if point == len(prompt):
-            kept.append(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
-                                      drafter=drafter))
+        if end:
+            snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                 drafter=drafter)
+            snap.head, self.e.head = self.e.head, None
+            kept.append(snap)
         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
             self.cache = [c for c in self.cache if c is not hit] + [hit]
         for snap in kept:

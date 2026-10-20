@@ -287,6 +287,7 @@ class Lane:
     stops: list[int] = field(default_factory=list)   # prompt positions whose states are kept (before the end)
     point: int | None = None           # where the prompt's own state is kept (engine.grid_point), or None
     shared: list[int] = field(default_factory=list)
+    head: Any = None                   # a replay's first-token logits row (its kept prompt's, ``decode.whole``)
     decoding: bool = False
     paused: bool = False
     t0: float = 0.0
@@ -665,6 +666,11 @@ class MultiDecoder:
                 if hit.drafter_end != cut or hit.drafter_rows is None:
                     raise RuntimeError("a kept prompt without DFlash2's window was chosen for a DFlash2 stream")
                 put_draft_window(self._ctx(lane), cut, hit.drafter_rows)
+            if cut == len(prompt):          # a replay: its one FILL samples the kept head's row, prefilling nothing
+                if hit.head is None:
+                    raise RuntimeError(f"the kept prompt {a['kid']} is the whole prompt of stream {a['sid']} but "
+                                       f"kept no head row")
+                lane.head = hit.head.clone()
             self._touch(hit)
         # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
         if a["draft"] and feed is None:
@@ -688,20 +694,24 @@ class MultiDecoder:
         raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
 
     def _resume(self, prompt: list[int]):
+        """The longest kept strict prefix of ``prompt``, or the whole prompt when it kept its head's logits row (a
+        replay of an earlier prompt), whose DFlash2 window came along."""
         best = None
         for c in self.kept:
             n = len(c.ids)
             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
             fits = fits and not (self.grid and n % self.grid)
-            if fits and n < len(prompt) and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
+            short = n < len(prompt) or (n == len(prompt) and c.head is not None)
+            if fits and short and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
                 best = c
         return best
 
     def _touch(self, c) -> None:
         self.kept = [k for k in self.kept if k is not c] + [c]
 
-    def _keep(self, lane: Lane, n: int) -> None:
-        """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent."""
+    def _keep(self, lane: Lane, n: int, head=None) -> None:
+        """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent;
+        ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay)."""
 
         from .decode import take_snapshot
 
@@ -714,6 +724,7 @@ class MultiDecoder:
         if lane.dflash:
             snap.drafter_end = n
             snap.drafter_rows = draft_window(self._ctx(lane), n)
+        snap.head = head
         snap.kid = self.next_kid
         self.next_kid += 1
         snap.extent = lane.extent
@@ -731,7 +742,7 @@ class MultiDecoder:
         x = c.extent
         x.kept = [k for k in x.kept if k is not c]
         c.rec = c.conv = None
-        c.tail = None
+        c.tail = c.head = None
         c.drafter_rows = None
         self._settle(x)
 
@@ -970,19 +981,23 @@ class MultiDecoder:
         prompt = s.prompt
         n = len(prompt)
         start = lane.st.pos
-        if not start < stop <= n or stop - start > e.prefill_rows:
+        replay = lane.head is not None           # resumed at the prompt's end: no rows, the kept head's row
+        if not (start < stop <= n or replay and start == stop == n) or stop - start > e.prefill_rows:
             raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
         t = time.perf_counter()
         prev = e.use(lane.st)
         try:
-            out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
-                                feed=lane.feed, mtp=False, head=stop == n)
+            if replay:
+                out, lane.head = lane.head, None
+            else:
+                out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+                                    feed=lane.feed, mtp=False, head=stop == n)
             if stop < n:
                 if stop in lane.stops:
                     self._keep(lane, stop)
                 return None
-            if lane.point == n:
-                self._keep(lane, n)
+            if lane.point == n and not replay:
+                self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
             logits = out[:1]
             if lane.constraint is not None:             # the first token's row, under the reply's grammar
                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
