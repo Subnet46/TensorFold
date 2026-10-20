@@ -45,6 +45,8 @@ import torch
 from tensorfold.cuda import priority as prio
 from tensorfold.cuda.scheduler import Scheduler, Waiting
 from tensorfold.cuda.streams import Stream, next_fill
+from tensorfold.cuda.incremental import PromptIds, copy_prompt, enabled as incremental_enabled, keep_rendered
+from .admit_delta import pack_prompt, unpack_prompt
 
 from . import digest as _digest, multi_prefill
 from . import prof as _prefill_prof
@@ -651,7 +653,8 @@ class MultiDecoder:
 
         self._check()
         g = self.g
-        prompt = [int(t) for t in s.prompt]
+        incremental = incremental_enabled()
+        prompt = copy_prompt(s.prompt) if incremental and isinstance(s.prompt, PromptIds) else [int(t) for t in s.prompt]
         if not prompt:
             raise ValueError("a request needs at least one prompt token")
         if len(prompt) >= g.limit:
@@ -713,7 +716,7 @@ class MultiDecoder:
         sid = self.next_sid
         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
                    int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
-                   len(prompt), *prompt]
+                   *pack_prompt(prompt, hit if incremental and feed is None else None)]
         from tensorfold.engine.grammar import pack
 
         packed = pack(s.constraint)
@@ -725,17 +728,16 @@ class MultiDecoder:
             self.broken = exc
             raise
 
-    @staticmethod
-    def _parse_admit(p: list[int]) -> dict:
+    def _parse_admit(self, p: list[int]) -> dict:
         (sid, slot, base, size, kid, copy, count, stop_eos, draft) = p[:9]
         sampling = unpack_sampling(p[9:19])
         shared = [v for v in p[19:19 + SHARED_SLOTS] if v]
         i = 19 + SHARED_SLOTS
         code = p[i:i + 4]
         i += 4
-        n = p[i]
-        prompt = p[i + 1:i + 1 + n]
-        i += 1 + n
+        # Decoding the wire format is unconditional, so ranks with different
+        # local switch settings still follow rank 0's authoritative operation.
+        prompt, i = unpack_prompt(p, i, self._kept_by_id, kid)
         n = p[i]
         packed = p[i + 1:i + 1 + n]
         i += 1 + n
@@ -754,7 +756,7 @@ class MultiDecoder:
         g, e = self.g, self.e
         hit = self._kept_by_id(a["kid"]) if a["kid"] >= 0 else None
         prompt = a["prompt"]
-        s.prompt = list(prompt)
+        s.prompt = copy_prompt(s.prompt) if isinstance(s.prompt, PromptIds) and s.prompt == prompt else list(prompt)
         cut = len(hit.ids) if hit is not None else 0
         if hit is not None and hit.ids != prompt[:cut]:
             raise RuntimeError(f"the kept prompt {a['kid']} is not a prefix of stream {a['sid']}'s prompt")
@@ -870,6 +872,7 @@ class MultiDecoder:
         snap.kid = self.next_kid
         self.next_kid += 1
         snap.extent = lane.extent
+        keep_rendered(snap, lane.s.prompt)
         for c in [c for c in self.kept if c.ids == snap.ids]:
             self._drop(c)
         lane.extent.kept.append(snap)
@@ -1773,7 +1776,7 @@ class GlmScheduler(Scheduler):
         box: queue.Queue = queue.Queue()
         if priority is None:
             priority = prio.BACKGROUND if background else self.prio.default if self.prio.enabled else prio.NORMAL
-        stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+        stream = Stream(copy_prompt(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
                         constraint=constraint, background=background, priority=int(priority), arrived=self.clock())
         stream.glm = dict(glm or {})
         self.saw(stream.priority)

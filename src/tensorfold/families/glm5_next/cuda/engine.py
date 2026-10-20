@@ -1187,6 +1187,9 @@ class GlmEngine:
         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
             self.cache = [c for c in self.cache if c is not hit] + [hit]
         for snap in kept:
+            from tensorfold.cuda.incremental import keep_rendered
+
+            keep_rendered(snap, prompt)
             self._remember(snap)
         if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
             self.cache = [c for c in self.cache if c is not hit] + [hit]
@@ -1248,6 +1251,8 @@ class GlmEngine:
                  priority: int | None = None) -> dict[str, Any]:
         """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them; ``priority``: under --parallel, the request's class (``tensorfold.cuda.priority``, patch 0141; None: from ``background``)."""
 
+        from tensorfold.cuda.incremental import copy_prompt
+
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
@@ -1260,7 +1265,7 @@ class GlmEngine:
         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
             if vision is not None and self.vision is None:
                 raise ValueError("image inputs require starting this server with --vision")
-            stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
+            stats = self.scheduler.submit(copy_prompt(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
                                           background=background, glm={"code": code, "spec": spec},
                                           priority=priority)
@@ -1302,7 +1307,7 @@ class GlmEngine:
             self._share(pack(constraint))
         if positions:
             self._share(positions)
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
+        stats = self._run(copy_prompt(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
                           shared)
         stats.update(policy=spec, drafts=draft)
         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
