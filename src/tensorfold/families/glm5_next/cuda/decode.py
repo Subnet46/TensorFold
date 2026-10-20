@@ -100,6 +100,13 @@ class Engine:
         self.w = w
         self.grid = grid
         w.meta["long_context"] = long_context
+        from . import l2pf
+
+        pf = l2pf.Settings.from_env()                        # TF_GLM_L2PF: installed before any graph capture
+        if pf.on and torch.cuda.is_available() and w.meta.get("l2pf") is None:
+            w.meta["l2pf"] = l2pf.Prefetch(w, pf)
+            if w.rank == 0:
+                print(f"[tensorfold] {w.meta['l2pf'].summary()}", flush=True)
         self.rows, self.prefill_rows = max_rows, prefill_rows
         if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
             from . import kda as kda_mod
