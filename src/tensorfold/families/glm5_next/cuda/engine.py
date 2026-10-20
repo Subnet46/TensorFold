@@ -372,11 +372,19 @@ class GlmEngine:
             weights_estimate = lambda name, info: ((math.prod(info["shape"]) * 2, 0)
                                                    if name.startswith("model.visual.") else text_weights(name, info))
 
+        from .exl3_mm import prompt_kernels
+        from .latent import SPARSE_ONEPASS
+        from .weights import exl3_route
+
+        # GLM's prompt expert kernels keep no split-K sums; the universal EXL3 route's prompt scratch does
+        lean_prompt = prompt_kernels() and (cfg.quant != "exl3" or exl3_route(str(model_dir), rank, 2) == "glm")
+
         def geometry(text):
             from tensorfold.cuda.capacity import Geometry
 
             g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
-                             mtp=self.mtp_on)
+                             mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=lean_prompt,
+                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4")
             return Geometry(lambda slots: g.bytes_at(slots) + workspace, g.reserve, g.minimum_slots) if workspace else g
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    geometry,

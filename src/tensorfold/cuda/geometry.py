@@ -245,16 +245,26 @@ def indexed_prompt_bytes(t: dict, rows: int, world: int = 1) -> int:
     return rows * _indexed_prefill_row(t, world, h, hk, hd, nv, dv, width, slots, moe)
 
 
-def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
-    """GLM's ``exl3_mm.Scratch`` for ``rows`` x ``slots`` pairs: fp16 rotated inputs and the fp32 split-K sums."""
+def exl3_expert_scratch(rows: int, slots: int, d: int, width: int, *, prompt: bool) -> int:
+    """GLM's ``exl3_mm.Scratch`` for a window of ``rows`` rows: fp16 rotated inputs of gate/up (2 x pairs x d) and down
+    (pairs x ``width``, a rank's expert width); a decode window's fp32 split-K sums (2 x 4 splits x pairs x
+    max(width, d)) and block counters (16-pair items); a prompt window's (``prompt``: TF_GLM_EXL3_PROMPT) launch order."""
 
     pairs = rows * slots
-    return 2 * pairs * d * 2 + pairs * width * 2 + 2 * 4 * pairs * max(width, d) * 4
+    total = 2 * pairs * d * 2 + pairs * width * 2
+    if prompt:
+        return total + 4 + 4 + (pairs // 16 + 1024) * 4
+    return total + 2 * 4 * pairs * max(width, d) * 4 + (pairs + pairs // 16 + 1) * max(1, width // 128) * 4 + 4
 
 
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
-                 prefill_rows: int = PREFILL_ROWS, mtp: bool | None = None) -> Geometry:
-    """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
+                 prefill_rows: int = PREFILL_ROWS, mtp: bool | None = None, onepass: bool = False,
+                 exl3_prompt: bool = True, prompt_split_k: bool = True) -> Geometry:
+    """GLM's engine: ``mtp`` whether it holds the MTP head's caches and decode buffers (None: when the checkpoint has
+    one; GLM's TF_GLM_MTP can leave it out); ``onepass``: prompt chunks' sparse latent attention keeps no partials
+    (TF_GLM_SPARSE_ONEPASS); an EXL3 checkpoint's ``exl3_prompt``: prompt chunks run the prompt expert kernels
+    (TF_GLM_EXL3_PROMPT: no split-K sums), ``prompt_split_k``: the prompt buffers keep split-K partials for BF16 / FP8
+    projections (``forward.Buffers.sk``)."""
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
     heads = int(t["num_attention_heads"]) // world
@@ -277,15 +287,18 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     # prompt-chunk buffers: at most 5 row extents a row without the head
     fixed += prefill_rows * 5 * (extent - int(t["vocab_size"]) // world)
     if (t.get("_quantization") or {}).get("quant_method") == "exl3":
-        # EXL3 experts' scratch (decode windows, the MTP head's, a prompt chunk) and the prompt's BF16 split-K partials
-        fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width)
-        fixed += exl3_expert_scratch(prefill_rows, slots, d, width) + 8 * prefill_rows * 16384 * 4
+        # the routed experts' scratch of the decode windows (the MTP head's too) and of a prompt chunk, and the prompt
+        # buffers' split-K partials (8 x rows x 16,384 fp32, as forward.Buffers allocates them)
+        fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width, prompt=False)
+        fixed += exl3_expert_scratch(prefill_rows, slots, d, width, prompt=exl3_prompt)
+        fixed += 8 * prefill_rows * 16384 * 4 if prompt_split_k else 0
     count = attention + int(mtp)
     lw = int(t.get("kv_lora_rank", 512))
     def bytes_at(capacity: int) -> int:
-        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows)
+        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows, onepass=onepass)
         if latent:
-            # latent cache; a prompt chunk's partials (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
+            # latent cache; a prompt chunk's latent partials (its dense pass runs MLA_PROMPT_ATT_ROWS rows at a time)
+            # and absorbed rows (the MTP absorbs through the same buffers)
             cache = count * capacity * lw * 2
             dense = min(capacity, minimum_slots) + prefill_rows
             scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
@@ -298,12 +311,16 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     return Geometry(bytes_at, reserve, minimum_slots)
 
 
-def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, prefill_rows: int = PREFILL_ROWS) -> int:
-    """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse attention's partials."""
+def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, prefill_rows: int = PREFILL_ROWS,
+                      onepass: bool = False) -> int:
+    """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse
+    attention's partials, which the latent path's one-pass kernel (``onepass``) does not allocate."""
 
     heads, topk = int(t["num_attention_heads"]) // world, int(t.get("index_topk", 2048))
     # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
     select = min(prefill_rows, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + prefill_rows * 16 * (topk + 3)
+    if latent and onepass:
+        return select
     if latent:
         return select + ((topk + 515) // 512) * prefill_rows * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))

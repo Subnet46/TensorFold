@@ -594,7 +594,9 @@ def chunk_stages() -> int:
 
 
 class LatentScratch:
-    """Chunk partials for ``part_rows`` (one ``attention`` call) x heads x chunks; queries and latents for ``rows``."""
+    """Chunk partials for up to part_rows x heads x chunks (``part_rows``: the rows one ``attention`` call takes,
+    default ``rows``; a prompt chunk's dense pass runs in blocks of them), the absorbed queries and the attended
+    latents of up to ``rows``."""
 
     def __init__(self, rows: int, heads: int, chunks: int, device, lw: int = L, part_rows: int | None = None) -> None:
         part_rows = rows if part_rows is None else min(rows, part_rows)
