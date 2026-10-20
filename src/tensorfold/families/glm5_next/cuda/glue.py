@@ -439,3 +439,28 @@ def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
     rows, d = out.shape
     block = min(1024, d)
     _combine[(rows, d // block)](y, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+
+
+@triton.jit
+def _combine_sy(Y, SY, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
+    """``_combine`` with the shared expert's row read from SY [R, D] fp32 instead of Y's last slot: the same terms
+    (w_k y_k, the shared one times its weight 1) added in the same slot order, so the same bits."""
+
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    d = c * BLOCK + tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in tl.static_range(SLOTS - 1):
+        acc = acc + tl.load(Y + (r * SLOTS + k) * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + k)
+    acc = acc + tl.load(SY + r * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + SLOTS - 1)
+    tl.store(OUT + r * D + d, acc)
+
+
+def combine_shared(y: torch.Tensor, sy: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
+    """combine(y with its last slot replaced by sy): y [R, slots, D] (the last slot not read), sy [R, D] fp32."""
+
+    rows, d = out.shape
+    if y.dtype != torch.float32 or sy.dtype != torch.float32 or not (y.is_contiguous() and sy.is_contiguous()):
+        raise ValueError("combine_shared: contiguous fp32 expert rows")
+    block = min(1024, d)
+    _combine_sy[(rows, d // block)](y, sy, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)

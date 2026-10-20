@@ -210,15 +210,25 @@ __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
 
 // Program (member row, 128-block of K, matrix): Xh[mat][row][block] = fp16((x[row] * suh[mat][e]) @ H) for the
 // gate and up projections of every routed slot (row, slot) with slot < slots - 1 (the last slot is the shared
-// expert). One warp per program.
+// expert). One warp per program. ROWS (prompt chunks of a layer whose experts all share one suh for gate and up):
+// program (row, block) writes Xh[row][block] from suh0 = that vector, the same arithmetic as every pair's input of
+// that row, so each pair's fp16 input has the same bits, computed once a row instead of 2 x top_k times.
+template <bool ROWS>
 __global__ void rot_in_kernel(const __nv_bfloat16* __restrict__ x, int x_stride, const int* __restrict__ pick,
                               const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
                               half* __restrict__ out1, int K, int slots) {
     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
-    const int row = p / slots, slot = p % slots;
-    if (slot == slots - 1) return;
+    int row, e;
+    if (ROWS) {
+        row = p;
+        e = 0;
+    } else {
+        row = p / slots;
+        const int slot = p % slots;
+        if (slot == slots - 1) return;
+        e = pick[row * slots + slot];
+    }
     const int lane = threadIdx.x;
-    const int e = pick[row * slots + slot];
     const half* suh = (mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane;
     const __nv_bfloat16* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
     float v[4];
@@ -327,13 +337,15 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
 // pass of PM members with NW warps: each warp holds MT = 16 / NW m tiles for all PM members (PM / 8 n blocks), so a
 // decoded tile feeds PM / 8 mma. PM 64 / 8 warps (two blocks an SM) or PM 128 / 16 warps (one): the same per-element
 // chains, so the same bits. Every stage brings the members' next PBK k values and the 16 tiles' trellis words into
-// shared memory (cp.async, PSTAGES deep).
+// shared memory (cp.async, PSTAGES deep). SHX (gate/up of a layer whose experts share one suh for both): gate and up
+// read the same member rows (X0 = X1 = the per-row Xh, the members' rows from xrows), so a stage holds them once.
 constexpr int PWORDS = 16 * PKT * 32;          // a stage's trellis words (16 m tiles x PKT k tiles x 32)
 
-template <int MATS, int PM, int NW>
+template <int MATS, int PM, int NW, bool SHX = false>
 struct PromptCfg {
     static constexpr int MT = 16 / NW, NB = PM / 8, T = NW * 32;
-    static constexpr size_t STAGE_HALVES = (size_t)MATS * PM * PXS + 2 * PWORDS;
+    static constexpr int XM = SHX ? 1 : MATS;               // member-row copies a stage holds
+    static constexpr size_t STAGE_HALVES = (size_t)XM * PM * PXS + 2 * PWORDS;
 };
 
 // Which (matrix, m tile) warp-tile q (0..15) of block cb is.
@@ -343,12 +355,12 @@ __device__ __forceinline__ void prompt_tile(int q, int cb, int& mat, int& nt) {
     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
 }
 
-template <int MATS, int PM, int NW>
+template <int MATS, int PM, int NW, bool SHX = false>
 __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
                                                 const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
                                                 const int* rows_sh, int cnt, int e, int K, int NTILES, int cb,
                                                 half* stage, float (&acc)[16 / NW][PM / 8][4]) {
-    using C = PromptCfg<MATS, PM, NW>;
+    using C = PromptCfg<MATS, PM, NW, SHX>;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int mat, nt_unused;
     prompt_tile<MATS>(warp * C::MT, cb, mat, nt_unused);
@@ -365,14 +377,14 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
     auto load = [&](int chunk) {
         half* dst = stage + (size_t)(chunk % PSTAGES) * C::STAGE_HALVES;
         const int k0 = chunk * PBK;
-        for (int idx = threadIdx.x; idx < MATS * PM * (PBK / 8); idx += C::T) {
+        for (int idx = threadIdx.x; idx < C::XM * PM * (PBK / 8); idx += C::T) {
             const int m = idx / (PM * (PBK / 8)), rem = idx % (PM * (PBK / 8)), i = rem / (PBK / 8),
                       j = rem % (PBK / 8);
             const int r = rows_sh[i];
             const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : r) * K + k0 + j * 8;
             cp_async16(dst + ((size_t)m * PM + i) * PXS + j * 8, src, r >= 0);
         }
-        uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)MATS * PM * PXS);
+        uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)C::XM * PM * PXS);
         for (int idx = threadIdx.x; idx < 16 * PKT * 8; idx += C::T) {       // 16 B pieces of 128-B tile words
             const int q = idx / (PKT * 8), kk = (idx / 8) % PKT, part = idx % 8;
             int wm, nt;
@@ -392,8 +404,8 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
         if (c + PSTAGES - 1 < chunks) load(c + PSTAGES - 1);
         cp_async_commit();
         const half* base = stage + (size_t)(c % PSTAGES) * C::STAGE_HALVES;
-        const half* xs = base + (size_t)mat * PM * PXS;
-        const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)MATS * PM * PXS);
+        const half* xs = base + (size_t)(SHX ? 0 : mat) * PM * PXS;
+        const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)C::XM * PM * PXS);
 #pragma unroll
         for (int kk = 0; kk < PKT; ++kk) {
             uint32_t a[C::MT][4];
@@ -442,34 +454,41 @@ __device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const f
 }
 
 constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;
-template <int PM>
+template <int PM, int XM = 2>
 constexpr size_t prompt_smem() {
-    // max of: gate/up stages, down stages, gate/up epilogue half (2 x PM/2 x GU_ES), down half (PM/2 x DN_ES)
-    const size_t gu = (size_t)PSTAGES * (2 * PM * PXS + 2 * PWORDS) * 2;
+    // max of: gate/up stages (XM copies of the member rows), down stages, gate/up epilogue half (2 x PM/2 x GU_ES),
+    // down half (PM/2 x DN_ES)
+    const size_t gu = (size_t)PSTAGES * (XM * PM * PXS + 2 * PWORDS) * 2;
     const size_t ep = (size_t)2 * (PM / 2) * GU_ES * 4;
     const size_t dn = (size_t)(PM / 2) * DN_ES * 4;
     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
 }
 
-template <int PM, int NW>
+// SHX: Xg = Xu = Xh [rows, K], one row a token (pair p reads row p / slots); otherwise Xg, Xu [pairs, K].
+template <int PM, int NW, bool SHX>
 __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
     const half* __restrict__ Xg, const half* __restrict__ Xu, const uint32_t* __restrict__ Tg,
     const uint32_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
     const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,
-    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit) {
+    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit, int slots) {
     constexpr int MT = 16 / NW, PH = PM / 2;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __shared__ int rows_sh[PM];
+    __shared__ int xrows_sh[SHX ? PM : 1];              // SHX: the members' token rows
     const int cb = blockIdx.x, item = blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
     if (e >= E) return;                                  // the shared expert
-    if (threadIdx.x < PM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+    if (threadIdx.x < PM) {
+        const int p = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+        rows_sh[threadIdx.x] = p;
+        if (SHX) xrows_sh[threadIdx.x] = p < 0 ? -1 : p / slots;
+    }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[MT][PM / 8][4];
-    prompt_mainloop<2, PM, NW>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, reinterpret_cast<half*>(smem_raw),
-                               acc);
+    prompt_mainloop<2, PM, NW, SHX>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
+                                    reinterpret_cast<half*>(smem_raw), acc);
     float* Eg = reinterpret_cast<float*>(smem_raw);
     int mat, nt;
     prompt_tile<2>(warp * MT, cb, mat, nt);
@@ -586,10 +605,21 @@ void exl3_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& p
                       const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, int64_t rows, int64_t K,
                       int64_t slots) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
-    rot_in_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+    rot_in_kernel<false><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, pick.data_ptr<int>(),
         reinterpret_cast<const half*>(suh0.data_ptr()), reinterpret_cast<const half*>(suh1.data_ptr()),
         reinterpret_cast<half*>(out0.data_ptr()), reinterpret_cast<half*>(out1.data_ptr()), (int)K, (int)slots);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Xh [rows, K] fp16 = fp16((x[row] * suh) @ H) block by block, suh [K] fp16: rot_in's arithmetic once a row.
+void exl3_rot_rows_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh, at::Tensor& out, int64_t rows,
+                        int64_t K) {
+    dim3 grid((unsigned)rows, (unsigned)(K / 128), 1);
+    auto s = reinterpret_cast<const half*>(suh.data_ptr());
+    auto o = reinterpret_cast<half*>(out.data_ptr());
+    rot_in_kernel<true><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, nullptr, s, s, o, o, (int)K, 1);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -620,10 +650,13 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
                           const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
                           const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
                           const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
-                          int64_t N, int64_t E, int64_t max_items, double limit) {
-    constexpr size_t SMEM = prompt_smem<PM>();
+                          int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx) {
+    constexpr size_t SMEM = prompt_smem<PM>(), SMEM_SHX = prompt_smem<PM, 1>();
     static bool once = [] {
-        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)SMEM);
+        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)SMEM_SHX);
         cudaFuncSetAttribute(prompt_down_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
         return true;
     }();
@@ -631,9 +664,17 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
     auto stream = at::cuda::getCurrentCUDAStream();
     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
-    prompt_gateup_kernel<PM, NW><<<dim3((unsigned)(N / 128), (unsigned)max_items), NW * 32, SMEM, stream>>>(
-        h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
-        h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E, (float)limit);
+    const dim3 gu_grid((unsigned)(N / 128), (unsigned)max_items);
+    if (shx)
+        prompt_gateup_kernel<PM, NW, true><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
+            h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+            h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
+            (float)limit, (int)slots);
+    else
+        prompt_gateup_kernel<PM, NW, false><<<gu_grid, NW * 32, SMEM, stream>>>(
+            h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+            h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
+            (float)limit, (int)slots);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
         reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
@@ -645,14 +686,14 @@ void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tens
                       const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
                       const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
                       const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
-                      int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass) {
+                      int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots, bool shx) {
     TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % PBK == 0 && N % PBK == 0, "prompt experts: shapes");
     if (pass == 128)
         prompt_launch<128, 16>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N,
-                               E, max_items, limit);
+                               E, max_items, limit, slots, shx);
     else if (pass == 64)
         prompt_launch<64, 8>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
-                             max_items, limit);
+                             max_items, limit, slots, shx);
     else
         TORCH_CHECK(false, "prompt experts: passes of 64 or 128 members");
 }

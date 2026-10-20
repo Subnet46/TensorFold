@@ -11,6 +11,8 @@ from tensorfold.cuda.geometry import MLA_SELECT_ROWS as SELECT_ROWS   # a prompt
 POOL = 4
 TOPK_POOLS = 512
 BR = 16
+# the first position whose row select_tokens counts (npool > TOPK_POOLS): rows before it keep dense attention
+SPARSE_FROM = (TOPK_POOLS + 1) * POOL - 1
 
 
 @triton.jit
@@ -177,12 +179,55 @@ def pool_bucket(pos: int, R: int, np_max: int) -> int:
     return min(np_max, max(1024, 1 << (visible - 1).bit_length()))
 
 
+PROMPT_ROWS = 64          # windows from this many rows (prompt chunks, eager) take the prompt selection below
+
+
+def pool_count(pos: int, R: int, np_max: int) -> int:
+    """Pools a prompt chunk scores: the visible ones rounded up to a multiple of 1,024 (at most ``pool_bucket``)."""
+    visible = (pos + R) // POOL + 1
+    return min(np_max, -(-visible // 1024) * 1024)
+
+
+def score_rows() -> int:
+    """TF_GLM_SCORE_RB: rows a prompt chunk's _scores program takes (1, 2, 4 or 8; each pool tile loaded once for
+    them, the same bits: row r's pool keys are masked to its own pools before the dot). At most 8: a block's key load
+    then stays within the pool cache's rows (capacity // 4 + 2)."""
+    import os
+
+    value = int(os.environ.get("TF_GLM_SCORE_RB", "4"))
+    if value not in (1, 2, 4, 8):
+        raise ValueError(f"TF_GLM_SCORE_RB is 1, 2, 4 or 8, not {value}")
+    return value
+
+
+@triton.jit
+def _tokens(POOLS, POS, TOK, CNT, W: tl.constexpr, K: tl.constexpr, PL: tl.constexpr, BLOCK: tl.constexpr):
+    """Program r: TOK[r] = the K pools' tokens ascending (pool * PL + j), then the incomplete last pool's visible
+    tokens (-1 past row r's position); CNT[r] = their count when the row has more than K complete pools, else 0."""
+    r = tl.program_id(0).to(tl.int64)
+    q = tl.load(POS).to(tl.int64) + r
+    npool = (q + 1) // PL
+    for c in tl.static_range(0, K * PL, BLOCK):
+        i = c + tl.arange(0, BLOCK)
+        p = tl.load(POOLS + r * K + i // PL)
+        tl.store(TOK + r * W + i, (p * PL + i % PL).to(tl.int32))
+    j = tl.arange(0, 4)
+    jok = j < PL - 1
+    tail = npool * PL + j
+    ok = jok & (tail <= q)
+    tl.store(TOK + r * W + K * PL + j, tl.where(ok, tail, -1).to(tl.int32), mask=jok)
+    n = K * PL + tl.sum(ok.to(tl.int64), 0)
+    tl.store(CNT + r, tl.where(npool > K, n, 0).to(tl.int32))
+
+
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int | None, R: int, np_max: int,
                   pos_dev: torch.Tensor, *, bucket: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Each row's attended tokens [R, 2051] ascending (-1 padded) and their count past the dense limit; ``bucket`` fixes the pool count for graphs."""
 
     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
+    if bucket is None and pos is not None and R >= PROMPT_ROWS:
+        return _select_prompt(qi, wts, pk, pos, R, np_max, pos_dev)
     # score only visible pools, rounded up to a power of two so the allocator reuses a few sizes (exact sizes fragmented memory at 128k)
     np_max = bucket if bucket is not None else pool_bucket(pos, R, np_max)
     # rows scored SELECT_ROWS at a time over the window's np_max pools (the same columns, so the same bits a row)
@@ -213,6 +258,38 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
     tail_ok = tail <= q[:, None]
     tokens[:, TOPK_POOLS * POOL:] = torch.where(tail_ok, tail, -1)
     counts = torch.where(npool > TOPK_POOLS, TOPK_POOLS * POOL + tail_ok.sum(1), 0).to(torch.int32)
+    return tokens, counts
+
+
+def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
+                   pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """select_tokens for a prompt chunk, with select_tokens' counts and, for every counted row, its tokens:
+
+    - it scores NP = pool_count pools, not pool_bucket's power of two: the columns left out lie past every row's
+      visible pools, where _scores writes -inf, and they have the highest indices, so they rank below every column
+      kept (-inf ties go to the lower pool; a negative NaN, the one key below -inf's, is never an arithmetic result
+      on the GPU). A counted row has more than 512 visible pools and NP >= 1024 >= 512, so its best 512 pools, the
+      radix select's threshold and ties are the same. (Rows with count 0, whose tokens nothing reads, may differ.)
+      The scores buffer keeps pool_bucket's size (the allocator's few sizes), used as a contiguous [R, NP] prefix;
+    - _scores takes score_rows() rows a program: a row's keys are masked to its own pools before its dot, as with 1;
+    - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
+
+    dev = qi.device
+    NP = pool_count(pos, R, np_max)
+    scores = torch.empty((R * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=dev)[:R * NP].view(R, NP)
+    H = wts.shape[1]
+    D = qi.shape[1] // H
+    wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+    rb = score_rows()
+    _scores[(triton.cdiv(R, rb), triton.cdiv(NP, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, NP, D ** -0.5,
+                                                       wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
+                                                       RB=rb, num_warps=4)
+    pools = top_pools(scores, TOPK_POOLS)                                               # ascending pool index
+    del scores
+    width = TOPK_POOLS * POOL + POOL - 1
+    tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
+    counts = torch.empty((R,), dtype=torch.int32, device=dev)
+    _tokens[(R,)](pools, pos_dev, tokens, counts, W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024, num_warps=4)
     return tokens, counts
 
 

@@ -325,12 +325,23 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R)
 
 
+def dense_rows(c, R: int, host_pos: int | None) -> int:
+    """Rows of a window from ``host_pos`` that keep dense attention: those before the first position select_tokens
+    gives a sparse count (sparse_attention overwrites every row from there). All R when the position is not known
+    on the host or the config's dense limit is not the selection's."""
+
+    if host_pos is None or c.dense_limit != sparse.SPARSE_FROM:
+        return R
+    return min(R, max(0, sparse.SPARSE_FROM - host_pos))
+
+
 def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s: latent.LatentScratch, *,
-                    scale: float, nch: int, out: torch.Tensor) -> torch.Tensor:
-    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row."""
+                    scale: float, nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
+    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row
+    (``hb``: the window's ``head_block``, which a window's first rows computed alone keep)."""
 
     R, step = qa.shape[0], s.part_rows
-    hb = latent.head_block(R)
+    hb = latent.head_block(R) if hb is None else hb
     if R <= step:
         return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb)
     for r0 in range(0, R, step):
@@ -364,16 +375,22 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
     if not all_sparse:
-        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it.
+        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
+        # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
+        dense = dense_rows(c, R, host_pos) if sparse_rows else R
         with prof.timed("dsa: dense attention"):
-            dense_attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
+            dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
+                            hb=latent.head_block(R))
     if sparse_rows:
         with prof.timed("dsa: select tokens"):
             mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
             tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
-            latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+            if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
+                latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
+            else:
+                latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
     with prof.timed("dsa: expand"):
         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
@@ -409,8 +426,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
             glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
             mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
         with prof.timed("moe: combine"):
-            b.ey[:R, c.top_k].copy_(b.sy[:R])
-            glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+            if b.prefill:                # the shared row read from sy where it is (the copy's bits, one pass less)
+                glue.combine_shared(b.ey[:R], b.sy[:R], b.wts[:R], b.part[:R])
+            else:
+                b.ey[:R, c.top_k].copy_(b.sy[:R])
+                glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
         with prof.timed("moe: all-gather"):
             return gather(w, b, R)
     with prof.timed("moe: gate/up"):

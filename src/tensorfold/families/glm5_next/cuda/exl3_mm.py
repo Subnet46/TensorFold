@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -43,7 +43,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v14", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v15", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -63,10 +63,29 @@ class Exl3Experts:
     count: int
     width: int                # NI: this rank's share of the expert width
     dims: int                 # D
+    # [D] fp16 when every expert's gate and up share one suh bitwise (found at construction; GLM-5.3-Flash's
+    # EXL3 checkpoint, every MoE layer): prompt chunks then rotate each row's input once (``rot_rows``)
+    shared_suh: torch.Tensor | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        self.shared_suh = shared_suh(self.suh_g, self.suh_u)
 
     def nbytes(self) -> int:
+        extra = () if self.shared_suh is None else (self.shared_suh,)
         return sum(t.numel() * t.element_size() for t in (self.gt, self.ut, self.dt, self.suh_g, self.suh_u,
-                                                         self.svh_g, self.svh_u, self.suh_d, self.svh_d))
+                                                         self.svh_g, self.svh_u, self.suh_d, self.svh_d, *extra))
+
+
+def shared_suh(suh_g: torch.Tensor, suh_u: torch.Tensor) -> torch.Tensor | None:
+    """The one input scale vector [D] if every expert's gate and up suh equal it bit for bit (-0 is not +0), else
+    None. Every pair's rotated input x_row * suh @ H is then the row's alone, whatever expert or matrix it feeds."""
+
+    if suh_g.dim() != 2 or suh_g.shape != suh_u.shape or suh_g.dtype != torch.float16 or suh_u.dtype != suh_g.dtype:
+        return None
+    g, u = suh_g.view(torch.int16), suh_u.view(torch.int16)
+    if not (bool(torch.equal(g, g[:1].expand_as(g))) and bool(torch.equal(u, g))):
+        return None
+    return suh_g[0].clone().contiguous()
 
 
 def words(trellis: torch.Tensor) -> torch.Tensor:
@@ -96,6 +115,14 @@ def prompt_kernels() -> bool:
     return os.environ.get("TF_GLM_EXL3_PROMPT", "1") != "0"
 
 
+def row_rotation() -> bool:
+    """TF_GLM_EXL3_ROWROT (default on): prompt chunks of layers whose experts share one gate/up suh rotate each row's
+    input once and load it once for gate and up (the same fp16 inputs, so the same bits); 0: per pair, as decode."""
+    import os
+
+    return os.environ.get("TF_GLM_EXL3_ROWROT", "1") != "0"
+
+
 class Scratch:
     """Per-window buffers for up to ``rows`` rows of ``slots`` slots (the last slot is the shared expert's); a
     prompt window's (``prompt``) kernels keep no split partials."""
@@ -118,11 +145,17 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
     slots, P = s.slots, s.rows * s.slots
     D, NI = ex.dims, ex.width
     if plan.tile in (64, 128):                       # a prompt window: the Y^T kernels, an item a pass
-        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
-        ext.prompt(s.xg, s.xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
+        shx = ex.shared_suh is not None and row_rotation()
+        if shx:                                      # one rotated input a row, read by all its pairs' gate and up
+            ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
+            xg = xu = s.xg
+        else:
+            ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+            xg, xu = s.xg, s.xu
+        ext.prompt(xg, xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
                    ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
                                                                                    plan.tile), float(limit),
-                   plan.tile)
+                   plan.tile, slots, shx)
         return
     if plan.tile != grouped.TILE:
         raise ValueError("the EXL3 kernel takes items of 16 pairs")

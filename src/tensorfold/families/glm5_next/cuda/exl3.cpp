@@ -14,7 +14,8 @@ void exl3_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Ten
 void exl3_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                       const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
-                      double, int64_t);
+                      double, int64_t, int64_t, bool);
+void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -52,6 +53,16 @@ void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const
     exl3_rot_in_cuda(x, x_stride, pick, suh0, suh1, out0, out1, rows, K, slots);
 }
 
+// Xh [rows, K] = rot_in's input rotation once a row, for a layer whose experts all share one suh for gate and up.
+void rot_rows(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh, at::Tensor out, int64_t rows, int64_t K) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16, "x: bf16 CUDA");
+    check(suh, at::kHalf, "suh");
+    check(out, at::kHalf, "out");
+    TORCH_CHECK(K % 128 == 0 && suh.numel() == K && out.numel() >= rows * K, "rot_rows: shapes");
+    c10::cuda::CUDAGuard guard(x.device());
+    exl3_rot_rows_cuda(x, x_stride, suh, out, rows, K);
+}
+
 void gateup_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g, const at::Tensor& svh_u,
                      const at::Tensor& suh_d, at::Tensor xd, int64_t rows, int64_t P, int64_t N, int64_t SK,
                      int64_t slots, double limit) {
@@ -81,20 +92,23 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
             const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
             const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
             at::Tensor xd, at::Tensor y, int64_t D, int64_t N, int64_t E, int64_t max_items, double limit,
-            int64_t pass) {
+            int64_t pass, int64_t slots, bool shx) {
     const at::cuda::CUDAGuard guard(Xg.device());
     for (auto* t : {&Xg, &Xu, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "prompt: fp16 input");
     for (auto* t : {&Tg, &Tu, &Td, &items, &counts, &members}) check(*t, at::kInt, "prompt: int32 input");
     check(xd, at::kHalf, "prompt: xd");
     check(y, at::kFloat, "prompt: y");
+    TORCH_CHECK(!shx || Xg.data_ptr() == Xu.data_ptr(), "prompt: shared rows take one Xh for gate and up");
+    TORCH_CHECK(slots > 0, "prompt: slots");
     exl3_prompt_cuda(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
-                     max_items, limit, pass);
+                     max_items, limit, pass, slots, shx);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
     m.def("prompt", &prompt);
     m.def("rot_in", &rot_in);
+    m.def("rot_rows", &rot_rows);
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);
 }
