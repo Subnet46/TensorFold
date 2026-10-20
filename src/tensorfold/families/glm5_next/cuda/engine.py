@@ -17,7 +17,48 @@ DEFAULT_POLICY = "auto"
 DFLASH_POLICY = os.environ.get("TF_GLM_DFLASH_POLICY", "").strip() or "fc5:0.3"
 EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
 GRAPH_ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # verify windows (and MTP steps) captured as CUDA graphs; wider ones run eagerly
-MAX_ROWS = 16                         # the widest verify window (a pending token and up to 15 drafts: copy drafts)
+
+
+def max_rows(value: str | None = None) -> int:
+    """TF_GLM_MAX_ROWS: the widest verify window, 16 (default) to 64 in steps of 8 (``geometry.MLA_DECODE_ROWS``,
+    which the startup estimate sizes decode buffers for). Wider windows serve copy drafts only (TF_GLM_COPY_MAX up to
+    this minus one); past 16 rows a window's all-gathers exceed TF_ROCE_MAX_KB's default 256 KiB (16 KiB a row) and
+    go through NCCL unless it is raised (TF_ROCE_MAX_KB=512 for 32 rows)."""
+
+    from tensorfold.cuda.geometry import MLA_DECODE_ROWS
+
+    value = (os.environ.get("TF_GLM_MAX_ROWS", "") if value is None else value).strip()
+    if value == "":
+        return 16
+    if not value.isdecimal() or not 16 <= int(value) <= MLA_DECODE_ROWS or int(value) % 8:
+        raise ValueError(f"TF_GLM_MAX_ROWS: 16 to {MLA_DECODE_ROWS} in steps of 8, not {value!r}")
+    return int(value)
+
+
+MAX_ROWS = max_rows()                 # the widest verify window (a pending token and up to 15 drafts: copy drafts)
+
+
+def wide_graphs(value: str | None = None, most: int | None = None) -> tuple[int, ...]:
+    """TF_GLM_WIDE_GRAPHS: verify-window widths past GRAPH_ROWS (9 to TF_GLM_MAX_ROWS) that also replay CUDA graphs,
+    comma separated (e.g. ``16`` or ``16,32``; off by default: wider windows run eagerly). Copy drafts pad a window
+    that falls short of a captured width up to it (``copy_drafts.CopySettings.pad``). Each width costs a graph a KDA
+    parity, and one more a pool bucket past the dense limit, at startup."""
+
+    most = MAX_ROWS if most is None else most
+    value = (os.environ.get("TF_GLM_WIDE_GRAPHS", "") if value is None else value).strip()
+    if value in ("", "0"):
+        return ()
+    out = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part.isdecimal() or not max(GRAPH_ROWS) < int(part) <= most:
+            raise ValueError(f"TF_GLM_WIDE_GRAPHS: widths from {max(GRAPH_ROWS) + 1} to {most} (TF_GLM_MAX_ROWS), "
+                             f"comma separated, not {value!r}")
+        out.add(int(part))
+    return tuple(sorted(out))
+
+
+WIDE_GRAPHS = wide_graphs()
 MTP_ROWS = 8                          # rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
@@ -352,7 +393,7 @@ class GlmEngine:
 
         # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of
         # the MTP head and DFlash2; both ranks must agree, so the settings join the startup comparison below
-        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
+        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1, pad=WIDE_GRAPHS)
         from .hcsplit import SplitSettings
 
         # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
@@ -472,9 +513,10 @@ class GlmEngine:
             verify_code = 1 + ("batched", "serial").index(verify_kind())
         # both ranks must run the same calls: refuse to start when they were given different settings
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0]) + \
+                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
-                                 parallel, verify_code]
+                                 parallel, verify_code, MAX_ROWS, len(WIDE_GRAPHS), sum(WIDE_GRAPHS),
+                                 max(WIDE_GRAPHS, default=0)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -485,7 +527,7 @@ class GlmEngine:
                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
-                               "TF_GLM_MULTI_VERIFY): "
+                               "TF_GLM_MULTI_VERIFY, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -534,13 +576,21 @@ class GlmEngine:
 
             self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
-                        graph_rows=GRAPH_ROWS, long_context=long_context,
+                        graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
                         split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows)
         if self.e.pbuf.split is not None:
             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
             if rank == 0:
                 print(f"[tensorfold] {self.split.describe()}", flush=True)
+        c = self.copy
+        if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
+            print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "
+                  f"{', '.join(map(str, GRAPH_ROWS + WIDE_GRAPHS))} rows (TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS)"
+                  + (f"; copies from the reply match {c.reply_match} tokens (TF_GLM_COPY_REPLY_MATCH)"
+                     if c is not None and c.reply_match else "")
+                  + (f"; {c.miss_most} copied drafts after a copied round that missed (TF_GLM_COPY_MISS_MAX)"
+                     if c is not None and c.miss_most else ""), flush=True)
         if rank == 0 and self.dump is not None:
             print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
                   f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
@@ -898,9 +948,7 @@ class GlmEngine:
         policy = decode_policy(code, self.costs)
         copies = None
         if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
-            from .copy_drafts import CopyDrafts
-
-            copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
+            copies = self.copy.drafts(list(prompt) + [first])
         if policy is None:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
         elif self.dump is not None and drafter is not None:      # serial's reply, the drafter's view recorded

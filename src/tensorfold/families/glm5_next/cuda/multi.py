@@ -794,7 +794,9 @@ class MultiDecoder:
         lane.decoding = True
         s.started = time.perf_counter()
         if lane.policy is not None and self.g.copy is not None:
-            lane.copies = CopyDrafts(list(prompt) + [first], self.g.copy.match, self.g.copy.most)
+            c = self.g.copy                 # no pads: batched windows are not the single-stream widths
+            lane.copies = CopyDrafts(list(prompt) + [first], c.match, c.most, prompt=n, reply_match=c.reply_match,
+                                     miss_most=c.miss_most)
         if lane.policy is not None:
             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
         return first
