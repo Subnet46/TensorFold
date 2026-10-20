@@ -27,7 +27,9 @@ kernels (the prompt matmul gives every row range the same bits), so every bit is
 
 TF_GLM_HC_EXCHANGE: ``p2p`` (the default) swaps rows with ncclSend/ncclRecv; ``gather`` uses the NCCL all-gather
 instead (whole halves, one piece: the partial halves out of place into the unused all-gather buffer, the bf16 rows in
-place), the same bytes on the wire, for when NCCL's point-to-point path is slower or misbehaves on a fabric."""
+place), the same bytes on the wire, for when NCCL's point-to-point path is slower or misbehaves on a fabric; ``ce``
+(patch 0122, module ``ce``) moves them with the GPUs' copy engines peer to peer through CUDA IPC (every rank on one
+host), with the p2p layout and pieces: the same bytes in the same places."""
 
 from __future__ import annotations
 
@@ -39,7 +41,7 @@ import torch
 
 from . import glue
 
-EXCHANGES = ("p2p", "gather")
+EXCHANGES = ("p2p", "gather", "ce")
 
 
 def _flag(env, name: str) -> bool:
@@ -83,9 +85,9 @@ class SplitSettings:
 
     split: bool = False
     overlap: bool = False
-    pieces: int = 2               # TF_GLM_OVERLAP_PIECES: row pieces a site's swaps run in (overlap, p2p only)
+    pieces: int = 2               # TF_GLM_OVERLAP_PIECES: row pieces a site's swaps run in (overlap, p2p or ce)
     min_rows: int = 64            # TF_GLM_HC_SPLIT_MIN_ROWS: shorter chunks (a prompt's tail) run unsplit
-    exchange: str = "p2p"         # TF_GLM_HC_EXCHANGE: p2p (ncclSend/ncclRecv) or gather (the all-gather)
+    exchange: str = "p2p"         # TF_GLM_HC_EXCHANGE: p2p (ncclSend/ncclRecv), gather (the all-gather), ce (copy engines)
     fronts: bool = False          # TF_GLM_PREFILL_OVERLAP=2: the next block's front on own rows during the swaps
 
     def __post_init__(self) -> None:
@@ -110,7 +112,7 @@ class SplitSettings:
                    _int(env, "TF_GLM_HC_SPLIT_MIN_ROWS", 64, 2, 16384), exchange, fronts=level == "2")
 
     def piece_count(self) -> int:
-        return self.pieces if self.overlap and self.exchange == "p2p" else 1
+        return self.pieces if self.overlap and self.exchange in ("p2p", "ce") else 1
 
     def code(self) -> list[int]:
         if not self.split:
@@ -120,7 +122,8 @@ class SplitSettings:
 
     def describe(self) -> str:
         what = "rows split between the ranks"
-        what += ", exchanges by " + ("send/receive" if self.exchange == "p2p" else "all-gather")
+        what += ", exchanges by " + {"p2p": "send/receive", "gather": "all-gather",
+                                      "ce": "copy engines (CUDA IPC)"}[self.exchange]
         if self.overlap:
             n = self.piece_count()
             what += f" on a second stream{f' in {n} pieces' if n > 1 else ''}"
@@ -152,7 +155,12 @@ class HcSplit:
         self.rank = w.rank
         self.peer = 1 - w.rank if two else None
         self.peers = [r for r in range(world) if r != w.rank]
-        self.gather = not p2p
+        self.gather = settings.exchange == "gather"
+        # TF_GLM_HC_EXCHANGE=ce: the copy-engine exchange (``ce.CeExchange``), set up by ``warm`` on every rank; it
+        # takes the [N, n, D] staging blocks of more than two ranks at any world size
+        self.ce_mode = settings.exchange == "ce"
+        self.ce = None
+        self.blocks = world > 2 or self.ce_mode
         # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
         self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
         self.active = False
@@ -180,8 +188,18 @@ class HcSplit:
         return R >= self.settings.min_rows and self.padded(R) <= getattr(self.b, "alloc_rows", self.b.rows)
 
     def warm(self) -> None:
-        """Open the NCCL send/receive connections to the peers at startup (every rank calls this together)."""
+        """Open the NCCL send/receive connections to the peers at startup (every rank calls this together); with
+        TF_GLM_HC_EXCHANGE=ce, set up the copy-engine exchange instead (a collective step, checked on every rank)."""
 
+        if self.ce_mode:
+            from .ce import CeExchange
+
+            b = self.b
+            taps = max((len(v) for v in getattr(b, "tap_at", {}).values()), default=0)
+            store = getattr(self.w.comm, "nccl", self.w.comm).store
+            self.ce = CeExchange(self.rank, self.world, store, getattr(b, "alloc_rows", b.rows), b.part.shape[1],
+                                 taps + 1)
+            return
         if self.gather:
             return
         a = torch.zeros((1,), dtype=torch.float32, device="cuda")
@@ -208,7 +226,11 @@ class HcSplit:
         # block a piece (p2p), or every rank's whole partial [N, Rp, D] (gather, one piece)
         d = b.part.shape[1]
         N = self.world
-        if N == 2 and self.gather:
+        if self.ce_mode and self.ce is None:
+            raise RuntimeError("TF_GLM_HC_EXCHANGE=ce: the copy-engine exchange is set up by warm() at startup")
+        if self.ce is not None:                       # the staging blocks in this rank's copy-engine arena
+            self.got = [self.ce.block(off, n) for off, n in self.pieces]
+        elif N == 2 and self.gather:
             self.got = [b.gath[(2 * off + self.peer * n) * d:(2 * off + self.peer * n + n) * d].view(n, d)
                         for off, n in self.pieces]
         elif N == 2:
@@ -245,6 +267,9 @@ class HcSplit:
 
         off, n = self.pieces[j]
         b = self.b
+        if self.ce is not None:                         # copy engines: into each peer's staging block of the piece
+            self.ce.partials(b.part, self.H, off, n)
+            return
         if self.world > 2:
             if self.gather:                             # every rank's whole partial (one piece)
                 self.all_gather(b.part[:self.Rp].reshape(-1), self.got[0].reshape(-1))
@@ -265,6 +290,9 @@ class HcSplit:
 
         off, n = self.pieces[j]
         mine = self.mine() + off
+        if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
+            self.ce.rows(outs, self.H, off, n)
+            return
         if self.gather:                                 # one piece: rank order is row order
             for t in outs:
                 self.all_gather(t[mine:mine + n].reshape(-1), t[:self.Rp].reshape(-1))
@@ -317,7 +345,7 @@ class HcSplit:
         b = self.b
         x = b.x[lo:hi]
         own = b.part[lo:hi]
-        if self.world == 2:
+        if self.world == 2 and not self.blocks:
             got = self.got[j]
             g0, g1 = (own, got) if self.rank == 0 else (got, own)
             glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
