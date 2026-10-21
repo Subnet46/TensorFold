@@ -118,7 +118,8 @@ class Engine:
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
                  taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
-                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None) -> None:
+                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None,
+                 lane_grid: int | None = None) -> None:
         """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
         the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
         anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
@@ -133,7 +134,9 @@ class Engine:
         self.w = w
         self.grid = grid
         w.meta["long_context"] = long_context
-        w.meta["prompt_grid"] = grid                         # prompt chunks' grid (``lanes`` cut on it)
+        # the grid a chunk's lanes cut on (``lanes.cut``): the prompt grid, unless kept states sit only on chunk
+        # boundaries (TF_GLM_PROMPT_GRID=chunk), when the lanes keep the kernels' own alignment (``lane_grid``)
+        w.meta["prompt_grid"] = grid if lane_grid is None else lane_grid
         from . import l2pf
 
         pf = l2pf.Settings.from_env()                        # TF_GLM_L2PF: installed before any graph capture

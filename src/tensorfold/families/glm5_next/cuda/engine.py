@@ -569,8 +569,10 @@ class GlmEngine:
         prefill_rows = int(prefill_rows)
         if not 64 <= prefill_rows <= 16384 or prefill_rows % 64:
             raise ValueError(f"prefill rows: a multiple of 64 from 64 to 16,384, not {prefill_rows}")
-        # TF_GLM_PROMPT_GRID=G: prompt chunks start on multiples of G and kept prompt states sit on them
+        # TF_GLM_PROMPT_GRID=G: prompt chunks start on multiples of G and kept prompt states sit on them; with
+        # ``chunk`` the states sit on chunk boundaries only, and a chunk's lanes cut on the kernels' own grid
         self.grid = prompt_grid(prefill_rows)
+        self.lane_grid = prompt_grid(prefill_rows, "0") if self.grid == prefill_rows else self.grid
         # TF_GLM_SHARED_PREFIX: kept states where prompts stop sharing, and saved states keep DFlash2's window; rank 0
         # picks the points (the header carries them), but both ranks save and evict alike, so both must agree
         self.shared = shared_prefix()
@@ -802,7 +804,8 @@ class GlmEngine:
         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=graphs,
                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
-                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv)
+                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv,
+                        lane_grid=self.lane_grid)
         if self.e.pbuf.split is not None:
             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
             if rank == 0:
@@ -1097,11 +1100,15 @@ class GlmEngine:
         return [i for i, c in enumerate(self.cache) if now - c.kept_at > self.cache_ttl]
 
     def _forget(self, stale: list[int]) -> None:
-        """Every rank: drop the states rank 0 found stale (``_stale``), sent with the request."""
+        """Every rank: drop the states rank 0 found stale (``_stale``), sent with the request or by the operator's
+        expiry (``sn46`` extension) while the engine idles. The live caches' ids are forgotten too once no kept
+        state names a prefix of them."""
         for i in sorted(set(int(i) for i in stale), reverse=True):
             if 0 <= i < len(self.cache):
                 self._drop(self.cache[i])
         if stale:
+            if not any(self.live[:len(c.ids)] == c.ids for c in self.cache):
+                self.live = []
             import torch
 
             torch.cuda.empty_cache()
@@ -1213,6 +1220,8 @@ class GlmEngine:
         if hit is not None and hit.rows is not None:
             load_rows(self.e, hit, drafter=self._kept_drafter())
             hit.rows, hit.nbytes = None, 0            # live again
+        if hit is not None:
+            hit.kept_at = time.monotonic()            # used now: TF_GLM_CACHE_TTL counts from here
         # a measured request's rows before the resume point: the kept state's numbers (every rank reduces its last)
         if hit is not None and sn46_rows.measuring():
             sn46_rows.resume(self.e.w, hit.sn46, cut, list(prompt))

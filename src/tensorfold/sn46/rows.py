@@ -342,6 +342,8 @@ def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
         return
     if kept is None or kept.rows != cut:
         raise RowsError(f"the kept state of {cut} tokens carries no row numbers")
+    if spec.job is not None and kept.got is None:
+        raise RowsError("the kept state carries no record of its rows on the recording rank")
     if spec.job is not None and cut > 1:
         spec.job.put(np.arange(cut - 1), kept.got, kept.targets.tolist())
     if cut < len(prompt):

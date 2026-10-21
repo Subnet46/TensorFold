@@ -32,7 +32,7 @@ def snap(ids):
 
 def bare(ttl: float) -> engine.GlmEngine:
     e = engine.GlmEngine.__new__(engine.GlmEngine)
-    e.cache, e.cache_ttl, e.cache_entries, e.cache_bytes = [], ttl, 8, 1 << 20
+    e.cache, e.cache_ttl, e.cache_entries, e.cache_bytes, e.live = [], ttl, 8, 1 << 20, []
     return e
 
 
@@ -57,3 +57,29 @@ def test_kept_states_past_the_ttl_are_dropped_on_every_rank_by_rank_zeros_list()
     e._remember(kept)
     e._drop(kept)
     assert kept.sn46 is None and e.cache == []
+
+
+def test_the_chunk_grid_leaves_the_lanes_their_own_grid():
+    """Kept states on chunk boundaries only: a chunk's two lanes still cut on the kernels' 64-row grid, as with the
+    default prompt grid (a 4096 lane grid would leave no chunk of 4096 rows for two lanes)."""
+    from tensorfold.families.glm5_next.cuda import lanes
+
+    assert lanes.cut(4096, 4, 64) == 2048
+    assert lanes.cut(4096, 4, 4096) is None
+    e = engine.GlmEngine.__new__(engine.GlmEngine)
+    e.grid = engine.prompt_grid(4096, "chunk", chunked=True)
+    e.lane_grid = engine.prompt_grid(4096, "0", chunked=True) if e.grid == 4096 else e.grid
+    assert (e.grid, e.lane_grid) == (4096, 64)
+
+
+def test_a_reused_state_counts_its_ttl_from_its_last_use_and_forgetting_frees_the_live_ids():
+    e = bare(10.0)
+    e._remember(snap([1] * 4))
+    e._remember(snap([2] * 4))
+    e.cache[0].kept_at -= 20
+    e.live = [2] * 4 + [9]
+    e._forget(e._stale())
+    assert [c.ids for c in e.cache] == [[2] * 4] and e.live == [2] * 4 + [9]   # a kept prefix of the live ids
+    e.cache[0].kept_at -= 20
+    e._forget(e._stale())
+    assert e.cache == [] and e.live == []                                       # nothing kept names them
