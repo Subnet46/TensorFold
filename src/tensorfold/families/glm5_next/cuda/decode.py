@@ -353,6 +353,10 @@ class Snapshot:
     # own end state: a request of exactly these ids resumes here and samples its first token from it, prefilling
     # nothing (``prefill``); None for states short of a prompt's end (which no head ran for)
     head: torch.Tensor | None = None
+    # TENSORFOLD_SN46: the rows' numbers a measured request kept with the state (``sn46.rows.Kept``), from which a
+    # measured request resuming here reports them; None when an unmeasured request kept it
+    sn46: object | None = None
+    kept_at: float = 0.0          # ``time.monotonic()`` when last kept (TF_GLM_CACHE_TTL, rank 0's clock)
 
 
 def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -483,7 +487,8 @@ def snapshot_bytes(snap: Snapshot) -> int:
     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
     held += [snap.head] if snap.head is not None else []
     held += [t for pair in (snap.tail or []) for t in pair]
-    return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+    return (sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+            + (snap.sn46.nbytes if snap.sn46 is not None else 0))
 
 
 def load_rows(e: Engine, snap: Snapshot, drafter=None) -> None:

@@ -95,3 +95,80 @@ def test_a_verifier_walks_the_miner_tokens_past_the_prompt():
     finally:
         rows._req = None
     assert rows.forced([3], [7]) is None
+
+
+class FakeWeights:
+    """A one-rank engine's weights as ``reduce`` reads them."""
+
+    vocab_offset = 0
+    comm = None
+    world = 1
+
+
+def test_a_kept_state_carries_its_rows_and_a_resumed_request_reports_a_fresh_prefills_numbers():
+    """A measured request keeping the state of its first n tokens records rows 0 .. n - 2 and its logits of row
+    n - 1; a request resuming there reports those rows, the last reduced against its own token at n."""
+    g = torch.Generator().manual_seed(7)
+    V = 64
+    prompt = [10, 11, 12, 13, 14, 15]
+    first = rows.Spec(record=True, prompt=prompt, cache=True)
+    rows.begin(first, prompt, 0)
+    try:
+        logits = (torch.randn((4, V), generator=g) * 4).to(torch.bfloat16)     # the prefill of prompt[:4]
+        got = rows.reduce(FakeWeights(), logits, prompt[1:5], [-1] * 4)
+        first.job.put(np.arange(4), got, prompt[1:5])
+        rows._last = (4, logits[3].clone())                                  # as ``prompt`` leaves it
+        kept = rows.kept(4)
+        assert kept.rows == 4 and kept.got.shape == (3, 5) and kept.targets.tolist() == prompt[1:4]
+        assert kept.nbytes == logits[3].numel() * logits[3].element_size()
+        with pytest.raises(rows.RowsError):
+            rows.kept(5)
+    finally:
+        rows.end()
+    assert rows.kept(4) is None                                              # no measured request: nothing to keep
+
+    later = [10, 11, 12, 13, 50, 51]                                         # shares the kept four, then differs
+    second = rows.Spec(record=True, prompt=later, cache=True)
+    rows.begin(second, later, 0)
+    try:
+        rows.resume(FakeWeights(), kept, 4, later)
+        want = dense(logits, [11, 12, 13, 50], [-1] * 4)
+        assert second.job.top1[:4].tolist() == want[:, 0].tolist()
+        assert second.job.target[:4].tolist() == [11, 12, 13, 50]
+        np.testing.assert_allclose(second.job.values[:4], want[:, 1:].numpy(), rtol=0, atol=1e-5)
+        assert np.isnan(second.job.values[4:]).all() if second.job.values.shape[0] > 4 else True
+        with pytest.raises(rows.RowsError):
+            rows.resume(FakeWeights(), kept, 3, later)                       # a state of another length
+        with pytest.raises(rows.RowsError):
+            rows.resume(FakeWeights(), None, 4, later)                       # an unmeasured request's state
+    finally:
+        rows.end()
+
+    whole = rows.Spec(record=True, prompt=prompt[:4], cache=True)            # the state is the whole prompt
+    rows.begin(whole, prompt[:4], 0)
+    try:
+        rows.resume(FakeWeights(), kept, 4, prompt[:4])
+        assert whole.job.top1[:3].tolist() == want[:3, 0].tolist()
+        assert whole.job.top1.shape[0] < 4 or whole.job.top1[3] < 0           # row 3: the sampler's, not reduced here
+    finally:
+        rows.end()
+
+
+def test_a_measured_request_keeps_state_only_when_its_spec_allows_and_never_while_walking_targets():
+    assert rows.keeps()                                                      # unmeasured: the engine's own policy
+    rows._req = rows.Spec(record=False, prompt=[1, 2])
+    try:
+        assert not rows.keeps()
+        rows._req.cache = True
+        assert rows.keeps()
+    finally:
+        rows._req = None
+    assert rows.Spec(record=True, cache=True).header()[4] == 1 and len(rows.NO_SPEC) == 5
+    rows.ACTIVE = True
+    try:
+        rows.arm(rows.Spec(record=True, targets=[2, 3, 4], prompt=[1, 2], cache=True))
+        with pytest.raises(rows.RowsError):
+            rows.take_armed([1, 2], True)
+        assert rows.disarm() is None                                         # refused specs are cleared
+    finally:
+        rows.ACTIVE = False

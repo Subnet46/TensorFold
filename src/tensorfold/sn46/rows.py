@@ -12,7 +12,13 @@ For each row the engine reduces the full-vocabulary fp32 logits, over every rank
 - ``claim_logit``: the logit of the spec's claimed id for that row (a verifier scoring a miner's top-1 claims);
 - ``target``: the target id itself, so the operator can check a sealed answer is the one the engine emitted.
 
-A measured request keeps no prompt snapshots and leaves no tokens named in the engine (``engine._run``).
+A measured request keeps prompt snapshots and resumes from them only when its spec says it may (``Spec.cache``, the
+operator's per-request retention decision); otherwise it leaves no state and no tokens named in the engine
+(``engine._run``). A kept state carries its rows' numbers (``Kept``: rank 0's record of every row before the last,
+and each rank's logits shard of the last row, whose target is the next prompt's token), so a request resuming from it
+reports the same numbers for those rows as a fresh prefill would (``resume``); the engine keeps states only where a
+fresh prefill's chunks would start (``TF_GLM_PROMPT_GRID=chunk``), so the rows past the resume point are computed in
+the same chunks too.
 
 Prompt rows are reduced in the prefill (``prompt``: one head matmul over the chunk's final-normed rows, in
 sub-chunks, one all-gather each). Decode rows ride on the sampler's own all-gather: ``tail`` appends each rank's
@@ -60,14 +66,15 @@ class Spec:
     targets: list[int] | None = None
     claims: list[int] | None = None
     prompt: list[int] | None = None      # the prompt the operator began the measurement for (the request must match)
+    cache: bool = False                  # the request may resume from kept prompt states and keep its own
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
 
     def header(self) -> list[int]:
         return [1, int(self.record), -1 if self.targets is None else len(self.targets),
-                -1 if self.claims is None else len(self.claims)]
+                -1 if self.claims is None else len(self.claims), int(self.cache)]
 
 
-NO_SPEC = [0, 0, -1, -1]
+NO_SPEC = [0, 0, -1, -1, 0]
 
 
 @dataclass
@@ -110,6 +117,7 @@ _armed: Spec | None = None
 _lock = threading.Lock()
 _req: Spec | None = None                 # the running request's spec (every rank)
 _scratch = None                          # [SUB, local vocab] bf16 for the prompt rows' head
+_last: tuple[int, object] | None = None  # (n, this rank's logits shard of row n - 1) of the latest prefill of n rows
 
 
 def arm(spec: Spec) -> None:
@@ -149,6 +157,8 @@ def take_armed(prompt: list[int], supported: bool) -> Spec | None:
         raise RowsError("targets must cover every prompt row")
     if spec.claims is not None and (spec.targets is None or len(spec.claims) != len(spec.targets)):
         raise RowsError("claims and targets cover different rows")
+    if spec.cache and spec.targets is not None:
+        raise RowsError("a request walking given targets keeps no prompt state")
     return spec
 
 
@@ -168,13 +178,13 @@ def share(engine, spec: Spec | None) -> Spec | None:
         return None
     targets = engine._share(None) if header[2] >= 0 else None
     claims = engine._share(None) if header[3] >= 0 else None
-    return Spec(record=False, targets=targets, claims=claims)
+    return Spec(record=False, targets=targets, claims=claims, cache=bool(header[4]))
 
 
 def begin(spec: Spec | None, prompt: list[int], rank: int) -> None:
     """Every rank, before the request runs (rank 0 checked the spec fits it in ``take_armed``)."""
-    global _req
-    _req = None
+    global _req, _last
+    _req = _last = None
     if spec is None:
         return
     spec.job = Job(spec, list(prompt)) if spec.record and rank == 0 else None
@@ -183,10 +193,16 @@ def begin(spec: Spec | None, prompt: list[int], rank: int) -> None:
 
 
 def end() -> None:
-    global _req
-    spec, _req = _req, None
+    global _req, _last
+    spec, _req, _last = _req, None, None
     if spec is not None and spec.job is not None:
         spec.job.done.set()
+
+
+def keeps() -> bool:
+    """Whether the running request may keep prompt states and resume from kept ones (every rank): an unmeasured
+    request does, a measured one when its spec says so."""
+    return _req is None or _req.cache
 
 
 def _target(spec: Spec, row: int, sampled: int | None) -> int:
@@ -269,6 +285,7 @@ def prompt(e, b, prompt_ids, start: int, R: int) -> None:
     w = e.w
     if _scratch is None or _scratch.device != b.fnormed.device:
         _scratch = torch.empty((SUB, w.head.n), dtype=b.fnormed.dtype, device=b.fnormed.device)
+    global _last
     for lo in range(0, R, SUB):
         hi = min(R, lo + SUB)
         logits = mm(b, b.fnormed[lo:hi], w.head, b.fxs[lo:hi], _scratch[:hi - lo])
@@ -277,6 +294,61 @@ def prompt(e, b, prompt_ids, start: int, R: int) -> None:
         got = reduce(w, logits, targets, [_claim(spec, r) for r in rows])
         if spec.job is not None:
             spec.job.put(np.asarray(rows), got, targets)
+        if start + hi == len(prompt_ids):          # the prefill's last row: a kept state's ``Kept.last``
+            _last = (start + hi, logits[hi - lo - 1].clone())
+
+
+@dataclass
+class Kept:
+    """The row numbers a kept prompt state of n tokens carries (``decode.Snapshot.sn46``): rank 0's record of rows
+    0 .. n - 2 (whose targets are the state's own tokens), and this rank's logits shard of row n - 1, whose target is
+    whatever token the resuming prompt puts at n."""
+
+    rows: int
+    last: object                         # this rank's [local vocab] logits of row n - 1 (bf16, as the head left them)
+    got: np.ndarray | None = None        # rank 0: [n - 1, 5] as ``Job.put`` takes it
+    targets: np.ndarray | None = None    # rank 0: rows 0 .. n - 2's targets (the ids 1 .. n - 1)
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.last.numel() * self.last.element_size())
+
+
+def kept(n: int) -> Kept | None:
+    """``engine._run_once``, right after a measured request kept the state of its first n tokens (every rank): what
+    the state carries, or None when the request is not measured. Rank 0's record of rows 0 .. n - 2 is complete, the
+    prefill of those n rows having reduced them."""
+    spec = _req
+    if spec is None:
+        return None
+    if _last is None or _last[0] != n:
+        raise RowsError(f"no prefill of {n} rows reduced its last row")
+    out = Kept(n, _last[1])
+    if spec.job is not None:
+        job = spec.job
+        if n - 1 > job.top1.shape[0] or (job.top1[:n - 1] < 0).any():
+            raise RowsError(f"the kept state's {n - 1} rows were not all reduced")
+        out.got = np.concatenate([job.top1[:n - 1, None].astype(np.float32), job.values[:n - 1]], 1)
+        out.targets = job.target[:n - 1].copy()
+    return out
+
+
+def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
+    """``engine._run_once``, when a measured request resumes from a kept state of ``cut`` tokens (every rank): rows
+    0 .. cut - 2 come from the state's record, row cut - 1 is reduced from its kept logits against the token the
+    prompt puts at ``cut`` (none when the state is the whole prompt: the sampler reports that row)."""
+    spec = _req
+    if spec is None:
+        return
+    if kept is None or kept.rows != cut:
+        raise RowsError(f"the kept state of {cut} tokens carries no row numbers")
+    if spec.job is not None and cut > 1:
+        spec.job.put(np.arange(cut - 1), kept.got, kept.targets.tolist())
+    if cut < len(prompt):
+        row = cut - 1
+        got = reduce(w, kept.last[None, :], [prompt[cut]], [_claim(spec, row)])
+        if spec.job is not None:
+            spec.job.put(np.asarray([row]), got, [prompt[cut]])
 
 
 TAIL = 3                                 # columns ``tail`` adds to a sampled row's gathered candidates

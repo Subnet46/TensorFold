@@ -93,12 +93,16 @@ def kda_chunked_on() -> bool:
 
 
 def prompt_grid(prefill_rows: int, value: str | None = None, chunked: bool | None = None) -> int:
-    """TF_GLM_PROMPT_GRID: 0 (off, the default) or G in ``GRIDS``, which ``prefill_rows`` must be a multiple of.
+    """TF_GLM_PROMPT_GRID: 0 (off, the default), G in ``GRIDS``, which ``prefill_rows`` must be a multiple of, or
+    ``chunk``: the prompt chunk itself (``prefill_rows``).
 
     With G set, every prompt chunk starts on a multiple of G and a kept prompt state sits at the last multiple of G
     in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly.
-    ``chunked`` (default: TF_GLM_KDA_CHUNKED): the chunked KDA prompt path, whose rows depend on the alignment of its
-    32-row sub-chunks, needs G a multiple of 32; unset or 0 then means 64."""
+    ``chunk`` goes further: a resumed prefill then runs exactly the chunks a fresh prefill of the same prompt runs
+    (a chunk's sparse selection is shared by its rows, so a chunk cut elsewhere computes other rows), which the
+    token check's row numbers need (TENSORFOLD_SN46). ``chunked`` (default: TF_GLM_KDA_CHUNKED): the chunked KDA
+    prompt path, whose rows depend on the alignment of its 32-row sub-chunks, needs G a multiple of 32; unset or 0
+    then means 64."""
 
     if chunked is None:
         chunked = kda_chunked_on()
@@ -108,8 +112,10 @@ def prompt_grid(prefill_rows: int, value: str | None = None, chunked: bool | Non
         if not chunked:
             return 0
         value = "64"
-    if not value.isdecimal() or int(value) not in GRIDS:
-        raise ValueError(f"TF_GLM_PROMPT_GRID: 0 or one of {', '.join(map(str, GRIDS))}, not {value!r}")
+    if value == "chunk":
+        value = str(prefill_rows)
+    elif not value.isdecimal() or int(value) not in GRIDS:
+        raise ValueError(f"TF_GLM_PROMPT_GRID: 0, chunk or one of {', '.join(map(str, GRIDS))}, not {value!r}")
     grid = int(value)
     if chunked and grid % 32:
         raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: TF_GLM_KDA_CHUNKED=1 runs prompt chunks in 32-row sub-chunks at "
@@ -887,6 +893,11 @@ class GlmEngine:
         self.cache: list = []
         self.live: list[int] = []
         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
+        # TF_GLM_CACHE_TTL: seconds a kept prompt state outlives its last use (0: until evicted); rank 0's clock
+        # decides, and the request carries the drops to the other ranks, so every rank keeps the same states
+        self.cache_ttl = float(os.environ.get("TF_GLM_CACHE_TTL", "0") or 0)
+        if not self.cache_ttl >= 0:
+            raise ValueError("TF_GLM_CACHE_TTL: seconds, 0 or more")
         if parallel > 1:
             from .multi import GlmScheduler, MultiDecoder
 
@@ -1055,15 +1066,17 @@ class GlmEngine:
         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
         return auto, auto or not dflash, dflash
 
-    def _resume(self, prompt: list[int], code: list[int]):
+    def _resume(self, prompt: list[int], code: list[int], measured: bool = False):
         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
-        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``)."""
+        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``). A
+        ``measured`` request resumes only from a state that carries its rows' numbers (``Snapshot.sn46``)."""
 
         _, mtp, dflash = self._drafters(code)
         best = None
         for snap in self.cache:
             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
             fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
+            fits = fits and (not measured or snap.sn46 is not None)
             short = len(snap.ids) < len(prompt) or (len(snap.ids) == len(prompt) and snap.head is not None)
             if fits and short and prompt[:len(snap.ids)] == snap.ids and (
                     best is None or len(snap.ids) > len(best.ids)):
@@ -1072,12 +1085,31 @@ class GlmEngine:
 
     def _drop(self, snap) -> None:
         """Forget a kept snapshot and free its saved rows now, even while a caller still holds the object."""
-        snap.rows, snap.nbytes, snap.drafter_rows = None, 0, None
+        snap.rows, snap.nbytes, snap.drafter_rows, snap.sn46 = None, 0, None, None
         self.cache.remove(snap)
+
+    def _stale(self) -> list[int]:
+        """Rank 0: the indexes (in ``cache`` order, which every rank shares) of the kept states past
+        TF_GLM_CACHE_TTL since their last use."""
+        if not self.cache_ttl:
+            return []
+        now = time.monotonic()
+        return [i for i, c in enumerate(self.cache) if now - c.kept_at > self.cache_ttl]
+
+    def _forget(self, stale: list[int]) -> None:
+        """Every rank: drop the states rank 0 found stale (``_stale``), sent with the request."""
+        for i in sorted(set(int(i) for i in stale), reverse=True):
+            if 0 <= i < len(self.cache):
+                self._drop(self.cache[i])
+        if stale:
+            import torch
+
+            torch.cuda.empty_cache()
 
     def _remember(self, snap) -> None:
         for c in [c for c in self.cache if c.ids == snap.ids and c is not snap]:
             self._drop(c)
+        snap.kept_at = time.monotonic()
         self.cache[:] = [c for c in self.cache if c is not snap] + [snap]   # a resumed prompt kept again moves last
         dropped = False
         while len(self.cache) > 1 and (len(self.cache) > self.cache_entries or self._held_bytes() > self.cache_bytes):
@@ -1161,8 +1193,8 @@ class GlmEngine:
         finally:
             self.e.constraint = self.e.window = None
             sn46_rows.end()
-            if measure is not None:
-                self.live = []                  # nothing of a measured request stays named in the engine
+            if measure is not None and not measure.cache:
+                self.live = []                  # nothing of a request that may not be kept stays named in the engine
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
@@ -1181,15 +1213,18 @@ class GlmEngine:
         if hit is not None and hit.rows is not None:
             load_rows(self.e, hit, drafter=self._kept_drafter())
             hit.rows, hit.nbytes = None, 0            # live again
+        # a measured request's rows before the resume point: the kept state's numbers (every rank reduces its last)
+        if hit is not None and sn46_rows.measuring():
+            sn46_rows.resume(self.e.w, hit.sn46, cut, list(prompt))
         # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
         self.live = list(prompt) if feed is None else []
         # a drafted text prompt keeps its state at ``point``: its end, or with TF_GLM_PROMPT_GRID the last grid
         # multiple in it. Short of the end, the prompt prefills to the point as a prompt of that length would (no
         # first token), keeps that state, and resumes from it as a later request would: so any prompt extending
         # prompt[:point] passes through the same state there, fresh or resumed. Both ranks decide alike
-        # a measured request (TENSORFOLD_SN46) keeps no state: it never resumes, and its prompt must not outlive it
-        point = (grid_point(len(prompt), cut, self.grid) if draft and feed is None and not sn46_rows.measuring()
-                 else None)
+        # a measured request (TENSORFOLD_SN46) keeps state only when its spec allows it (``sn46_rows.keeps``), and
+        # then with its rows' numbers, so a request resuming from it reports a fresh prefill's numbers
+        point = grid_point(len(prompt), cut, self.grid) if draft and feed is None and sn46_rows.keeps() else None
         # TF_GLM_SHARED_PREFIX: rank 0's shared-prefix points (past the resume point, short of ``point``) are kept the
         # same way, each prefilled to as a prompt of its length and resumed from, so fresh and resumed prompts pass
         # through the same states there too
@@ -1203,6 +1238,7 @@ class GlmEngine:
             prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=resume, sample=False)
             resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
                                    drafter=drafter)
+            resume.sn46 = sn46_rows.kept(stop)
             kept.append(resume)
         # a replay of a kept prompt (``decode.whole``: its state and head's logits row) prefills nothing and keeps
         # nothing new; a prompt's own end state keeps the head's row it sampled from, for a later replay
@@ -1215,6 +1251,7 @@ class GlmEngine:
             snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
                                  drafter=drafter)
             snap.head, self.e.head = self.e.head, None
+            snap.sn46 = sn46_rows.kept(len(prompt))
             kept.append(snap)
         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
             self.cache = [c for c in self.cache if c is not hit] + [hit]
@@ -1324,9 +1361,13 @@ class GlmEngine:
                 raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
             feed = VisionFeed(self, positions, rows)
             feed.encode_s = time.perf_counter() - t
-        # a measured request prefills its whole prompt: rows resumed from a snapshot would have no statistics
-        hit = self._resume(list(prompt), code) if draft and feed is None and measure is None else None
-        shared = self._shared(list(prompt), hit) if draft and feed is None and measure is None else []
+        # kept states past TF_GLM_CACHE_TTL go on every rank with this request (rank 0's clock decides)
+        stale = self._stale()
+        self._forget(stale)
+        # a measured request resumes (from a state carrying its rows' numbers) and keeps only when its spec allows
+        may_keep = draft and feed is None and (measure is None or measure.cache)
+        hit = self._resume(list(prompt), code, measured=measure is not None) if may_keep else None
+        shared = self._shared(list(prompt), hit) if may_keep else []
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
@@ -1339,6 +1380,7 @@ class GlmEngine:
         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
         self._share(header)
         self._share(list(prompt))
+        self._share(stale)
         if constraint is not None:                     # the request's grammar: rank 1 compiles the same
             self._share(pack(constraint))
         if positions:
@@ -1434,6 +1476,7 @@ class GlmEngine:
          images, *rest) = header
         shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
         prompt = self._share(None)
+        self._forget(self._share(None))             # the kept states rank 0 found past TF_GLM_CACHE_TTL
         packed = self._share(None) if shaped else []
         constraint = None
         if packed:                                  # compiled here as on rank 0
