@@ -395,21 +395,24 @@ def from_gathered(g, k: int, targets: list[int]) -> np.ndarray:
     """Every rank's ``[values, ids, tail]`` [world, R, 2k + TAIL] (CPU) -> [R, 5] (top1 id, top1 logit, lse, target
     logit, claim logit). The top-1 is the lowest id among the maxima of the gathered values (the greedy rule); a
     target the tail did not know (-inf everywhere: a token sampled from these candidates) takes its logit from the
-    candidate of that id."""
-    import torch
-
-    world, R, width = g.shape
-    values = torch.cat([g[r, :, :k] for r in range(world)], 1).float()
-    ids = torch.cat([g[r, :, k:2 * k].contiguous().view(torch.int32) for r in range(world)], 1).to(torch.int64)
-    order = torch.argsort(ids, dim=1, stable=True)                                    # ties: the lowest id first
-    values, ids = values.gather(1, order), ids.gather(1, order)
-    best = torch.argmax(values, 1)                                                    # the first maximum
-    top1 = ids.gather(1, best[:, None])[:, 0]
-    top1_logit = values.gather(1, best[:, None])[:, 0]
-    lse = torch.logsumexp(g[:, :, 2 * k].float(), 0)
-    target_logit = g[:, :, 2 * k + 1].float().max(0).values
-    claim_logit = g[:, :, 2 * k + 2].float().max(0).values
-    want = torch.tensor(targets, dtype=torch.int64)
-    hit = torch.where(ids == want[:, None], values, torch.full_like(values, float("-inf"))).max(1).values
-    target_logit = torch.where(torch.isinf(target_logit) & (want >= 0), hit, target_logit)
-    return torch.stack([top1.float(), top1_logit, lse, target_logit, claim_logit], 1).numpy()
+    candidate of that id. In numpy: a torch CPU op here wakes the rank's OpenMP pool, and the ranks' pools contend
+    on the host (four ranks, 70 ms a call on a 96-core host against 0.1 ms single-threaded)."""
+    a = np.ascontiguousarray(g.numpy() if hasattr(g, "numpy") else g, dtype=np.float32)
+    world, R, width = a.shape
+    values = np.concatenate([a[r, :, :k] for r in range(world)], 1)
+    ids = np.concatenate([a[r, :, k:2 * k] for r in range(world)], 1).view(np.int32).astype(np.int64)
+    order = np.argsort(ids, axis=1, kind="stable")                                    # ties: the lowest id first
+    values, ids = np.take_along_axis(values, order, 1), np.take_along_axis(ids, order, 1)
+    best = np.argmax(values, 1)                                                       # the first maximum
+    rows = np.arange(R)
+    top1, top1_logit = ids[rows, best], values[rows, best]
+    part = a[:, :, 2 * k]                                                             # [world, R] each rank's lse
+    m = part.max(0)
+    with np.errstate(invalid="ignore"):
+        lse = np.where(np.isinf(m), m, m + np.log(np.exp(part - m).sum(0)))
+    target_logit = a[:, :, 2 * k + 1].max(0)
+    claim_logit = a[:, :, 2 * k + 2].max(0)
+    want = np.asarray(targets, dtype=np.int64)
+    hit = np.where(ids == want[:, None], values, np.float32(-np.inf)).max(1)
+    target_logit = np.where(np.isinf(target_logit) & (want >= 0), hit, target_logit)
+    return np.stack([top1.astype(np.float32), top1_logit, lse, target_logit, claim_logit], 1).astype(np.float32)
