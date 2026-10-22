@@ -498,6 +498,9 @@ class GlmEngine:
             else:
                 if rank == 0:
                     print(f"[tensorfold] {self.comm.describe()}", flush=True)
+                    if self.comm.timings():
+                        print(f"[tensorfold] all-gather routes timed (us a gather, the slowest rank): "
+                              f"{self.comm.timings()}", flush=True)
         if comm is None and transport == "roce":
             # small all-gathers (a decode round's partials, the samplers) over b12x's one-shot RoCE transport
             from tensorfold.cuda.roce import RoceComm

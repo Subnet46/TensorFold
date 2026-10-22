@@ -37,7 +37,13 @@ Settings (every rank must see the same values; the setup compares them):
                           names ll, flag, ce; default "ll:32,flag" (LL up to 32 KiB, SM stores with flags above).
                           Examples: "flag" (one protocol), "ll:16,flag:64,ce". The GPU test's bench prints the best
                           bands for a machine. Each GPU exports 2 x (ranks - 1) flag slots of the max, LL slots of
-                          twice its band's top, and ranks - 1 copy-engine slots of its band's top (BAR1 space)
+                          twice its band's top, and ranks - 1 copy-engine slots of its band's top (BAR1 space).
+                          "auto" (sn46): slots for every protocol up to the max, and at startup each protocol and
+                          NCCL are timed at the decode sizes in CUDA graphs (``AUTO_SIZES``; the slowest rank's
+                          time counts, so every rank chooses alike); each size takes the fastest route, NCCL
+                          included. Hosts differ here, not the cards: where SM peer stores over PCIe are slow
+                          (a root-complex crossing, ACS, an IOMMU), LL and flag cost several times the copy
+                          engines or NCCL. Every route copies the same bytes, so the choice never moves a bit
   TF_GLM_IPC_WAIT_S       seconds a wait for a peer may take before it poisons the runtime (default 300, 1 to 3600).
                           Generous on purpose: in a multi-stream round the other ranks wait inside the round
                           message's gather while rank 0 alone admits a request (an image encode, a grammar compile),
@@ -66,6 +72,18 @@ PROTOCOLS = "ll:32,flag"
 PROTO = {"flag": 0, "ll": 1, "ce": 2}     # ipc.h's PROTO_FLAG, PROTO_LL, PROTO_CE
 NAMES = {v: k for k, v in PROTO.items()}
 MAX_BANDS = 3
+
+
+AUTO = "auto"
+NCCL_ROUTE = -2                          # a band served by NCCL (``auto`` only; the C++ gather knows the three above)
+ROUTE_NAMES = {**NAMES, NCCL_ROUTE: "nccl"}
+# bytes a rank timed by ``auto``: the samplers' and round messages' gathers, then a decode window's partials (16 KiB
+# a row up to 8 rows, the 16-row graph's 256 KiB) and the two-shot bf16 gathers between them, up to the max
+AUTO_SIZES = (64, 1 << 10, 4 << 10, 8 << 10, *((16 << 10) * r for r in range(1, 9)), 192 << 10, 256 << 10,
+              384 << 10, 512 << 10)
+AUTO_ITERS = 20                          # gathers a captured graph replays
+AUTO_REPS = 5                            # replays timed a (route, size); the fastest counts
+AUTO_MARGIN = 0.02                       # a route within 2 % of the fastest that comes first in ROUTE order wins
 
 
 class IpcUnavailable(RuntimeError):
@@ -128,8 +146,20 @@ def describe(bands: list[tuple[int, int]]) -> str:
     return ",".join(f"{NAMES[p]}:{b / 1024:g}" for p, b in bands)
 
 
+def auto() -> bool:
+    """Whether TF_GLM_IPC_PROTOCOLS is ``auto``: the routes are chosen by timing them at startup."""
+
+    return os.environ.get("TF_GLM_IPC_PROTOCOLS", "").strip().lower() == AUTO
+
+
+def _protocols_spec() -> str:
+    spec = os.environ.get("TF_GLM_IPC_PROTOCOLS", "").strip()
+    return PROTOCOLS if not spec or spec.lower() == AUTO else spec
+
+
 def settings() -> dict:
-    """The TF_GLM_IPC_* values (bytes, ns, threads and bands), checked."""
+    """The TF_GLM_IPC_* values (bytes, ns, threads and bands), checked. Under ``auto`` the bands are the default ones
+    until the startup timing replaces them (``IpcComm``)."""
 
     threads = int(_setting("TF_GLM_IPC_THREADS", THREADS, 32, 1024))
     if threads % 32:
@@ -139,7 +169,53 @@ def settings() -> dict:
             "timeout_ns": int(_setting("TF_GLM_IPC_WAIT_S", WAIT_S, 1, 3600) * 1e9),
             "block_bytes": int(_setting("TF_GLM_IPC_BLOCK_KB", BLOCK_KB, 1, 4096) * 1024),
             "threads": threads,
-            "bands": parse_protocols(os.environ.get("TF_GLM_IPC_PROTOCOLS", "").strip() or PROTOCOLS, max_bytes)}
+            "bands": parse_protocols(_protocols_spec(), max_bytes)}
+
+
+def auto_sizes(max_bytes: int) -> list[int]:
+    """The byte counts ``auto`` times: ``AUTO_SIZES`` up to the max (multiples of 4), and the max itself."""
+
+    return sorted({n for n in AUTO_SIZES if n < max_bytes} | {max_bytes - max_bytes % 4 or 4})
+
+
+def choose_routes(sizes: list[int], routes: list[int], times: list[list[float]],
+                  max_bytes: int) -> list[tuple[int, int]]:
+    """[(route, largest bytes)] in rising order from ``times[i][j]``, route ``routes[i]``'s time at ``sizes[j]``
+    (rising): each size takes its fastest route (a route within ``AUTO_MARGIN`` of it that comes first in
+    ``routes`` wins, so close calls stay put between starts); neighbouring sizes of one route merge into a band and
+    the last band reaches ``max_bytes``. A gather between two timed sizes takes the larger one's route. Pure: the
+    same times give every rank the same bands."""
+
+    if not sizes or len(times) != len(routes) or any(len(t) != len(sizes) for t in times):
+        raise ValueError("choose_routes: one time a route and a size")
+    winners = []
+    for j in range(len(sizes)):
+        column = [times[i][j] for i in range(len(routes))]
+        fastest = min(column)
+        winners.append(next(routes[i] for i, t in enumerate(column) if t <= fastest * (1 + AUTO_MARGIN)))
+    bands: list[tuple[int, int]] = []
+    for size, route in zip(sizes, winners):
+        if bands and bands[-1][0] == route:
+            bands[-1] = (route, size)
+        else:
+            bands.append((route, size))
+    bands[-1] = (bands[-1][0], max_bytes)
+    return bands
+
+
+def route_of(bands: list[tuple[int, int]], nbytes: int) -> int:
+    """The route of a gather of ``nbytes`` (at most the last band's top)."""
+
+    for route, top in bands:
+        if nbytes <= top:
+            return route
+    return bands[-1][0]
+
+
+def describe_routes(bands: list[tuple[int, int]]) -> str:
+    """Routes as a setting-like string (KiB), e.g. "ll:16,ce:64,nccl:512"."""
+
+    return ",".join(f"{ROUTE_NAMES[p]}:{b / 1024:g}" for p, b in bands)
 
 
 @lru_cache(maxsize=1)
@@ -181,7 +257,7 @@ class IpcGather:
         self.threads = int(given["threads"] if threads is None else threads)
         if bands is None:
             bands = (given["bands"] if max_bytes is None else
-                     parse_protocols(os.environ.get("TF_GLM_IPC_PROTOCOLS", "").strip() or PROTOCOLS, self.max_bytes))
+                     parse_protocols(_protocols_spec(), self.max_bytes))
         self.bands = [(int(p), int(b)) for p, b in bands]
         self.slot_bytes = -(-self.max_bytes // SLOT_ALIGN) * SLOT_ALIGN
         tops = {p: max((b for q, b in self.bands if q == p), default=0) for p in PROTO.values()}
@@ -295,10 +371,14 @@ class IpcComm:
         self.nccl, self.rank, self.world = nccl, rank, world
         self.small = self.large = 0
         self.settled = False
+        self.routes: list[tuple[int, int]] | None = None   # ``auto``'s choice, else the C++ gather's bands decide
+        self.timed: dict | None = None                     # ``auto``'s timings (us a gather), for the start log
         nccl.barrier()
-        self.ipc = IpcGather(nccl, rank, world, max_bytes)
+        self.ipc = IpcGather(nccl, rank, world, max_bytes, every_protocol=auto())
         try:
             self._self_test()
+            if auto():
+                self._choose()
         except Exception:
             self.ipc.close()
             raise
@@ -339,11 +419,83 @@ class IpcComm:
                                  + (f" ({why})" if why else " (other bytes than NCCL's)"))
         ipc.g.set_timeout(ipc.timeout_ns)
 
+    def _choose(self) -> None:
+        """``auto``: every route (each protocol this gather has slots for, and NCCL) timed at ``auto_sizes`` as a
+        captured graph of ``AUTO_ITERS`` gathers, the fastest of ``AUTO_REPS`` replays, the ranks aligned by a
+        barrier before each replay; the slowest rank's time counts (an all-gather of the table), so every rank
+        derives the same routes from the same numbers. Decode replays its gathers in graphs, so graphs are timed."""
+
+        import time
+
+        ipc = self.ipc
+        sizes = auto_sizes(ipc.max_bytes)
+        routes = [*ipc.protocols(), NCCL_ROUTE]
+        ipc.g.set_timeout(min(ipc.timeout_ns, self.SELF_TEST_WAIT_NS))
+        send = torch.zeros((ipc.max_bytes // 4,), dtype=torch.int32, device="cuda")
+        recv = torch.empty((self.world * send.numel(),), dtype=torch.int32, device="cuda")
+        mine = []
+        for route in routes:
+            row = []
+            for n in sizes:
+                s, r = send[:n // 4], recv[:self.world * (n // 4)]
+
+                def once(route=route, s=s, r=r) -> None:
+                    if route == NCCL_ROUTE:
+                        self.nccl.all_gather(s, r)
+                    else:
+                        ipc.all_gather(s, r, route)
+
+                self.nccl.barrier()
+                once()                                   # warm: NCCL's first call on a size sets up its plan
+                torch.cuda.synchronize()
+                ipc.check()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    for _ in range(AUTO_ITERS):
+                        once()
+                best = float("inf")
+                for _ in range(AUTO_REPS):
+                    self.nccl.barrier()
+                    t = time.perf_counter()
+                    g.replay()
+                    torch.cuda.synchronize()
+                    best = min(best, (time.perf_counter() - t) * 1e6 / AUTO_ITERS)
+                ipc.check()
+                del g
+                row.append(best)
+            mine.append(row)
+        local = torch.tensor(mine, dtype=torch.float32, device="cuda").flatten()
+        every = torch.empty((self.world * local.numel(),), dtype=torch.float32, device="cuda")
+        self.nccl.all_gather(local, every)
+        slowest = every.view(self.world, len(routes), len(sizes)).max(dim=0).values.tolist()
+        ipc.g.set_timeout(ipc.timeout_ns)
+        self.routes = choose_routes(sizes, routes, slowest, ipc.max_bytes)
+        self.timed = {"sizes": sizes, "routes": [ROUTE_NAMES[x] for x in routes], "us": slowest}
+
+    def routes_text(self) -> str:
+        """The routes gathers take, as a setting-like string: ``auto``'s choice, else the configured bands."""
+
+        return describe_routes(self.routes) if self.routes is not None else describe(self.ipc.bands)
+
+    def timings(self) -> str:
+        """``auto``'s table for the start log: us a gather at each timed size (KiB), each route, the winner marked."""
+
+        if self.timed is None:
+            return ""
+        t = self.timed
+        lines = []
+        for j, n in enumerate(t["sizes"]):
+            cells = [f"{name} {t['us'][i][j]:.1f}" for i, name in enumerate(t["routes"])]
+            lines.append(f"{n / 1024:g} KiB: " + ", ".join(cells) + f" -> {ROUTE_NAMES[route_of(self.routes, n)]}")
+        return "; ".join(lines)
+
     def describe(self) -> str:
         ipc = self.ipc
-        return (f"all-gathers up to {ipc.max_bytes >> 10} KiB over CUDA IPC (one-shot peer-to-peer push, protocols "
-                f"{describe(ipc.bands)}, blocks of {ipc.block_bytes / 1024:g} KiB x {ipc.threads} threads, at most "
-                f"{ipc.max_grid}, wait limit {ipc.timeout_ns / 1e9:g} s), larger ones over NCCL")
+        how = (f"routes {self.routes_text()} (TF_GLM_IPC_PROTOCOLS=auto: timed at startup, NCCL included)"
+               if self.routes is not None else f"protocols {describe(ipc.bands)}")
+        return (f"all-gathers up to {ipc.max_bytes >> 10} KiB over CUDA IPC (one-shot peer-to-peer push, {how}, "
+                f"blocks of {ipc.block_bytes / 1024:g} KiB x {ipc.threads} threads, at most {ipc.max_grid}, wait "
+                f"limit {ipc.timeout_ns / 1e9:g} s), larger ones over NCCL")
 
     def settle(self) -> None:
         """Startup is over on this rank (its engine is built). Until then each eager IPC gather first meets the other
@@ -366,14 +518,19 @@ class IpcComm:
             return
         if recv.numel() != send.numel() * self.world or send.dtype != recv.dtype:
             raise ValueError("all_gather: recv must hold world x send of the same dtype")
-        self.small += 1
+        route = -1 if self.routes is None else route_of(self.routes, n)
         s = send if send.is_contiguous() else send.contiguous()
         r = recv if recv.is_contiguous() else torch.empty(recv.shape, dtype=recv.dtype, device=recv.device)
         if _overlap(s, r) and s.data_ptr() != r.data_ptr() + self.rank * n:
             s = s.clone()
-        if not self.settled and not torch.cuda.is_current_stream_capturing():
-            self.nccl.barrier()
-        self.ipc.all_gather(s, r)
+        if route == NCCL_ROUTE:                       # ``auto`` chose NCCL for this size: the same buffers
+            self.large += 1
+            self.nccl.all_gather(s, r)
+        else:
+            self.small += 1
+            if not self.settled and not torch.cuda.is_current_stream_capturing():
+                self.nccl.barrier()
+            self.ipc.all_gather(s, r, route)
         if r is not recv:
             recv.copy_(r)
 
