@@ -380,6 +380,19 @@ def draft_fraction(draft_dir, rank: int, world: int):
     return fraction
 
 
+def feature_hash(rows) -> str:
+    """The tower's feature rows as bits (sha256 over the shape and the raw words): equal on two hosts exactly when
+    their encodes agree bit for bit."""
+
+    import torch
+
+    flat = rows.detach().contiguous().view(-1)
+    bits = flat.view(torch.int16 if flat.element_size() == 2 else torch.int32)
+    digest = hashlib.sha256(b"tensorfold-sn46-features-v1\0" + json.dumps(list(rows.shape)).encode())
+    digest.update(bits.cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _f64_ints(x: float) -> list[int]:
     return list(struct.unpack("<2i", struct.pack("<d", float(x))))
 
@@ -1345,7 +1358,9 @@ class GlmEngine:
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         # TENSORFOLD_SN46: the row statistics the operator armed for this request, checked against it here, before
         # any other rank hears of the request
-        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None and vision is None and constraint is None)
+        # (patch sn46/vision-rows) image prompts too: their feature rows are injected before the rows are read
+        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None and constraint is None,
+                                       images=vision is not None)
         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
             if vision is not None and self.vision is None:
                 raise ValueError("image inputs require starting this server with --vision")
@@ -1373,6 +1388,9 @@ class GlmEngine:
                 raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
             feed = VisionFeed(self, positions, rows)
             feed.encode_s = time.perf_counter() - t
+            if measure is not None:          # where two hosts' rows part: the fitted pixels, or the tower's features
+                feed.hashes = {"image_hash": getattr(vision, "content_hash", ""),
+                               "feature_hash": feature_hash(rows)}
         # kept states past TF_GLM_CACHE_TTL go on every rank with this request (rank 0's clock decides)
         stale = self._stale()
         self._forget(stale)
@@ -1404,7 +1422,7 @@ class GlmEngine:
         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
             self.comm.check()
         if feed is not None:
-            stats.update(image_rows=len(positions), encode_s=round(feed.encode_s, 3))
+            stats.update(image_rows=len(positions), encode_s=round(feed.encode_s, 3), **feed.hashes)
         return stats
 
     def score_labels(self, prompt_ids: list[int], label_ids: list[int]) -> tuple[list[float], float]:
@@ -1520,6 +1538,7 @@ class VisionFeed:
         self.engine, self.positions, self.rows = engine, positions, rows
         self.width = engine.w.cfg.hidden
         self.encode_s = 0.0
+        self.hashes: dict[str, str] = {}
 
     def chunk(self, start: int, count: int):
         """(row indices within the chunk, their features) for prompt rows start .. start + count, or None."""

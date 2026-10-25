@@ -143,14 +143,16 @@ def measuring() -> bool:
     return _req is not None
 
 
-def take_armed(prompt: list[int], supported: bool) -> Spec | None:
+def take_armed(prompt: list[int], supported: bool, images: bool = False) -> Spec | None:
     """Rank 0, at a request's start, before any other rank hears of it: the armed spec (then cleared), or None. A
     spec that does not fit the request is cleared and refused here, so a refusal never strands the other ranks."""
     spec = disarm() if ACTIVE else None
     if spec is None:
         return None
     if not supported:
-        raise RowsError("row statistics run on the one-stream engine, for text prompts without a grammar")
+        raise RowsError("row statistics run on the one-stream engine, for prompts without a grammar")
+    if images and spec.cache:                # an image prompt's rows are not its ids' rows: nothing is kept
+        raise RowsError("an image prompt keeps no prompt state; measure it with cache off")
     if spec.prompt is not None and list(prompt) != list(spec.prompt):
         raise RowsError("the request's prompt differs from the measured one")
     if spec.targets is not None and len(spec.targets) < len(prompt):

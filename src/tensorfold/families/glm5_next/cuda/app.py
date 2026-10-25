@@ -45,6 +45,8 @@ def media_template(inner, model_dir) -> None:
     """Swap the checkpoint template's no-media reminder for GLM's image and video markers."""
 
     source = (model_dir / "chat_template.jinja").read_text()
+    if source.count(_NO_MEDIA) != 1 and "<|begin_of_image|><|image|><|end_of_image|>" in source:
+        return                       # (patch sn46/vision-rows) it writes GLM's markers itself (the SN46 checkpoints)
     if source.count(_NO_MEDIA) != 1:
         raise ValueError("--vision: this checkpoint's chat template has no media branch TensorFold knows how to "
                          "extend (GLM-5.3 Flash's chat_template.jinja)")

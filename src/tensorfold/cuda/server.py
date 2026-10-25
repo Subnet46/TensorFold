@@ -240,7 +240,9 @@ class App:
     def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
         from jinja2.exceptions import TemplateError
 
-        validate_modalities(body)
+        # (patch sn46/vision-rows) a token-id completion's pictures come as ``images``; anywhere else it stays refused
+        id_images = not chat and isinstance(body.get("prompt"), list) and body.get("images") is not None
+        validate_modalities({k: v for k, v in body.items() if k != "images"} if id_images else body)
         ToolCallPolicy(body)
         ignore_eos, stop = stop_options(body)
         max_tokens = self._requested_tokens(body)
@@ -298,6 +300,11 @@ class App:
             prompt = self._encode(text, add_special_tokens=False)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
+            if body.get("images") is not None:           # (patch sn46/vision-rows) their pictures, ids expanded
+                vision = self._id_images(prompt, body["images"])
+                return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
+                                       ignore_eos=ignore_eos, stop=stop, vision=vision, grammar=compiled,
+                                       think_budget=budget)
         else:
             text = body.get("prompt")
             if not isinstance(text, str):
@@ -308,6 +315,26 @@ class App:
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+
+    def _id_images(self, prompt: list[int], images: Any):
+        """(patch sn46/vision-rows) A token-id prompt's pictures (``images``: data URLs, or https URLs under
+        ``--vision-urls``), fitted as the chat route fits them; the prompt carries each picture's rows already
+        expanded."""
+
+        from tensorfold.server.prompts import image_slot
+        from tensorfold.vision.images import ImageInputError, ImageSource
+
+        if self.vision is None or not hasattr(self.vision, "prepare_ids"):
+            raise RequestError("images with a token-id prompt need a GLM checkpoint served with --vision")
+        if not isinstance(images, list) or not images or not all(isinstance(u, str) for u in images):
+            raise RequestError("images must be a non-empty list of image URLs")
+        slot = image_slot()
+        try:
+            return self.vision.prepare_ids(prompt, self.vision.load_images([ImageSource(u) for u in images]))
+        except (ImageInputError, ValueError) as exc:
+            raise RequestError(str(exc)) from exc
+        finally:
+            slot.release()
 
     def _encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         incremental = getattr(self, "incremental", None)

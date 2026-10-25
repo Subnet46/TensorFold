@@ -556,11 +556,42 @@ class GlmVision:
         rows = sum(self._rows(kind, x) for kind, x in items)
         if len(positions) != rows:
             raise ImageInputError(f"the prompt has {len(positions)} image positions for {rows} feature rows")
+        return GlmPrepared(ids, items, positions, self._hash(items))
+
+    def prepare_ids(self, ids: list[int], images) -> GlmPrepared:
+        """(patch sn46/vision-rows) A token-id prompt already expanded as ``prepare`` writes it (``/tokenize`` of the
+        chat messages gives these ids): each picture's rows are one run of ``<|image|>`` ids, in order, exactly as
+        many as the picture's rows at its canvas."""
+
+        ids = [int(t) for t in ids]
+        tokens = self.limits.picture_tokens(len(images))
+        items = [("image", p if hasattr(p, "dim") else self._picture(p, tokens)) for p in images]
+        positions = [p for p, t in enumerate(ids) if t == self.image_token]
+        runs: list[int] = []
+        for n, p in enumerate(positions):
+            if n and p == positions[n - 1] + 1:
+                runs[-1] += 1
+            else:
+                runs.append(1)
+        wanted = [self._rows(kind, x) for kind, x in items]
+        if runs != wanted:
+            raise ImageInputError(f"the prompt's image runs {runs} do not match its pictures' rows {wanted}")
+        return GlmPrepared(ids, items, positions, self._hash(items))
+
+    def image_rows(self, sources) -> list[int]:
+        """(patch sn46/vision-rows) Each picture's feature rows as a request with these pictures gets them: the
+        pictures decoded and fitted as ``load_images`` fits them (their count sets each one's budget), the tower not
+        run. A token-id prompt repeats ``<|image|>`` this many times for each picture, in order."""
+
+        return [self._rows("image", picture) for picture in self.load_images(sources)]
+
+    @staticmethod
+    def _hash(items) -> str:
         digest = hashlib.sha256(b"tensorfold-glm-vision-v1\0")
         for kind, x in items:
             digest.update(kind.encode() + json.dumps(list(x.shape)).encode())
             digest.update(x.numpy().tobytes())
-        return GlmPrepared(ids, items, positions, digest.hexdigest())
+        return digest.hexdigest()
 
     @staticmethod
     def _rows(kind: str, x) -> int:
