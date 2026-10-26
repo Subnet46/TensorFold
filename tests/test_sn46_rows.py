@@ -74,6 +74,20 @@ def test_a_job_keeps_the_last_numbers_of_each_row_and_takes_complete_rows():
         job.take(6)
 
 
+def test_a_job_keeps_each_reply_rows_own_draw_beside_its_target():
+    """A verifier's walk commits the miner's token (the target) but records the engine's own draw; prompt rows have
+    none, and a row sampled again keeps its last draw."""
+    job = rows.Job(rows.Spec(record=True), [1, 2, 3])
+    job.put(np.array([0, 1]), np.array([[7, 1, 2, 3, 4]] * 2, np.float32), [2, 3])
+    job.put(np.array([2, 3]), np.array([[8, 1, 2, 3, 4]] * 2, np.float32), [40, 41])
+    job.draw(np.array([2, 3]), [40, 99])
+    job.draw(np.array([3]), [41])
+    job.done.set()
+    got = job.take(4)
+    assert got["drawn"].tolist() == [-1, -1, 40, 41]
+    assert got["target"].tolist() == [2, 3, 40, 41]
+
+
 def test_targets_are_the_prompt_then_the_sampled_tokens_unless_the_spec_names_them():
     spec = rows.Spec(record=False, prompt=[10, 11, 12])
     assert [rows._target(spec, r, 99) for r in range(4)] == [11, 12, 99, 99]

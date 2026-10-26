@@ -10,7 +10,10 @@ For each row the engine reduces the full-vocabulary fp32 logits, over every rank
 - ``lse``: the log-sum-exp, so a logprob is ``logit - lse``;
 - ``target_logit``: the logit of the target: the next prompt token, the sampled token, or the spec's ``targets``;
 - ``claim_logit``: the logit of the spec's claimed id for that row (a verifier scoring a miner's top-1 claims);
-- ``target``: the target id itself, so the operator can check a sealed answer is the one the engine emitted.
+- ``target``: the target id itself, so the operator can check a sealed answer is the one the engine emitted;
+- ``drawn``: the id the engine's sampler drew for a reply row (-1 on prompt rows), before a verifier's walk commits
+  the miner's token in its place: with the request's sampling and seed, the verifier's own draw, which a sampled
+  answer's token must equal.
 
 A measured request keeps prompt snapshots and resumes from them only when its spec says it may (``Spec.cache``, the
 operator's per-request retention decision); otherwise it leaves no state and no tokens named in the engine
@@ -86,20 +89,30 @@ class Job:
     top1: np.ndarray = field(default_factory=lambda: np.full(0, -1, np.int64))
     target: np.ndarray = field(default_factory=lambda: np.full(0, -1, np.int64))
     values: np.ndarray = field(default_factory=lambda: np.full((0, 4), np.nan, np.float32))
+    drawn: np.ndarray = field(default_factory=lambda: np.full(0, -1, np.int64))
     done: threading.Event = field(default_factory=threading.Event)
 
     def put(self, rows: np.ndarray, got: np.ndarray, targets: list[int]) -> None:
         """``got`` [n, 5] (top1 id, top1 logit, lse, target logit, claim logit) for ``rows``, whose targets were
         ``targets``."""
-        need = int(rows.max()) + 1
-        if need > self.top1.shape[0]:
-            grow = max(need, 2 * self.top1.shape[0])
-            self.top1 = np.concatenate([self.top1, np.full(grow - self.top1.shape[0], -1, np.int64)])
-            self.target = np.concatenate([self.target, np.full(grow - self.target.shape[0], -1, np.int64)])
-            self.values = np.concatenate([self.values, np.full((grow - self.values.shape[0], 4), np.nan, np.float32)])
+        self._grow(int(rows.max()) + 1)
         self.top1[rows] = got[:, 0].astype(np.int64)
         self.target[rows] = np.asarray(targets, np.int64)
         self.values[rows] = got[:, 1:]
+
+    def draw(self, rows: np.ndarray, tokens: list[int]) -> None:
+        """The sampler's own ``tokens`` for these reply rows (a row sampled again keeps its last draw)."""
+        self._grow(int(rows.max()) + 1)
+        self.drawn[rows] = np.asarray(tokens, np.int64)
+
+    def _grow(self, need: int) -> None:
+        if need > self.top1.shape[0]:
+            grow = max(need, 2 * self.top1.shape[0])
+            more = grow - self.top1.shape[0]
+            self.top1 = np.concatenate([self.top1, np.full(more, -1, np.int64)])
+            self.target = np.concatenate([self.target, np.full(more, -1, np.int64)])
+            self.values = np.concatenate([self.values, np.full((more, 4), np.nan, np.float32)])
+            self.drawn = np.concatenate([self.drawn, np.full(more, -1, np.int64)])
 
     def take(self, rows: int) -> dict[str, np.ndarray]:
         """Rows 0 .. rows - 1 (prompt + output - 1 for a reply), every one reduced."""
@@ -107,7 +120,8 @@ class Job:
             raise RowsError("the request is still running")
         if rows < 1 or rows > self.top1.shape[0] or (self.top1[:rows] < 0).any():
             raise RowsError(f"the request reduced {int((self.top1 >= 0).sum())} rows, not the {rows} asked for")
-        out = {"top1": self.top1[:rows].copy(), "target": self.target[:rows].copy()}
+        out = {"top1": self.top1[:rows].copy(), "target": self.target[:rows].copy(),
+               "drawn": self.drawn[:rows].copy()}
         for i, name in enumerate(FIELDS[1:]):
             out[name] = self.values[:rows, i].copy()
         return out
@@ -391,6 +405,7 @@ def sampled(w, logits, positions, tokens: list[int], gathered=None, k: int = 0) 
         got = from_gathered(gathered, k, targets)
     if spec.job is not None:
         spec.job.put(np.asarray(rows), got, targets)
+        spec.job.draw(np.asarray(rows), tokens)
 
 
 def from_gathered(g, k: int, targets: list[int]) -> np.ndarray:
