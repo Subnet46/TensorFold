@@ -1088,20 +1088,23 @@ class GlmEngine:
         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
         return auto, auto or not dflash, dflash
 
-    def _resume(self, prompt: list[int], code: list[int], measured: bool = False):
+    def _resume(self, prompt: list[int], code: list[int], measure=None):
         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
         the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``). A
-        ``measured`` request resumes only from a state that carries its rows' numbers (``Snapshot.sn46``)."""
+        measured request (rank 0's ``measure``, armed) resumes only from a state that carries its rows' numbers
+        (``Snapshot.sn46``) and admits its claims (``sn46_rows.admits``: a state whose top-1 differs from a claim is
+        passed over for a shorter one, so the differing row is scored fresh)."""
 
         _, mtp, dflash = self._drafters(code)
         best = None
         for snap in self.cache:
             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
             fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
-            fits = fits and (not measured or snap.sn46 is not None)
+            fits = fits and (measure is None or snap.sn46 is not None)
             short = len(snap.ids) < len(prompt) or (len(snap.ids) == len(prompt) and snap.head is not None)
             if fits and short and prompt[:len(snap.ids)] == snap.ids and (
-                    best is None or len(snap.ids) > len(best.ids)):
+                    best is None or len(snap.ids) > len(best.ids)) and (
+                    measure is None or sn46_rows.admits(snap.sn46, measure)):
                 best = snap
         return best
 
@@ -1420,7 +1423,7 @@ class GlmEngine:
         self._forget(stale)
         # a measured request resumes (from a state carrying its rows' numbers) and keeps only when its spec allows
         may_keep = draft and feed is None and (measure is None or measure.cache)
-        hit = self._resume(list(prompt), code, measured=measure is not None) if may_keep else None
+        hit = self._resume(list(prompt), code, measure) if may_keep else None
         shared = self._shared(list(prompt), hit) if may_keep else []
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,

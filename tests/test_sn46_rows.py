@@ -168,7 +168,7 @@ def test_a_kept_state_carries_its_rows_and_a_resumed_request_reports_a_fresh_pre
         rows.end()
 
 
-def test_a_measured_request_keeps_state_only_when_its_spec_allows_and_never_while_walking_targets():
+def test_a_measured_request_keeps_state_only_when_its_spec_allows_and_a_verifier_walk_may_keep_one():
     assert rows.keeps()                                                      # unmeasured: the engine's own policy
     rows._req = rows.Spec(record=False, prompt=[1, 2])
     try:
@@ -180,12 +180,67 @@ def test_a_measured_request_keeps_state_only_when_its_spec_allows_and_never_whil
     assert rows.Spec(record=True, cache=True).header()[4] == 1 and len(rows.NO_SPEC) == 7
     rows.ACTIVE = True
     try:
-        rows.arm(rows.Spec(record=True, targets=[2, 3, 4], prompt=[1, 2], cache=True))
+        walk = rows.Spec(record=True, targets=[2, 3, 4], claims=[2, -1, 4], prompt=[1, 2], cache=True)
+        rows.arm(walk)
+        assert rows.take_armed([1, 2], True) is walk                         # a verifier's walk keeps and resumes
+        rows.arm(rows.Spec(record=True, prompt=[1, 2], cache=True))
         with pytest.raises(rows.RowsError):
-            rows.take_armed([1, 2], True)
+            rows.take_armed([1, 2], True, images=True)                       # an image prompt still keeps nothing
         assert rows.disarm() is None                                         # refused specs are cleared
     finally:
         rows.ACTIVE = False
+
+
+def test_a_verifier_resumes_only_from_a_state_whose_top1_its_claims_name_and_reports_a_fresh_reduction():
+    """A verifier's claims on the kept rows are the miner's top-1: a state admits them when its top-1 equals every
+    claim (or there is none, -1); resuming then reports each claim's logit as the row's top-1 logit (-inf for none),
+    and row cut - 1 is reduced against the request's own claim, all as a fresh prefill would."""
+    g = torch.Generator().manual_seed(11)
+    V = 64
+    prompt = [10, 11, 12, 13, 14, 15]
+    logits = (torch.randn((4, V), generator=g) * 4).to(torch.bfloat16)        # the prefill of prompt[:4]
+    first = rows.Spec(record=True, prompt=prompt, cache=True)
+    rows.begin(first, prompt, 0)
+    try:
+        first.job.put(np.arange(4), rows.reduce(FakeWeights(), logits, prompt[1:5], [-1] * 4), prompt[1:5])
+        rows._last = (4, logits[3].clone())
+        kept = rows.kept(4)
+    finally:
+        rows.end()
+
+    later = [10, 11, 12, 13, 50]
+    output = [60, 61]
+    top1 = [int(t) for t in torch.argmax(logits.float(), 1)]
+    claims = [top1[0], -1, top1[2], 7, 8, 9]                                 # rows 0 .. 2 from the state, 3 fresh
+    spec = rows.Spec(record=True, targets=later[1:] + output, claims=claims, prompt=later, cache=True)
+    assert rows.admits(kept, spec)
+    rows.begin(spec, later, 0)
+    try:
+        rows.resume(FakeWeights(), kept, 4, later)
+        want = dense(logits, [11, 12, 13, 50], claims[:4]).numpy()
+        got = spec.job.values[:4]
+        assert spec.job.top1[:4].tolist() == want[:, 0].tolist()
+        assert got[0, 3] == got[0, 0] and got[2, 3] == got[2, 0]             # the claim is the top-1: its logit
+        assert np.isneginf(got[1, 3])                                        # no claim
+        np.testing.assert_allclose(got[:, :3], want[:, 1:4], rtol=0, atol=1e-5)
+        np.testing.assert_allclose(got[:, 3], want[:, 4], rtol=0, atol=1e-5)  # row 3 from its own claim, fresh
+        assert kept.got[0, 4] != got[0, 3] or claims[0] == -1                # the state's own record is untouched
+    finally:
+        rows.end()
+    assert spec.claims_array is None                                         # nothing of the claims outlives the run
+
+    differs = list(claims)
+    differs[1] = (top1[1] + 1) % V
+    wrong = rows.Spec(record=True, targets=later[1:] + output, claims=differs, prompt=later, cache=True)
+    assert not rows.admits(kept, wrong)
+    rows.begin(wrong, later, 0)
+    try:
+        with pytest.raises(rows.RowsError):
+            rows.resume(FakeWeights(), kept, 4, later)
+    finally:
+        rows.end()
+    assert rows.admits(kept, rows.Spec(record=True, prompt=later, cache=True))   # a miner claims nothing
+    assert not rows.admits(rows.Kept(4, None), spec)                         # no record to check against
 
 
 def test_a_specs_keep_duration_travels_in_int32_halves_and_comes_back_whole():
@@ -198,3 +253,31 @@ def test_a_specs_keep_duration_travels_in_int32_halves_and_comes_back_whole():
     assert (back.targets, back.claims) == ([2, 3], [-1, 4])
     assert rows.Spec.from_header(rows.Spec(record=True).header(), None, None).keep_for_ms is None
     assert rows.NO_SPEC[0] == 0 and len(rows.NO_SPEC) == len(header)
+
+
+def test_a_request_without_claims_resuming_a_scored_state_reports_no_claim_logits():
+    """A state a verifier's walk kept carries its claims' logits; a request without claims resuming from it reports
+    -inf for every claim logit, as a fresh reduction does, and leaves the state's record as it was."""
+    g = torch.Generator().manual_seed(13)
+    V = 64
+    prompt = [10, 11, 12, 13, 14, 15]
+    logits = (torch.randn((4, V), generator=g) * 4).to(torch.bfloat16)
+    top1 = [int(t) for t in torch.argmax(logits.float(), 1)]
+    walk = rows.Spec(record=True, targets=prompt[1:] + [60], claims=top1 + [-1, -1], prompt=prompt, cache=True)
+    rows.begin(walk, prompt, 0)
+    try:
+        walk.job.put(np.arange(4), rows.reduce(FakeWeights(), logits, prompt[1:5], top1), prompt[1:5])
+        rows._last = (4, logits[3].clone())
+        kept = rows.kept(4)
+    finally:
+        rows.end()
+    record = kept.got.copy()
+    assert np.isfinite(record[:, 4]).all()                                   # the walk's claim logits
+    plain = rows.Spec(record=True, prompt=prompt, cache=True)
+    rows.begin(plain, prompt, 0)
+    try:
+        rows.resume(FakeWeights(), kept, 4, prompt)
+        assert np.isneginf(plain.job.values[:4, 3]).all()                    # rows 0 .. 2 from the state, 3 fresh
+    finally:
+        rows.end()
+    np.testing.assert_array_equal(kept.got, record)

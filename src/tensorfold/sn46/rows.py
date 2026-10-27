@@ -81,6 +81,7 @@ class Spec:
     # (``begin``); the wall clock is never read, so stepping it changes nothing
     keep_by: float | None = field(default=None, repr=False, compare=False)
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
+    claims_array: "np.ndarray | None" = field(default=None, repr=False, compare=False)   # ``admits``' cache
 
     def header(self) -> list[int]:
         """Seven ints for ``share`` (int32 each: the keep duration travels as two 31-bit halves, 0 for none)."""
@@ -191,8 +192,6 @@ def take_armed(prompt: list[int], supported: bool, images: bool = False) -> Spec
         raise RowsError("targets must cover every prompt row")
     if spec.claims is not None and (spec.targets is None or len(spec.claims) != len(spec.targets)):
         raise RowsError("claims and targets cover different rows")
-    if spec.cache and spec.targets is not None:
-        raise RowsError("a request walking given targets keeps no prompt state")
     return spec
 
 
@@ -230,6 +229,8 @@ def begin(spec: Spec | None, prompt: list[int], rank: int) -> None:
 def end() -> None:
     global _req, _last
     spec, _req, _last = _req, None, None
+    if spec is not None:
+        spec.claims_array = None
     if spec is not None and spec.job is not None:
         spec.job.done.set()
 
@@ -374,10 +375,35 @@ def kept(n: int) -> Kept | None:
     return out
 
 
+def _claims_array(spec: Spec) -> np.ndarray:
+    """The spec's claims as an int64 array, made once (a verifier's run to the whole prompt and output)."""
+    if spec.claims_array is None or spec.claims_array.shape[0] != len(spec.claims):
+        spec.claims_array = np.asarray(spec.claims, np.int64)
+    return spec.claims_array
+
+
+def admits(kept: Kept, spec: Spec) -> bool:
+    """Rank 0, before a measured request resumes from ``kept``: whether the state's rows answer the request's claims
+    the way a fresh prefill would let them be reported, that is every claim on rows 0 .. n - 2 is the state's top-1
+    there or none (-1). A request without claims (a miner's) is admitted. A state whose top-1 differs from a claim is
+    refused: the request resumes from a shorter state, or prefills, and the claim's own logit is computed fresh."""
+    if spec.claims is None:
+        return True
+    if kept.got is None:
+        return False
+    n = kept.rows - 1
+    claims = _claims_array(spec)[:n]
+    if claims.shape[0] < n:
+        return False
+    return bool(((claims == kept.got[:, 0].astype(np.int64)) | (claims == -1)).all())
+
+
 def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
     """``engine._run_once``, when a measured request resumes from a kept state of ``cut`` tokens (every rank): rows
     0 .. cut - 2 come from the state's record, row cut - 1 is reduced from its kept logits against the token the
-    prompt puts at ``cut`` (none when the state is the whole prompt: the sampler reports that row)."""
+    prompt puts at ``cut`` (none when the state is the whole prompt: the sampler reports that row). A request with
+    claims (a verifier's) resumes only from a state that ``admits`` them; its claims' logits on the state's rows are
+    then the rows' top-1 logits (the claimed id is the top-1), -inf where it claims none, as a fresh reduction gives."""
     spec = _req
     if spec is None:
         return
@@ -386,7 +412,14 @@ def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
     if spec.job is not None and kept.got is None:
         raise RowsError("the kept state carries no record of its rows on the recording rank")
     if spec.job is not None and cut > 1:
-        spec.job.put(np.arange(cut - 1), kept.got, kept.targets.tolist())
+        got = kept.got.copy()                # the state's own record stays as the request that kept it left it
+        if spec.claims is None:              # no claims: every claim logit is -inf, as a fresh reduction gives
+            got[:, 4] = np.float32(-np.inf)
+        else:
+            if not admits(kept, spec):
+                raise RowsError("the kept state's top-1 differs from the request's claims")
+            got[:, 4] = np.where(_claims_array(spec)[:cut - 1] == -1, np.float32(-np.inf), got[:, 1])
+        spec.job.put(np.arange(cut - 1), got, kept.targets.tolist())
     if cut < len(prompt):
         row = cut - 1
         got = reduce(w, kept.last[None, :], [prompt[cut]], [_claim(spec, row)])

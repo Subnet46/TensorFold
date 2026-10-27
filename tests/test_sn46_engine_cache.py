@@ -179,3 +179,37 @@ def test_expired_live_ids_keep_only_the_prefix_a_kept_state_still_names():
     e.cache = []
     e._trim_live()
     assert e.live == []                                        # nothing kept names them: all forgotten
+def test_a_verifier_resumes_from_the_longest_state_whose_top1_its_claims_name():
+    """States of 4 and 8 tokens on a grid of 4, each with its rows' top-1 (rows 0 .. n - 2): all claims equal them
+    -> the 8; row 6 differs (only the 8 holds it) -> the 4; row 1 differs -> none; an unmeasured request takes the
+    longest whatever it carries."""
+    import numpy as np
+
+    from tensorfold.sn46 import rows
+
+    prompt = list(range(100, 110))
+    top1 = [7, 8, 9, 10, 11, 12, 13]
+    e = bare(0.0)
+    e.grid, e.drafter = 4, None
+    for n in (4, 8):
+        s = snap(prompt[:n])
+        s.mtp_len = 0
+        got = np.zeros((n - 1, 5), np.float32)
+        got[:, 0] = top1[:n - 1]
+        s.sn46 = rows.Kept(n, torch.zeros(1), got, np.asarray(prompt[1:n], np.int64))
+        e._remember(s)
+    code = [0]
+
+    def measure(claims):
+        return rows.Spec(record=True, targets=prompt[1:] + [1], claims=claims, prompt=prompt, cache=True)
+
+    claims = top1 + [-1, -1, -1]
+    assert len(e._resume(prompt, code, measure(claims)).ids) == 8
+    assert len(e._resume(prompt, code, measure([-1] * 3 + top1[3:] + [-1] * 3)).ids) == 8    # no claim: admitted
+    row6 = list(claims)
+    row6[6] = 99
+    assert len(e._resume(prompt, code, measure(row6)).ids) == 4
+    row1 = list(claims)
+    row1[1] = 99
+    assert e._resume(prompt, code, measure(row1)) is None
+    assert len(e._resume(prompt, code).ids) == 8                                           # unmeasured
