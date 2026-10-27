@@ -17,11 +17,14 @@ For each row the engine reduces the full-vocabulary fp32 logits, over every rank
 
 A measured request keeps prompt snapshots and resumes from them only when its spec says it may (``Spec.cache``, the
 operator's per-request retention decision); otherwise it leaves no state and no tokens named in the engine
-(``engine._run``). A kept state carries its rows' numbers (``Kept``: rank 0's record of every row before the last,
-and each rank's logits shard of the last row, whose target is the next prompt's token), so a request resuming from it
-reports the same numbers for those rows as a fresh prefill would (``resume``); the engine keeps states only where a
-fresh prefill's chunks would start (``TF_GLM_PROMPT_GRID=chunk``), so the rows past the resume point are computed in
-the same chunks too.
+(``engine._run``). A spec may also name how long its states may be kept (``Spec.keep_for_ms``, from the request's start,
+on the monotonic clock: no wall clock is read): the states the request keeps carry that cutoff, a request resuming one
+raises it to its own (never lowers it), and a state is dropped at its cutoff or TF_GLM_CACHE_TTL after its last use,
+whichever comes first (``engine._stale``). A kept state carries its rows' numbers (``Kept``: rank 0's record of every
+row before the last, and each rank's logits shard of the last row, whose target is the next prompt's token), so a
+request resuming from it reports the same numbers for those rows as a fresh prefill would (``resume``); the engine keeps
+states only where a fresh prefill's chunks would start (``TF_GLM_PROMPT_GRID=chunk``), so the rows past the resume point
+are computed in the same chunks too.
 
 Prompt rows are reduced in the prefill (``prompt``: one head matmul over the chunk's final-normed rows, in
 sub-chunks, one all-gather each). Decode rows ride on the sampler's own all-gather: ``tail`` appends each rank's
@@ -43,6 +46,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -70,14 +74,28 @@ class Spec:
     claims: list[int] | None = None
     prompt: list[int] | None = None      # the prompt the operator began the measurement for (the request must match)
     cache: bool = False                  # the request may resume from kept prompt states and keep its own
+    # ms from the request's start after which the states this request keeps or resumes are dropped, whatever their
+    # last use (the operator's retention bound for the content); None: only TF_GLM_CACHE_TTL bounds them
+    keep_for_ms: int | None = None
+    # the cutoff on this rank's monotonic clock (``time.monotonic()`` seconds), set when the request starts
+    # (``begin``); the wall clock is never read, so stepping it changes nothing
+    keep_by: float | None = field(default=None, repr=False, compare=False)
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
 
     def header(self) -> list[int]:
+        """Seven ints for ``share`` (int32 each: the keep duration travels as two 31-bit halves, 0 for none)."""
+        keep = self.keep_for_ms or 0
         return [1, int(self.record), -1 if self.targets is None else len(self.targets),
-                -1 if self.claims is None else len(self.claims), int(self.cache)]
+                -1 if self.claims is None else len(self.claims), int(self.cache), keep & 0x7FFFFFFF, keep >> 31]
+
+    @classmethod
+    def from_header(cls, header: list[int], targets: list[int] | None, claims: list[int] | None) -> "Spec":
+        """A follower's spec from rank 0's ``header`` and the targets and claims sent after it."""
+        keep = (int(header[6]) << 31) | int(header[5])
+        return cls(record=False, targets=targets, claims=claims, cache=bool(header[4]), keep_for_ms=keep or None)
 
 
-NO_SPEC = [0, 0, -1, -1, 0]
+NO_SPEC = [0, 0, -1, -1, 0, 0, 0]
 
 
 @dataclass
@@ -194,7 +212,7 @@ def share(engine, spec: Spec | None) -> Spec | None:
         return None
     targets = engine._share(None) if header[2] >= 0 else None
     claims = engine._share(None) if header[3] >= 0 else None
-    return Spec(record=False, targets=targets, claims=claims, cache=bool(header[4]))
+    return Spec.from_header(header, targets, claims)
 
 
 def begin(spec: Spec | None, prompt: list[int], rank: int) -> None:
@@ -205,6 +223,7 @@ def begin(spec: Spec | None, prompt: list[int], rank: int) -> None:
         return
     spec.job = Job(spec, list(prompt)) if spec.record and rank == 0 else None
     spec.prompt = list(prompt)
+    spec.keep_by = None if spec.keep_for_ms is None else time.monotonic() + spec.keep_for_ms / 1000
     _req = spec
 
 
@@ -219,6 +238,12 @@ def keeps() -> bool:
     """Whether the running request may keep prompt states and resume from kept ones (every rank): an unmeasured
     request does, a measured one when its spec says so."""
     return _req is None or _req.cache
+
+
+def keep_by() -> float | None:
+    """The running request's deadline as a monotonic cutoff (``Spec.keep_by``, every rank), None when it sets none or
+    is not measured."""
+    return _req.keep_by if _req is not None else None
 
 
 def _target(spec: Spec, row: int, sampled: int | None) -> int:

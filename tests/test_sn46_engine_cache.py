@@ -79,7 +79,103 @@ def test_a_reused_state_counts_its_ttl_from_its_last_use_and_forgetting_frees_th
     e.cache[0].kept_at -= 20
     e.live = [2] * 4 + [9]
     e._forget(e._stale())
-    assert [c.ids for c in e.cache] == [[2] * 4] and e.live == [2] * 4 + [9]   # a kept prefix of the live ids
+    assert [c.ids for c in e.cache] == [[2] * 4] and e.live == [2] * 4      # cut to the kept prefix of the live ids
     e.cache[0].kept_at -= 20
     e._forget(e._stale())
     assert e.cache == [] and e.live == []                                       # nothing kept names them
+
+
+def test_a_kept_state_past_its_deadline_is_dropped_whatever_its_last_use():
+    import time
+
+    now = time.monotonic()
+    for ttl in (0.0, 600.0):                                    # with the TTL off, and well inside it
+        e = bare(ttl)
+        for ids, by in (([1] * 4, now - 0.001), ([2] * 4, now + 60), ([3] * 4, None)):
+            s = snap(ids)
+            s.keep_by = by
+            e._remember(s)
+        assert e._stale() == [0]                                # used just now, but past its deadline
+        e._forget(e._stale())
+        assert [c.ids for c in e.cache] == [[2] * 4, [3] * 4]
+    e = bare(10.0)
+    s = snap([4] * 4)
+    s.keep_by = now + 60
+    e._remember(s)
+    e.cache[0].kept_at -= 11
+    assert e._stale() == [0]                                    # the TTL still drops a state inside its deadline
+
+
+def test_a_wall_clock_step_changes_nothing(monkeypatch):
+    """The keep duration becomes a monotonic cutoff when the request starts; the wall clock is never read: stepped back
+    an hour (or forward) it changes nothing, the state goes when the monotonic clock passes the cutoff."""
+    import time
+
+    from tensorfold.sn46 import rows
+
+    wall, mono = time.time(), time.monotonic()
+    monkeypatch.setattr(time, "time", lambda: wall)
+    monkeypatch.setattr(time, "monotonic", lambda: mono)
+    spec = rows.Spec(record=False, prompt=[1] * 4, cache=True, keep_for_ms=1_000)
+    rows.begin(spec, [1] * 4, 1)
+    try:
+        assert abs(rows.keep_by() - (mono + 1.0)) < 0.01
+        by = rows.keep_by()
+    finally:
+        rows.end()
+    e = bare(600.0)
+    s = snap([1] * 4)
+    s.keep_by = by
+    e._remember(s)
+    monkeypatch.setattr(time, "time", lambda: wall - 3_600)    # the wall clock steps back an hour
+    monkeypatch.setattr(time, "monotonic", lambda: mono + 0.5)
+    assert e._stale() == []
+    monkeypatch.setattr(time, "time", lambda: wall + 3_600)    # or forward
+    assert e._stale() == []
+    monkeypatch.setattr(time, "monotonic", lambda: mono + 1.5)
+    assert e._stale() == [0]
+
+
+def test_a_resuming_request_raises_a_states_deadline_and_never_lowers_it():
+    e = bare(10.0)
+    s = snap([1] * 4)
+    s.keep_by, s.kept_at = 1.0, 0.0
+    e._touch(s, 5.0)
+    assert s.keep_by == 5.0 and s.kept_at > 0                 # extended, and its TTL counts from now
+    e._touch(s, 2.0)
+    assert s.keep_by == 5.0                                   # an earlier deadline does not shorten it
+    e._touch(s, None)
+    assert s.keep_by == 5.0                                   # nor does a request without one
+    free = snap([2] * 4)
+    e._touch(free, 9.0)
+    assert free.keep_by is None                               # a TTL-only state stays TTL-only
+
+
+def test_a_raised_deadline_drops_the_source_prompts_rendering():
+    """TF_W1_INCREMENTAL keeps the whole source prompt's rendering (text and ids past the state) with a grid state:
+    a later request raising the state's deadline must not keep that suffix alive with it."""
+    e = bare(10.0)
+    s = snap([1] * 4)
+    s.keep_by, s.w1_rendered = 1.0, ("the source prompt's rendering", 4)
+    e._touch(s, 0.5)
+    assert s.w1_rendered is not None                          # not raised: the source's own deadline still holds
+    e._touch(s, 5.0)
+    assert s.keep_by == 5.0 and s.w1_rendered is None
+
+
+def test_expired_live_ids_keep_only_the_prefix_a_kept_state_still_names():
+    """A request resumed from an older state whose deadline is later than its own: once its deadline passes, the
+    live ids keep that state's prefix, never the request's own suffix and reply."""
+    e = bare(600.0)
+    older, longer = snap([1] * 4), snap([1] * 8)
+    for s in (older, longer):
+        e._remember(s)
+    e.live, e.live_by = [1] * 4 + [5, 6, 7], 1.0              # the request's prompt suffix and reply past [1] * 4
+    e._trim_live()
+    assert e.live == [1] * 4 and e.live_by is None             # the longest kept prefix of them, not [1] * 8
+    e.live = [1] * 8 + [9]
+    e._trim_live()
+    assert e.live == [1] * 8
+    e.cache = []
+    e._trim_live()
+    assert e.live == []                                        # nothing kept names them: all forgotten

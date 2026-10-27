@@ -911,6 +911,9 @@ class GlmEngine:
         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
         self.cache: list = []
         self.live: list[int] = []
+        # ``time.monotonic()`` past which the live ids are forgotten (the deadline of the measured request that left
+        # them, ``sn46.rows.Spec.keep_by``; the ``sn46`` extension's expiry drops them), None: TF_GLM_CACHE_TTL alone
+        self.live_by: float | None = None
         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
         # TF_GLM_CACHE_TTL: seconds a kept prompt state outlives its last use (0: until evicted); rank 0's clock
         # decides, and the request carries the drops to the other ranks, so every rank keeps the same states
@@ -1109,25 +1112,44 @@ class GlmEngine:
 
     def _stale(self) -> list[int]:
         """Rank 0: the indexes (in ``cache`` order, which every rank shares) of the kept states past
-        TF_GLM_CACHE_TTL since their last use."""
-        if not self.cache_ttl:
-            return []
+        TF_GLM_CACHE_TTL since their last use, or past their deadline (``Snapshot.keep_by``) whatever their last use,
+        both on the monotonic clock."""
         now = time.monotonic()
-        return [i for i, c in enumerate(self.cache) if now - c.kept_at > self.cache_ttl]
+        return [i for i, c in enumerate(self.cache)
+                if (self.cache_ttl and now - c.kept_at > self.cache_ttl)
+                or (c.keep_by is not None and now > c.keep_by)]
+
+    def _touch(self, hit, by: float | None) -> None:
+        """A request resumes from ``hit`` now: TF_GLM_CACHE_TTL counts from here, and a measured request's deadline
+        (``by``, a monotonic cutoff) raises the state's, never lowers it; a raised state keeps no source rendering."""
+        hit.kept_at = time.monotonic()
+        if by is not None and hit.keep_by is not None and by > hit.keep_by:
+            hit.keep_by = by
+            # TF_W1_INCREMENTAL: the rendering kept with the state is its source prompt's whole (text and ids past
+            # the state); that prompt's request did not ask for the later deadline, so its rendering goes now
+            hit.w1_rendered = None
 
     def _forget(self, stale: list[int]) -> None:
         """Every rank: drop the states rank 0 found stale (``_stale``), sent with the request or by the operator's
-        expiry (``sn46`` extension) while the engine idles. The live caches' ids are forgotten too once no kept
-        state names a prefix of them."""
+        expiry (``sn46`` extension) while the engine idles. The live caches' ids are cut back to what a kept state
+        still names (``_trim_live``)."""
         for i in sorted(set(int(i) for i in stale), reverse=True):
             if 0 <= i < len(self.cache):
                 self._drop(self.cache[i])
         if stale:
-            if not any(self.live[:len(c.ids)] == c.ids for c in self.cache):
-                self.live = []
+            self._trim_live()
             import torch
 
             torch.cuda.empty_cache()
+
+    def _trim_live(self) -> None:
+        """Every rank: forget the live caches' ids past the longest kept state that names a prefix of them (all of
+        them when none does). Only kept states read the live rows, and each is bounded by its own deadline and TTL:
+        the request that left the rest (its own prompt suffix and reply) holds them no longer, so they never outlive
+        its deadline because an older state it resumed from lives on."""
+        keep = max((len(c.ids) for c in self.cache if self.live[:len(c.ids)] == c.ids), default=0)
+        self.live = self.live[:keep]
+        self.live_by = None
 
     def _remember(self, snap) -> None:
         for c in [c for c in self.cache if c.ids == snap.ids and c is not snap]:
@@ -1215,6 +1237,8 @@ class GlmEngine:
             return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
         finally:
             self.e.constraint = self.e.window = None
+            # the live ids are this request's from here: forgotten by its deadline (the extension's expiry)
+            self.live_by = sn46_rows.keep_by()
             sn46_rows.end()
             if measure is not None and not measure.cache:
                 self.live = []                  # nothing of a request that may not be kept stays named in the engine
@@ -1237,7 +1261,7 @@ class GlmEngine:
             load_rows(self.e, hit, drafter=self._kept_drafter())
             hit.rows, hit.nbytes = None, 0            # live again
         if hit is not None:
-            hit.kept_at = time.monotonic()            # used now: TF_GLM_CACHE_TTL counts from here
+            self._touch(hit, sn46_rows.keep_by())       # used now: TF_GLM_CACHE_TTL counts from here
         # a measured request's rows before the resume point: the kept state's numbers (every rank reduces its last)
         if hit is not None and sn46_rows.measuring():
             sn46_rows.resume(self.e.w, hit.sn46, cut, list(prompt))
@@ -1263,7 +1287,7 @@ class GlmEngine:
             prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=resume, sample=False)
             resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
                                    drafter=drafter)
-            resume.sn46 = sn46_rows.kept(stop)
+            resume.sn46, resume.keep_by = sn46_rows.kept(stop), sn46_rows.keep_by()
             kept.append(resume)
         # a replay of a kept prompt (``decode.whole``: its state and head's logits row) prefills nothing and keeps
         # nothing new; a prompt's own end state keeps the head's row it sampled from, for a later replay
@@ -1276,7 +1300,7 @@ class GlmEngine:
             snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
                                  drafter=drafter)
             snap.head, self.e.head = self.e.head, None
-            snap.sn46 = sn46_rows.kept(len(prompt))
+            snap.sn46, snap.keep_by = sn46_rows.kept(len(prompt)), sn46_rows.keep_by()
             kept.append(snap)
         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
             self.cache = [c for c in self.cache if c is not hit] + [hit]

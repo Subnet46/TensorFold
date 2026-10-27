@@ -177,7 +177,7 @@ def test_a_measured_request_keeps_state_only_when_its_spec_allows_and_never_whil
         assert rows.keeps()
     finally:
         rows._req = None
-    assert rows.Spec(record=True, cache=True).header()[4] == 1 and len(rows.NO_SPEC) == 5
+    assert rows.Spec(record=True, cache=True).header()[4] == 1 and len(rows.NO_SPEC) == 7
     rows.ACTIVE = True
     try:
         rows.arm(rows.Spec(record=True, targets=[2, 3, 4], prompt=[1, 2], cache=True))
@@ -186,3 +186,15 @@ def test_a_measured_request_keeps_state_only_when_its_spec_allows_and_never_whil
         assert rows.disarm() is None                                         # refused specs are cleared
     finally:
         rows.ACTIVE = False
+
+
+def test_a_specs_keep_duration_travels_in_int32_halves_and_comes_back_whole():
+    """``share`` moves int32s: a duration past 2**31 ms goes as two 31-bit halves (0 for none)."""
+    keep = 2**40 + 123                                                       # well above int32
+    header = rows.Spec(record=True, targets=[2, 3], claims=[-1, 4], cache=True, keep_for_ms=keep).header()
+    assert len(header) == 7 and all(0 <= v < 2**31 for v in header[4:])
+    back = rows.Spec.from_header(header, [2, 3], [-1, 4])
+    assert (back.keep_for_ms, back.cache, back.record) == (keep, True, False)
+    assert (back.targets, back.claims) == ([2, 3], [-1, 4])
+    assert rows.Spec.from_header(rows.Spec(record=True).header(), None, None).keep_for_ms is None
+    assert rows.NO_SPEC[0] == 0 and len(rows.NO_SPEC) == len(header)

@@ -360,6 +360,9 @@ class Snapshot:
     # measured request resuming here reports them; None when an unmeasured request kept it
     sn46: object | None = None
     kept_at: float = 0.0          # ``time.monotonic()`` when last kept (TF_GLM_CACHE_TTL, rank 0's clock)
+    # ``time.monotonic()`` past which the state is dropped whatever its last use (``sn46.rows.Spec.keep_by``: the latest
+    # deadline of the measured requests that kept or resumed it), None: TF_GLM_CACHE_TTL alone
+    keep_by: float | None = None
 
 
 def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
