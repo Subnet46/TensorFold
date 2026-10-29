@@ -281,3 +281,37 @@ def test_a_request_without_claims_resuming_a_scored_state_reports_no_claim_logit
     finally:
         rows.end()
     np.testing.assert_array_equal(kept.got, record)
+
+
+def test_a_verifier_resuming_on_top1_right_claims_gets_the_kept_states_recorded_numbers():
+    """A state is admitted on its top-1 alone, so a claim whose top-1 is right but whose log-probability is not must
+    still be judged against real numbers: the resumed rows' top-1 logit, log-sum-exp and target logit are the kept
+    state's record, bit for bit (the numbers a fresh prefill gave), not anything derived from the claims."""
+    g = torch.Generator().manual_seed(17)
+    V = 64
+    prompt = [10, 11, 12, 13, 14, 15]
+    logits = (torch.randn((4, V), generator=g) * 4).to(torch.bfloat16)        # the prefill of prompt[:4]
+    first = rows.Spec(record=True, prompt=prompt, cache=True)
+    rows.begin(first, prompt, 0)
+    try:
+        first.job.put(np.arange(4), rows.reduce(FakeWeights(), logits, prompt[1:5], [-1] * 4), prompt[1:5])
+        rows._last = (4, logits[3].clone())
+        kept = rows.kept(4)
+    finally:
+        rows.end()
+
+    top1 = [int(t) for t in torch.argmax(logits.float(), 1)]
+    claims = top1[:3] + [7, 8, 9]                                            # every kept row's claim is its top-1
+    spec = rows.Spec(record=True, targets=prompt[1:] + [60], claims=claims, prompt=prompt, cache=True)
+    assert rows.admits(kept, spec)
+    rows.begin(spec, prompt, 0)
+    try:
+        rows.resume(FakeWeights(), kept, 4, prompt)
+        np.testing.assert_array_equal(spec.job.top1[:3], kept.got[:, 0].astype(np.int64))
+        np.testing.assert_array_equal(spec.job.values[:3, :3], kept.got[:, 1:4])  # top-1 logit, lse, target logit
+        want = dense(logits[:3], prompt[1:4], claims[:3]).numpy()
+        np.testing.assert_allclose(spec.job.values[:3, :3], want[:, 1:4], rtol=0, atol=1e-5)
+        logprob = spec.job.values[:3, 2] - spec.job.values[:3, 1]             # the target's log-probability
+        np.testing.assert_allclose(logprob, want[:, 3] - want[:, 2], rtol=0, atol=1e-5)
+    finally:
+        rows.end()
