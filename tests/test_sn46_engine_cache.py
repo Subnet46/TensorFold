@@ -213,3 +213,45 @@ def test_a_verifier_resumes_from_the_longest_state_whose_top1_its_claims_name():
     row1[1] = 99
     assert e._resume(prompt, code, measure(row1)) is None
     assert len(e._resume(prompt, code).ids) == 8                                           # unmeasured
+
+
+def test_a_request_drops_at_its_start_every_state_whose_deadline_falls_inside_its_horizon_but_the_one_it_resumes():
+    """The operator's expiry waits while a request holds the engine, so a state whose deadline passes meanwhile would
+    outlive it by up to the whole request: a request naming its horizon (``Spec.horizon_ms``, the walk's bound) drops,
+    as it starts, every state whose deadline is before now + horizon, except the one it resumes (whose deadline it
+    raises to its own). States past the horizon, TTL-only states and states already stale are left as they were."""
+    import time
+
+    from tensorfold.sn46 import rows
+
+    now = time.monotonic()
+    e = bare(0.0)
+    e.grid, e.drafter = 4, None
+    prompt = [9] * 8 + [1, 2]
+    for ids, by in (([1] * 4, now + 5), ([9] * 4, now + 5), ([9] * 8, now + 30), ([2] * 4, now + 120),
+                    ([3] * 4, None), ([4] * 4, now - 1)):
+        s = snap(ids)
+        s.keep_by, s.mtp_len, s.sn46 = by, 0, rows.Kept(len(ids), torch.zeros(1))
+        e._remember(s)
+    stale = e._stale()
+    assert stale == [5]                                          # past its deadline already
+    spec = rows.Spec(record=False, prompt=prompt, cache=True, keep_for_ms=60_000, horizon_ms=60_000)
+    hit = e._resume(prompt, [0], spec, skip=stale)
+    assert hit.ids == [9] * 8                                    # the longest prefix, inside the horizon: resumed
+    beyond = e._horizon_stale(spec, hit, stale)
+    assert [e.cache[i].ids for i in beyond] == [[1] * 4, [9] * 4]
+    e._forget(sorted(stale + beyond))
+    assert [c.ids for c in e.cache] == [[9] * 8, [2] * 4, [3] * 4]
+    assert hit in e.cache
+    # without a horizon (a miner's request, or a verifier's before this rule) nothing more goes
+    assert e._horizon_stale(rows.Spec(record=False, cache=True), None, []) == []
+    assert e._horizon_stale(None, None, []) == []
+    # a state about to be dropped is never resumed: the next longest is
+    e2 = bare(0.0)
+    e2.grid, e2.drafter = 4, None
+    for ids in ([9] * 4, [9] * 8):
+        s = snap(ids)
+        s.mtp_len, s.sn46 = 0, rows.Kept(len(ids), torch.zeros(1))
+        e2._remember(s)
+    assert e2._resume(prompt, [0], spec).ids == [9] * 8
+    assert e2._resume(prompt, [0], spec, skip=[1]).ids == [9] * 4

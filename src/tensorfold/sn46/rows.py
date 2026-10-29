@@ -20,7 +20,9 @@ operator's per-request retention decision); otherwise it leaves no state and no 
 (``engine._run``). A spec may also name how long its states may be kept (``Spec.keep_for_ms``, from the request's start,
 on the monotonic clock: no wall clock is read): the states the request keeps carry that cutoff, a request resuming one
 raises it to its own (never lowers it), and a state is dropped at its cutoff or TF_GLM_CACHE_TTL after its last use,
-whichever comes first (``engine._stale``). A kept state carries its rows' numbers (``Kept``: rank 0's record of every
+whichever comes first (``engine._stale``). A request may also name how long it may hold the
+engine (``Spec.horizon_ms``, rank 0's only): every state it does not resume whose cutoff falls before that is dropped
+when it starts, so no cutoff passes while the expiry waits behind the request. A kept state carries its rows' numbers (``Kept``: rank 0's record of every
 row before the last, and each rank's logits shard of the last row, whose target is the next prompt's token), so a
 request resuming from it reports the same numbers for those rows as a fresh prefill would (``resume``); the engine keeps
 states only where a fresh prefill's chunks would start (``TF_GLM_PROMPT_GRID=chunk``), so the rows past the resume point
@@ -80,6 +82,11 @@ class Spec:
     # the cutoff on this rank's monotonic clock (``time.monotonic()`` seconds), set when the request starts
     # (``begin``); the wall clock is never read, so stepping it changes nothing
     keep_by: float | None = field(default=None, repr=False, compare=False)
+    # rank 0 only (never shared): the longest this request may hold the engine, ms from its start (a verifier's walk
+    # bound). The engine's expiry waits for a running request, so a state whose cutoff falls inside that time could
+    # outlive it by the whole walk: at the request's start every state it does not resume whose cutoff is that close
+    # is dropped (``engine._horizon_stale``). None: no state is dropped for it
+    horizon_ms: int | None = None
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
     claims_array: "np.ndarray | None" = field(default=None, repr=False, compare=False)   # ``admits``' cache
 
