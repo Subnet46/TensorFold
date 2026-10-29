@@ -255,3 +255,37 @@ def test_a_request_drops_at_its_start_every_state_whose_deadline_falls_inside_it
         e2._remember(s)
     assert e2._resume(prompt, [0], spec).ids == [9] * 8
     assert e2._resume(prompt, [0], spec, skip=[1]).ids == [9] * 4
+
+
+def test_a_verifier_naming_logprobs_resumes_from_the_longest_state_whose_rows_hold_them_all():
+    """States of 4 and 8 tokens whose rows' claimed log-probabilities are -1.0: honest claims resume the 8; one
+    shifted past eps on a row only the 8 holds resumes the 4; on row 1, nothing (a fresh prefill, judged whole)."""
+    import numpy as np
+
+    from tensorfold.sn46 import rows
+
+    prompt = list(range(100, 110))
+    top1 = [7, 8, 9, 10, 11, 12, 13]
+    e = bare(0.0)
+    e.grid, e.drafter = 4, None
+    for n in (4, 8):
+        s = snap(prompt[:n])
+        s.mtp_len = 0
+        got = np.zeros((n - 1, 5), np.float32)
+        got[:, 0] = top1[:n - 1]
+        got[:, 2], got[:, 3] = 3.0, 2.0                                     # target logit - lse = -1.0
+        s.sn46 = rows.Kept(n, torch.zeros(1), got, np.asarray(prompt[1:n], np.int64))
+        e._remember(s)
+
+    def measure(logprobs):
+        return rows.Spec(record=True, targets=prompt[1:] + [1], claims=top1 + [-1, -1, -1], prompt=prompt,
+                         cache=True, claim_logprobs=np.asarray(logprobs, np.float32), logprob_eps=1e-3)
+
+    honest = [-1.0] * 10
+    assert len(e._resume(prompt, [0], measure(honest)).ids) == 8
+    row6 = list(honest)
+    row6[6] = -1.01
+    assert len(e._resume(prompt, [0], measure(row6)).ids) == 4
+    row1 = list(honest)
+    row1[1] = -0.99
+    assert e._resume(prompt, [0], measure(row1)) is None

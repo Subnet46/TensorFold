@@ -87,6 +87,12 @@ class Spec:
     # outlive it by the whole walk: at the request's start every state it does not resume whose cutoff is that close
     # is dropped (``engine._horizon_stale``). None: no state is dropped for it
     horizon_ms: int | None = None
+    # rank 0 only (never shared): the claimed log-probability of each row's target (float32 values, at least one per
+    # prompt row but the last) and how far a kept state's may be from it (the token check's ``logprob_eps``): a
+    # request naming them resumes only from a state whose rows hold every claim within it (``admits``), so a row it
+    # skips is one the check would pass
+    claim_logprobs: "np.ndarray | object | None" = field(default=None, repr=False, compare=False)
+    logprob_eps: float | None = None
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
     claims_array: "np.ndarray | None" = field(default=None, repr=False, compare=False)   # ``admits``' cache
 
@@ -389,11 +395,21 @@ def _claims_array(spec: Spec) -> np.ndarray:
     return spec.claims_array
 
 
+def logprob_deltas(logprobs: np.ndarray, lse: np.ndarray, target_logit: np.ndarray) -> np.ndarray:
+    """|claimed log-probability - (target logit - log-sum-exp)| per row, in float32 as the token check computes it
+    (each operation rounded to float32, so the same inputs give the same bits on both sides)."""
+    lp = np.asarray(logprobs, np.float32)
+    return np.abs(lp - (np.asarray(target_logit, np.float32) - np.asarray(lse, np.float32)))
+
+
 def admits(kept: Kept, spec: Spec) -> bool:
     """Rank 0, before a measured request resumes from ``kept``: whether the state's rows answer the request's claims
     the way a fresh prefill would let them be reported, that is every claim on rows 0 .. n - 2 is the state's top-1
-    there or none (-1). A request without claims (a miner's) is admitted. A state whose top-1 differs from a claim is
-    refused: the request resumes from a shorter state, or prefills, and the claim's own logit is computed fresh."""
+    there or none (-1), and, when the request names its claimed log-probabilities (``Spec.claim_logprobs``), each of
+    those rows' is finite and within ``Spec.logprob_eps`` of the state's (``logprob_deltas``): every row resumed is
+    then one the token check passes, so a verifier may leave it unread. A request without claims (a miner's) is
+    admitted. A state either rule refuses is passed over: the request resumes from a shorter state, or prefills, and
+    the rows are computed fresh."""
     if spec.claims is None:
         return True
     if kept.got is None:
@@ -402,7 +418,15 @@ def admits(kept: Kept, spec: Spec) -> bool:
     claims = _claims_array(spec)[:n]
     if claims.shape[0] < n:
         return False
-    return bool(((claims == kept.got[:, 0].astype(np.int64)) | (claims == -1)).all())
+    if not ((claims == kept.got[:, 0].astype(np.int64)) | (claims == -1)).all():
+        return False
+    if spec.claim_logprobs is None:
+        return True
+    lp = np.asarray(spec.claim_logprobs, np.float32)[:n]       # any float32 sequence: the operator's, as it decoded it
+    if lp.shape[0] < n or spec.logprob_eps is None or not np.isfinite(lp).all():
+        return False
+    deltas = logprob_deltas(lp, kept.got[:, 2], kept.got[:, 3])
+    return bool((deltas <= np.float32(spec.logprob_eps)).all())
 
 
 def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
