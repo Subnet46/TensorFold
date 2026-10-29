@@ -123,6 +123,9 @@ class Job:
     values: np.ndarray = field(default_factory=lambda: np.full((0, 4), np.nan, np.float32))
     drawn: np.ndarray = field(default_factory=lambda: np.full(0, -1, np.int64))
     done: threading.Event = field(default_factory=threading.Event)
+    # the tokens the request resumed from a kept state (``resume``; 0: a fresh prefill): rows 0 .. resumed - 2 are the
+    # state's record, which ``admits`` held to the request's claims, so an operator may leave them unread
+    resumed: int = 0
 
     def put(self, rows: np.ndarray, got: np.ndarray, targets: list[int]) -> None:
         """``got`` [n, 5] (top1 id, top1 logit, lse, target logit, claim logit) for ``rows``, whose targets were
@@ -442,6 +445,8 @@ def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
         raise RowsError(f"the kept state of {cut} tokens carries no row numbers")
     if spec.job is not None and kept.got is None:
         raise RowsError("the kept state carries no record of its rows on the recording rank")
+    if spec.job is not None:
+        spec.job.resumed = cut
     if spec.job is not None and cut > 1:
         got = kept.got.copy()                # the state's own record stays as the request that kept it left it
         if spec.claims is None:              # no claims: every claim logit is -inf, as a fresh reduction gives

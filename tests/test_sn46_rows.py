@@ -216,7 +216,9 @@ def test_a_verifier_resumes_only_from_a_state_whose_top1_its_claims_name_and_rep
     assert rows.admits(kept, spec)
     rows.begin(spec, later, 0)
     try:
+        assert spec.job.resumed == 0
         rows.resume(FakeWeights(), kept, 4, later)
+        assert spec.job.resumed == 4                                         # the resume point, for the operator
         want = dense(logits, [11, 12, 13, 50], claims[:4]).numpy()
         got = spec.job.values[:4]
         assert spec.job.top1[:4].tolist() == want[:, 0].tolist()
