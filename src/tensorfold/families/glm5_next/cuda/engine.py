@@ -1088,16 +1088,20 @@ class GlmEngine:
         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
         return auto, auto or not dflash, dflash
 
-    def _resume(self, prompt: list[int], code: list[int], measure=None):
+    def _resume(self, prompt: list[int], code: list[int], measure=None, skip=()):
         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
         the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``). A
         measured request (rank 0's ``measure``, armed) resumes only from a state that carries its rows' numbers
         (``Snapshot.sn46``) and admits its claims (``sn46_rows.admits``: a state whose top-1 differs from a claim is
-        passed over for a shorter one, so the differing row is scored fresh)."""
+        passed over for a shorter one, so the differing row is scored fresh). ``skip``: indexes (in ``cache``
+        order) of states about to be dropped, which nothing resumes."""
 
         _, mtp, dflash = self._drafters(code)
         best = None
-        for snap in self.cache:
+        skip = set(skip)
+        for i, snap in enumerate(self.cache):
+            if i in skip:
+                continue
             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
             fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
             fits = fits and (measure is None or snap.sn46 is not None)
@@ -1121,6 +1125,20 @@ class GlmEngine:
         return [i for i, c in enumerate(self.cache)
                 if (self.cache_ttl and now - c.kept_at > self.cache_ttl)
                 or (c.keep_by is not None and now > c.keep_by)]
+
+    def _horizon_stale(self, measure, hit, stale: list[int]) -> list[int]:
+        """Rank 0, at a measured request's start: the indexes of the kept states (in ``cache`` order) that a request
+        holding the engine for its ``Spec.horizon_ms`` could keep past their deadline, beyond ``stale``. The
+        operator's expiry runs only while no request does, so a state whose deadline (``Snapshot.keep_by``) falls
+        before now + the horizon would live on until the request ends; each one the request does not resume
+        (``hit``, whose deadline the request raises to its own) is dropped now instead."""
+        horizon = getattr(measure, "horizon_ms", None) if measure is not None else None
+        if not horizon:
+            return []
+        cutoff = time.monotonic() + horizon / 1000
+        gone = set(stale)
+        return [i for i, c in enumerate(self.cache)
+                if i not in gone and c is not hit and c.keep_by is not None and c.keep_by < cutoff]
 
     def _touch(self, hit, by: float | None) -> None:
         """A request resumes from ``hit`` now: TF_GLM_CACHE_TTL counts from here, and a measured request's deadline
@@ -1418,12 +1436,15 @@ class GlmEngine:
             if measure is not None:          # where two hosts' rows part: the fitted pixels, or the tower's features
                 feed.hashes = {"image_hash": getattr(vision, "content_hash", ""),
                                "feature_hash": feature_hash(rows)}
-        # kept states past TF_GLM_CACHE_TTL go on every rank with this request (rank 0's clock decides)
+        # kept states past TF_GLM_CACHE_TTL or their deadline go on every rank with this request (rank 0's clock
+        # decides), and so do those whose deadline falls inside the time this request may hold the engine
+        # (``_horizon_stale``), unless it resumes them
         stale = self._stale()
-        self._forget(stale)
         # a measured request resumes (from a state carrying its rows' numbers) and keeps only when its spec allows
         may_keep = draft and feed is None and (measure is None or measure.cache)
-        hit = self._resume(list(prompt), code, measure) if may_keep else None
+        hit = self._resume(list(prompt), code, measure, skip=stale) if may_keep else None
+        stale = sorted(stale + self._horizon_stale(measure, hit, stale))
+        self._forget(stale)
         shared = self._shared(list(prompt), hit) if may_keep else []
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,

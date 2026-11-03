@@ -213,3 +213,79 @@ def test_a_verifier_resumes_from_the_longest_state_whose_top1_its_claims_name():
     row1[1] = 99
     assert e._resume(prompt, code, measure(row1)) is None
     assert len(e._resume(prompt, code).ids) == 8                                           # unmeasured
+
+
+def test_a_request_drops_at_its_start_every_state_whose_deadline_falls_inside_its_horizon_but_the_one_it_resumes():
+    """The operator's expiry waits while a request holds the engine, so a state whose deadline passes meanwhile would
+    outlive it by up to the whole request: a request naming its horizon (``Spec.horizon_ms``, the walk's bound) drops,
+    as it starts, every state whose deadline is before now + horizon, except the one it resumes (whose deadline it
+    raises to its own). States past the horizon, TTL-only states and states already stale are left as they were."""
+    import time
+
+    from tensorfold.sn46 import rows
+
+    now = time.monotonic()
+    e = bare(0.0)
+    e.grid, e.drafter = 4, None
+    prompt = [9] * 8 + [1, 2]
+    for ids, by in (([1] * 4, now + 5), ([9] * 4, now + 5), ([9] * 8, now + 30), ([2] * 4, now + 120),
+                    ([3] * 4, None), ([4] * 4, now - 1)):
+        s = snap(ids)
+        s.keep_by, s.mtp_len, s.sn46 = by, 0, rows.Kept(len(ids), torch.zeros(1))
+        e._remember(s)
+    stale = e._stale()
+    assert stale == [5]                                          # past its deadline already
+    spec = rows.Spec(record=False, prompt=prompt, cache=True, keep_for_ms=60_000, horizon_ms=60_000)
+    hit = e._resume(prompt, [0], spec, skip=stale)
+    assert hit.ids == [9] * 8                                    # the longest prefix, inside the horizon: resumed
+    beyond = e._horizon_stale(spec, hit, stale)
+    assert [e.cache[i].ids for i in beyond] == [[1] * 4, [9] * 4]
+    e._forget(sorted(stale + beyond))
+    assert [c.ids for c in e.cache] == [[9] * 8, [2] * 4, [3] * 4]
+    assert hit in e.cache
+    # without a horizon (a miner's request, or a verifier's before this rule) nothing more goes
+    assert e._horizon_stale(rows.Spec(record=False, cache=True), None, []) == []
+    assert e._horizon_stale(None, None, []) == []
+    # a state about to be dropped is never resumed: the next longest is
+    e2 = bare(0.0)
+    e2.grid, e2.drafter = 4, None
+    for ids in ([9] * 4, [9] * 8):
+        s = snap(ids)
+        s.mtp_len, s.sn46 = 0, rows.Kept(len(ids), torch.zeros(1))
+        e2._remember(s)
+    assert e2._resume(prompt, [0], spec).ids == [9] * 8
+    assert e2._resume(prompt, [0], spec, skip=[1]).ids == [9] * 4
+
+
+def test_a_verifier_naming_logprobs_resumes_from_the_longest_state_whose_rows_hold_them_all():
+    """States of 4 and 8 tokens whose rows' claimed log-probabilities are -1.0: honest claims resume the 8; one
+    shifted past eps on a row only the 8 holds resumes the 4; on row 1, nothing (a fresh prefill, judged whole)."""
+    import numpy as np
+
+    from tensorfold.sn46 import rows
+
+    prompt = list(range(100, 110))
+    top1 = [7, 8, 9, 10, 11, 12, 13]
+    e = bare(0.0)
+    e.grid, e.drafter = 4, None
+    for n in (4, 8):
+        s = snap(prompt[:n])
+        s.mtp_len = 0
+        got = np.zeros((n - 1, 5), np.float32)
+        got[:, 0] = top1[:n - 1]
+        got[:, 2], got[:, 3] = 3.0, 2.0                                     # target logit - lse = -1.0
+        s.sn46 = rows.Kept(n, torch.zeros(1), got, np.asarray(prompt[1:n], np.int64))
+        e._remember(s)
+
+    def measure(logprobs):
+        return rows.Spec(record=True, targets=prompt[1:] + [1], claims=top1 + [-1, -1, -1], prompt=prompt,
+                         cache=True, claim_logprobs=np.asarray(logprobs, np.float32), logprob_eps=1e-3)
+
+    honest = [-1.0] * 10
+    assert len(e._resume(prompt, [0], measure(honest)).ids) == 8
+    row6 = list(honest)
+    row6[6] = -1.01
+    assert len(e._resume(prompt, [0], measure(row6)).ids) == 4
+    row1 = list(honest)
+    row1[1] = -0.99
+    assert e._resume(prompt, [0], measure(row1)) is None

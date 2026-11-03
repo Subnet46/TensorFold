@@ -216,7 +216,9 @@ def test_a_verifier_resumes_only_from_a_state_whose_top1_its_claims_name_and_rep
     assert rows.admits(kept, spec)
     rows.begin(spec, later, 0)
     try:
+        assert spec.job.resumed == 0
         rows.resume(FakeWeights(), kept, 4, later)
+        assert spec.job.resumed == 4                                         # the resume point, for the operator
         want = dense(logits, [11, 12, 13, 50], claims[:4]).numpy()
         got = spec.job.values[:4]
         assert spec.job.top1[:4].tolist() == want[:, 0].tolist()
@@ -241,6 +243,62 @@ def test_a_verifier_resumes_only_from_a_state_whose_top1_its_claims_name_and_rep
         rows.end()
     assert rows.admits(kept, rows.Spec(record=True, prompt=later, cache=True))   # a miner claims nothing
     assert not rows.admits(rows.Kept(4, None), spec)                         # no record to check against
+
+
+def test_a_verifier_resumes_only_where_every_claimed_logprob_is_within_eps_of_the_kept_rows():
+    """Naming its claimed log-probabilities, a verifier resumes from a state only when each kept row's is finite and
+    within logprob_eps of the state's own (target logit - lse, in float32 as the token check computes it), so every
+    row it resumes is one the check passes; a miner that keeps the prefix's top-1 but shifts one log-probability
+    past eps is not resumed, its rows are prefilled and judged fresh."""
+    g = torch.Generator().manual_seed(23)
+    V = 64
+    prompt = [10, 11, 12, 13, 14, 15]
+    logits = (torch.randn((4, V), generator=g) * 4).to(torch.bfloat16)
+    first = rows.Spec(record=True, prompt=prompt, cache=True)
+    rows.begin(first, prompt, 0)
+    try:
+        first.job.put(np.arange(4), rows.reduce(FakeWeights(), logits, prompt[1:5], [-1] * 4), prompt[1:5])
+        rows._last = (4, logits[3].clone())
+        kept = rows.kept(4)
+    finally:
+        rows.end()
+    later = [10, 11, 12, 13, 50]
+    top1 = [int(t) for t in torch.argmax(logits.float(), 1)]
+    claims = top1[:3] + [7, 8, 9]
+    honest = np.zeros(6, np.float32)
+    honest[:3] = kept.got[:, 3] - kept.got[:, 2]                             # the kept rows' own, in float32
+
+    def spec(logprobs, eps=1e-3):
+        return rows.Spec(record=True, targets=later[1:] + [60, 61], claims=claims, prompt=later, cache=True,
+                         claim_logprobs=np.asarray(logprobs, np.float32), logprob_eps=eps)
+
+    assert rows.admits(kept, spec(honest))
+    assert np.array_equal(rows.logprob_deltas(honest[:3], kept.got[:, 2], kept.got[:, 3]), np.zeros(3, np.float32))
+    near = honest.copy()
+    near[1] += np.float32(9e-4)
+    assert rows.admits(kept, spec(near))                                    # inside eps: the check passes it too
+    for shift in (2e-3, -2e-3, 0.5):
+        far = honest.copy()
+        far[1] += np.float32(shift)
+        assert not rows.admits(kept, spec(far)), shift                      # the check would fail it: scored fresh
+        cheat = spec(far)
+        rows.begin(cheat, later, 0)
+        try:
+            with pytest.raises(rows.RowsError):
+                rows.resume(FakeWeights(), kept, 4, later)
+        finally:
+            rows.end()
+    past = honest.copy()
+    past[4] += np.float32(5.0)                                              # rows past the state are not its to judge
+    assert rows.admits(kept, spec(past))
+    for bad in (np.nan, np.inf, -np.inf):
+        nan = honest.copy()
+        nan[0] = bad
+        assert not rows.admits(kept, spec(nan))
+    assert not rows.admits(kept, spec(honest, eps=None))                   # logprobs without a margin: refused
+    assert not rows.admits(kept, spec(honest[:2]))                         # too few
+    assert rows.admits(kept, rows.Spec(record=True, targets=later[1:] + [60, 61], claims=claims, prompt=later,
+                                       cache=True))                         # top-1 alone, as before
 
 
 def test_a_specs_keep_duration_travels_in_int32_halves_and_comes_back_whole():

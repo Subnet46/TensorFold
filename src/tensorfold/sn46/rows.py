@@ -20,7 +20,9 @@ operator's per-request retention decision); otherwise it leaves no state and no 
 (``engine._run``). A spec may also name how long its states may be kept (``Spec.keep_for_ms``, from the request's start,
 on the monotonic clock: no wall clock is read): the states the request keeps carry that cutoff, a request resuming one
 raises it to its own (never lowers it), and a state is dropped at its cutoff or TF_GLM_CACHE_TTL after its last use,
-whichever comes first (``engine._stale``). A kept state carries its rows' numbers (``Kept``: rank 0's record of every
+whichever comes first (``engine._stale``). A request may also name how long it may hold the
+engine (``Spec.horizon_ms``, rank 0's only): every state it does not resume whose cutoff falls before that is dropped
+when it starts, so no cutoff passes while the expiry waits behind the request. A kept state carries its rows' numbers (``Kept``: rank 0's record of every
 row before the last, and each rank's logits shard of the last row, whose target is the next prompt's token), so a
 request resuming from it reports the same numbers for those rows as a fresh prefill would (``resume``); the engine keeps
 states only where a fresh prefill's chunks would start (``TF_GLM_PROMPT_GRID=chunk``), so the rows past the resume point
@@ -80,6 +82,17 @@ class Spec:
     # the cutoff on this rank's monotonic clock (``time.monotonic()`` seconds), set when the request starts
     # (``begin``); the wall clock is never read, so stepping it changes nothing
     keep_by: float | None = field(default=None, repr=False, compare=False)
+    # rank 0 only (never shared): the longest this request may hold the engine, ms from its start (a verifier's walk
+    # bound). The engine's expiry waits for a running request, so a state whose cutoff falls inside that time could
+    # outlive it by the whole walk: at the request's start every state it does not resume whose cutoff is that close
+    # is dropped (``engine._horizon_stale``). None: no state is dropped for it
+    horizon_ms: int | None = None
+    # rank 0 only (never shared): the claimed log-probability of each row's target (float32 values, at least one per
+    # prompt row but the last) and how far a kept state's may be from it (the token check's ``logprob_eps``): a
+    # request naming them resumes only from a state whose rows hold every claim within it (``admits``), so a row it
+    # skips is one the check would pass
+    claim_logprobs: "np.ndarray | object | None" = field(default=None, repr=False, compare=False)
+    logprob_eps: float | None = None
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
     claims_array: "np.ndarray | None" = field(default=None, repr=False, compare=False)   # ``admits``' cache
 
@@ -110,6 +123,9 @@ class Job:
     values: np.ndarray = field(default_factory=lambda: np.full((0, 4), np.nan, np.float32))
     drawn: np.ndarray = field(default_factory=lambda: np.full(0, -1, np.int64))
     done: threading.Event = field(default_factory=threading.Event)
+    # the tokens the request resumed from a kept state (``resume``; 0: a fresh prefill): rows 0 .. resumed - 2 are the
+    # state's record, which ``admits`` held to the request's claims, so an operator may leave them unread
+    resumed: int = 0
 
     def put(self, rows: np.ndarray, got: np.ndarray, targets: list[int]) -> None:
         """``got`` [n, 5] (top1 id, top1 logit, lse, target logit, claim logit) for ``rows``, whose targets were
@@ -382,11 +398,21 @@ def _claims_array(spec: Spec) -> np.ndarray:
     return spec.claims_array
 
 
+def logprob_deltas(logprobs: np.ndarray, lse: np.ndarray, target_logit: np.ndarray) -> np.ndarray:
+    """|claimed log-probability - (target logit - log-sum-exp)| per row, in float32 as the token check computes it
+    (each operation rounded to float32, so the same inputs give the same bits on both sides)."""
+    lp = np.asarray(logprobs, np.float32)
+    return np.abs(lp - (np.asarray(target_logit, np.float32) - np.asarray(lse, np.float32)))
+
+
 def admits(kept: Kept, spec: Spec) -> bool:
     """Rank 0, before a measured request resumes from ``kept``: whether the state's rows answer the request's claims
     the way a fresh prefill would let them be reported, that is every claim on rows 0 .. n - 2 is the state's top-1
-    there or none (-1). A request without claims (a miner's) is admitted. A state whose top-1 differs from a claim is
-    refused: the request resumes from a shorter state, or prefills, and the claim's own logit is computed fresh."""
+    there or none (-1), and, when the request names its claimed log-probabilities (``Spec.claim_logprobs``), each of
+    those rows' is finite and within ``Spec.logprob_eps`` of the state's (``logprob_deltas``): every row resumed is
+    then one the token check passes, so a verifier may leave it unread. A request without claims (a miner's) is
+    admitted. A state either rule refuses is passed over: the request resumes from a shorter state, or prefills, and
+    the rows are computed fresh."""
     if spec.claims is None:
         return True
     if kept.got is None:
@@ -395,7 +421,15 @@ def admits(kept: Kept, spec: Spec) -> bool:
     claims = _claims_array(spec)[:n]
     if claims.shape[0] < n:
         return False
-    return bool(((claims == kept.got[:, 0].astype(np.int64)) | (claims == -1)).all())
+    if not ((claims == kept.got[:, 0].astype(np.int64)) | (claims == -1)).all():
+        return False
+    if spec.claim_logprobs is None:
+        return True
+    lp = np.asarray(spec.claim_logprobs, np.float32)[:n]       # any float32 sequence: the operator's, as it decoded it
+    if lp.shape[0] < n or spec.logprob_eps is None or not np.isfinite(lp).all():
+        return False
+    deltas = logprob_deltas(lp, kept.got[:, 2], kept.got[:, 3])
+    return bool((deltas <= np.float32(spec.logprob_eps)).all())
 
 
 def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
@@ -411,6 +445,8 @@ def resume(w, kept: Kept | None, cut: int, prompt: list[int]) -> None:
         raise RowsError(f"the kept state of {cut} tokens carries no row numbers")
     if spec.job is not None and kept.got is None:
         raise RowsError("the kept state carries no record of its rows on the recording rank")
+    if spec.job is not None:
+        spec.job.resumed = cut
     if spec.job is not None and cut > 1:
         got = kept.got.copy()                # the state's own record stays as the request that kept it left it
         if spec.claims is None:              # no claims: every claim logit is -inf, as a fresh reduction gives
