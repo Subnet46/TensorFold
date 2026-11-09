@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -16,6 +20,11 @@ FLASHNEXT_FLOOR = (12, 0)       # Flash Next serves CUDA on sm_120/sm_121 cards 
 # stop first: when the lock goes, a waiting start imports whatever module is there without building, even an old one
 HINT = "if no other build is running, a killed build left it: stop this start, delete the lock and start again"
 LOCK_WAIT_SECONDS = 60.0        # a start still waiting on the same lock this long says so again
+PREBUILT = "TENSORFOLD_PREBUILT"                # a directory of modules built ahead (``record``): imported, not compiled
+RECORD = "TENSORFOLD_PREBUILT_RECORD"           # copy every module this process loads into such a directory
+FLAG_KEYS = ("extra_cflags", "extra_cuda_cflags", "extra_ldflags", "extra_include_paths", "with_cuda",
+             "is_python_module", "is_standalone")
+HEADERS = (".h", ".hpp", ".cuh", ".inc", ".inl")
 
 
 def arch_flags(need: tuple[int, int] = MIN_CAPABILITY, arch_specific: bool = False) -> list[str]:
@@ -70,9 +79,18 @@ def load(name: str, sources: str | list[str], need: tuple[int, int] = MIN_CAPABI
     from torch.utils import cpp_extension
 
     kwargs["extra_cuda_cflags"] = [*kwargs.get("extra_cuda_cflags", []), *arch_flags(need, arch_specific)]
+    # The key before the toolkit's link flags: where a compiler was found says nothing about the module.
+    key = prebuilt_key(name, sources, kwargs)
     links = _toolkit()
     if links:
         kwargs["extra_ldflags"] = [*kwargs.get("extra_ldflags", []), *links]
+    # A recording start compiles everything it records: what it imports ahead would not be copied.
+    ahead = None if os.environ.get(RECORD) else os.environ.get(PREBUILT)
+    if ahead:
+        module = Path(ahead) / name / key / (name + getattr(cpp_extension, "LIB_EXT", ".so"))
+        if module.is_file():
+            return _import_prebuilt(name, module, kwargs.get("is_python_module", True))
+        _say(f"no prebuilt CUDA extension {name} for this build ({key}); compiling it")
     held = _announce(cpp_extension, name, sources, kwargs.get("build_directory"))
     timer = None
     if held is not None:
@@ -80,10 +98,96 @@ def load(name: str, sources: str | list[str], need: tuple[int, int] = MIN_CAPABI
         timer.daemon = True
         timer.start()
     try:
-        return cpp_extension.load(name=name, sources=sources, **kwargs)
+        loaded = cpp_extension.load(name=name, sources=sources, **kwargs)
     finally:
         if timer is not None:
             timer.cancel()
+    record = os.environ.get(RECORD)
+    if record:
+        _record(name, loaded, key, Path(record))
+    return loaded
+
+
+def prebuilt_key(name: str, sources: str | list[str], kwargs: dict[str, Any]) -> str:
+    """What a module built ahead must match to stand in for this build: the TensorFold, torch, CUDA and Python (ABI)
+    versions, the flags (install paths written as ``<root>``, so a release unpacked elsewhere still matches), and the
+    bytes of every source and of every header in the TensorFold package, beside the sources or under the include
+    paths (a source may include a header from any of them)."""
+
+    import sysconfig
+
+    import torch
+    import tensorfold
+
+    # Every root and every path in a flag canonical (symlinks resolved), so the same files under a link match.
+    roots = sorted({os.path.realpath(r) for r in (str(Path(tensorfold.__file__).resolve().parents[1]), sys.prefix,
+                                                   os.environ.get("TORCH_EXTENSIONS_DIR", ""),
+                                                   os.environ.get("CUDA_HOME", "")) if r},
+                   key=len, reverse=True)
+
+    def plain(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return [plain(v) for v in value]
+        text = str(value)
+        flag, path = (text[:2], text[2:]) if text[:2] in ("-I", "-L") else ("", text)
+        if path.startswith("/") and os.path.exists(path):
+            text = flag + os.path.realpath(path)
+        for root in roots:
+            text = text.replace(root, "<root>")
+        return text
+
+    h = hashlib.sha256()
+    h.update(json.dumps({"name": name, "tensorfold": tensorfold.__version__, "torch": torch.__version__,
+                         "cuda": torch.version.cuda, "python": sysconfig.get_config_var("SOABI") or sys.version,
+                         "flags": {k: plain(kwargs[k]) for k in FLAG_KEYS if k in kwargs}},
+                        sort_keys=True).encode())
+    files = [Path(s) for s in ([sources] if isinstance(sources, str) else sources)]
+    package = Path(tensorfold.__file__).resolve().parent
+    folders = ({package} | {f.resolve().parent for f in files}
+               | {Path(p).resolve() for p in kwargs.get("extra_include_paths", [])})
+    headers = sorted({f for folder in folders if folder.is_dir() for f in folder.rglob("*") if f.suffix in HEADERS})
+    for f in files:
+        h.update(b"source " + f.name.encode() + b"\0" + f.read_bytes())
+    for f in headers:
+        rel = next((str(f.relative_to(d)) for d in sorted(folders) if f.is_relative_to(d)), f.name)
+        h.update(b"header " + rel.encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()[:32]
+
+
+def _import_prebuilt(name: str, module: Path, python: bool) -> Any:
+    """The module built ahead at ``module``, as torch's ``load`` would return it."""
+
+    if not python:                                  # an op library: torch.ops holds it, load returns its path
+        import torch
+
+        torch.ops.load_library(str(module))
+        return str(module)
+    loader = importlib.machinery.ExtensionFileLoader(name, str(module))
+    spec = importlib.util.spec_from_file_location(name, str(module), loader=loader)
+    found = importlib.util.module_from_spec(spec)
+    loader.exec_module(found)
+    return found
+
+
+def _record(name: str, loaded: Any, key: str, into: Path) -> None:
+    """Copy the artifact torch just loaded for ``name`` (a module's file, or an op library's path) to
+    ``into/<name>/<key>/<name><ext>``, for a later start to import. A versioned build (``<name>_v1``: the same name
+    loaded twice with other sources in one process) initializes under another name and is not recorded."""
+
+    built = Path(getattr(loaded, "__file__", None) or str(loaded))
+    if not built.is_file():
+        return
+    if built.name.split(".", 1)[0] != name:
+        _say(f"CUDA extension {name} was built as {built.name}; not recorded for prebuilt starts")
+        return
+    target = into / name / key / built.name
+    if target.is_file():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + f".{os.getpid()}")
+    shutil.copy2(built, partial)
+    os.replace(partial, target)
+    _say(f"recorded CUDA extension {name} ({key}) for prebuilt starts")
 
 
 def _announce(cpp_extension: Any, name: str, sources: str | list[str],
@@ -197,4 +301,4 @@ def _say(text: str) -> None:
     print(f"[tensorfold] {text}", flush=True)
 
 
-__all__ = ["CLUSTERS", "MIN_CAPABILITY", "arch_flags", "load", "pip_toolkit"]
+__all__ = ["CLUSTERS", "MIN_CAPABILITY", "PREBUILT", "RECORD", "arch_flags", "load", "pip_toolkit", "prebuilt_key"]
