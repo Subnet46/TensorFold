@@ -1404,8 +1404,7 @@ class GlmEngine:
         # TENSORFOLD_SN46: the row statistics the operator armed for this request, checked against it here, before
         # any other rank hears of the request
         # (patch sn46/vision-rows) image prompts too: their feature rows are injected before the rows are read
-        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None and constraint is None,
-                                       images=vision is not None)
+        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None, images=vision is not None)
         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
             if vision is not None and self.vision is None:
                 raise ValueError("image inputs require starting this server with --vision")

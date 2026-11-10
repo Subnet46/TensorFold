@@ -40,6 +40,11 @@ gives some late prompt rows other predictions than the miner's prompt-only prefi
 prefills the miner's prompt alone and walks the output through decode, each sampled token replaced by the miner's
 (``forced``, from the targets past the prompt), with drafts off: serial decode commits the bits drafted decode does.
 
+A request with a grammar (``engine.grammar.Constraint``) is measured on the logits its sampler draws from: the
+engine masks a reply row before ``Engine.sample`` reads it (the prefill's last row, the first reply row, included), so
+its top-1, log-sum-exp, target logit and ``drawn`` are the masked row's, the same on a miner and on a verifier walking
+the miner's answer under the same grammar. Prompt rows are never masked.
+
 A request is measured when the operator armed a ``Spec`` for it on rank 0 (``arm``); rank 0 checks it fits the
 request before any other rank hears of it (``take_armed``) and sends it with the request (``share``). Rank 0 records
 into the ``Job`` the operator keeps.
@@ -199,7 +204,7 @@ def take_armed(prompt: list[int], supported: bool, images: bool = False) -> Spec
     if spec is None:
         return None
     if not supported:
-        raise RowsError("row statistics run on the one-stream engine, for prompts without a grammar")
+        raise RowsError("row statistics run on the one-stream engine")
     if images and spec.cache:                # an image prompt's rows are not its ids' rows: nothing is kept
         raise RowsError("an image prompt keeps no prompt state; measure it with cache off")
     if spec.prompt is not None and list(prompt) != list(spec.prompt):

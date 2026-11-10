@@ -60,6 +60,62 @@ def test_the_numbers_read_off_the_samplers_gather_equal_the_dense_reduction(worl
     np.testing.assert_allclose(got[:, 1:], want[:, 1:], rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("world,k", [(1, 1), (2, 1), (4, 1), (4, 3)])
+def test_a_grammar_masked_rows_numbers_are_the_masked_rows_reduction_and_finite(world, k):
+    """A measured request with a grammar: each rank masks its vocabulary columns before the sampler's gather (as
+    ``Engine.sample`` does), so the numbers read off the gather are the dense reduction of the masked row: the top-1
+    an allowed token, the log-sum-exp over the allowed ones only, finite, also when a rank's whole shard is masked."""
+    xgr = pytest.importorskip("xgrammar")
+    from tensorfold.engine import grammar
+
+    V = 128
+    info = xgr.TokenizerInfo([""] + [chr(t) for t in range(1, V)], xgr.VocabType.RAW, vocab_size=V,
+                             stop_token_ids=[0])
+    grammars = grammar.Grammars(info)
+    c = grammars.constraint(grammars.compile(grammar.Spec("regex", "[0-9]+")))
+    g = torch.Generator().manual_seed(world + k)
+    R = 3
+    logits = (torch.randn((R, V), generator=g) * 4).to(torch.bfloat16)
+    logits[:, ord("x")] = 50                                         # the unmasked top-1, which the grammar refuses
+    tokens = [ord("1"), ord("2"), ord("3")]
+    window = c.window(tokens, [-1, 0, 1])                            # row r: after r + 1 digits
+    assert window.rows == [0, 1, 2]
+    masked = logits.clone()
+    c.mask(masked, window)
+    n = V // world
+    parts = []
+    targets = [ord("7"), ord("0"), 0]                                # a digit, a digit, the stop token
+    claims = [-1, ord("5"), -1]
+    for r in range(world):
+        shard = logits[:, r * n:(r + 1) * n].clone()
+        c.mask(shard, window, r * n)                                 # this rank's columns, as the engine masks them
+        vals, ids = torch.topk(shard.float(), k, dim=-1)
+        ids = (ids + r * n).to(torch.int32)
+        parts.append(torch.cat([vals, ids.view(torch.float32), rows.tail(shard, r * n, targets, claims)], 1))
+    got = rows.from_gathered(torch.stack(parts), k, targets)
+    want = dense(masked, targets, claims).numpy()
+    assert got[:, 0].tolist() == want[:, 0].tolist()
+    assert all(chr(int(t)).isdigit() or int(t) == 0 for t in got[:, 0])  # a digit, or the stop after one
+    np.testing.assert_allclose(got[:, 1:], want[:, 1:], rtol=0, atol=1e-5)
+    assert np.isfinite(got[:, 1:4]).all()                            # top-1 logit, lse, target logit
+    assert got[0, 2] < float(logits[0].float().logsumexp(0))         # the masked tokens are out of the lse
+
+
+def test_measured_requests_run_on_the_one_stream_engine_with_or_without_a_grammar():
+    rows.ACTIVE = True
+    try:
+        spec = rows.Spec(record=True, prompt=[1, 2])
+        rows.arm(spec)
+        assert rows.take_armed([1, 2], True) is spec
+        rows.arm(rows.Spec(record=True, prompt=[1, 2]))
+        with pytest.raises(rows.RowsError, match="one-stream engine"):
+            rows.take_armed([1, 2], False)                           # --parallel's scheduler
+        assert rows.disarm() is None
+    finally:
+        rows.disarm()
+        rows.ACTIVE = False
+
+
 def test_a_job_keeps_the_last_numbers_of_each_row_and_takes_complete_rows():
     job = rows.Job(rows.Spec(record=True), [1, 2, 3])
     job.put(np.array([0, 1, 2]), np.array([[7, 1, 2, 3, 4]] * 3, np.float32), [2, 3, 40])

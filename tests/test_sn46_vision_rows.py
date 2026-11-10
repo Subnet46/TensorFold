@@ -67,7 +67,7 @@ def test_a_measured_image_prompt_keeps_no_prompt_state():
         rows.arm(spec)
         assert rows.take_armed([1, 2], True, images=True) is spec
         rows.arm(rows.Spec(record=True, prompt=[1, 2]))
-        with pytest.raises(rows.RowsError, match="without a grammar"):
+        with pytest.raises(rows.RowsError, match="one-stream engine"):
             rows.take_armed([1, 2], False, images=True)
     finally:
         rows.disarm()
