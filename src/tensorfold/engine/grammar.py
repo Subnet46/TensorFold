@@ -257,6 +257,7 @@ class Constraint:
 
     def __init__(self, xgr, compiled, vocab_size: int, *, think_end: int | None = None) -> None:
         self.xgr = xgr
+        self.compiled = compiled
         self.m = xgr.GrammarMatcher(compiled)
         self.vocab = int(vocab_size)
         self.words = (self.vocab + 31) // 32
@@ -270,6 +271,27 @@ class Constraint:
         """The grammar has taken its stop token: the reply is complete."""
 
         return self.active and self.m.is_terminated()
+
+    def first_reject(self, tokens: Sequence[int]) -> int | None:
+        """(patch sn46/forced-grammar) A forced walk's check before it runs (a verifier walking a miner's reply under
+        the reply's grammar): the index of the first of ``tokens`` a fresh reply under this grammar could not have
+        chosen (one its mask refuses, or any token after the stop token), None when it could have chosen them all.
+        With ``think_end`` the grammar starts after that token, as ``advance`` follows a reply. A fresh matcher walks
+        them: this constraint's own state is untouched. Never raises: a token xgrammar fails on is rejected."""
+
+        m = self.xgr.GrammarMatcher(self.compiled)
+        active = self.think_end is None
+        for i, t in enumerate(tokens):
+            t = int(t)
+            if not active:
+                active = t == self.think_end
+                continue
+            try:
+                if m.is_terminated() or not m.accept_token(t):
+                    return i
+            except Exception:                         # noqa: BLE001  (an id xgrammar cannot take is not choosable)
+                return i
+        return None
 
     def window(self, tokens: Sequence[int], parents: Sequence[int]) -> Window:
         """The rows an accepted path can use (row 0 the pending token, parents first), each constrained row's bits."""

@@ -1404,7 +1404,16 @@ class GlmEngine:
         # TENSORFOLD_SN46: the row statistics the operator armed for this request, checked against it here, before
         # any other rank hears of the request
         # (patch sn46/vision-rows) image prompts too: their feature rows are injected before the rows are read
-        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None, images=vision is not None)
+        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None, images=vision is not None,
+                                       constraint=constraint)
+        # (patch sn46/forced-grammar) a verifier's walk of a miner's output that its grammar rejects stops before the
+        # rejected token (``Spec.grammar_reject``, which the operator reads): the tokens before it under the grammar,
+        # or, with the first one rejected, one token without it, so no forced token is ever one the mask refused.
+        # Decided before the header, so every rank walks the same tokens under the same constraint
+        if measure is not None and measure.grammar_reject is not None:
+            max_tokens = sn46_rows.walk_tokens(measure, max_tokens)
+            if measure.grammar_reject == 0:
+                constraint = None
         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
             if vision is not None and self.vision is None:
                 raise ValueError("image inputs require starting this server with --vision")

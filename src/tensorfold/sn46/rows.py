@@ -98,6 +98,13 @@ class Spec:
     # skips is one the check would pass
     claim_logprobs: "np.ndarray | object | None" = field(default=None, repr=False, compare=False)
     logprob_eps: float | None = None
+    # rank 0 only (never shared), set by ``take_armed``: for a walk of forced output tokens under a grammar (a
+    # verifier's), the index into the output of the first token the grammar rejects (``Constraint.first_reject``),
+    # None when it accepts them all or the request has no grammar. The walk then stops before that token: it walks
+    # output[:grammar_reject] under the grammar's masks, so its rows 0 .. len(prompt) + grammar_reject - 2 are all
+    # reduced from masked rows whose targets the grammar allows (no -inf, no GrammarError); with grammar_reject 0 it
+    # walks one token unmasked and only the prompt rows 0 .. len(prompt) - 2 are the walk's
+    grammar_reject: int | None = None
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
     claims_array: "np.ndarray | None" = field(default=None, repr=False, compare=False)   # ``admits``' cache
 
@@ -197,9 +204,11 @@ def measuring() -> bool:
     return _req is not None
 
 
-def take_armed(prompt: list[int], supported: bool, images: bool = False) -> Spec | None:
+def take_armed(prompt: list[int], supported: bool, images: bool = False, constraint=None) -> Spec | None:
     """Rank 0, at a request's start, before any other rank hears of it: the armed spec (then cleared), or None. A
-    spec that does not fit the request is cleared and refused here, so a refusal never strands the other ranks."""
+    spec that does not fit the request is cleared and refused here, so a refusal never strands the other ranks. A
+    spec walking forced output tokens (targets past the prompt) under the request's grammar (``constraint``, fresh)
+    gets ``Spec.grammar_reject``: where the walk must stop (``walk_tokens``)."""
     spec = disarm() if ACTIVE else None
     if spec is None:
         return None
@@ -213,7 +222,28 @@ def take_armed(prompt: list[int], supported: bool, images: bool = False) -> Spec
         raise RowsError("targets must cover every prompt row")
     if spec.claims is not None and (spec.targets is None or len(spec.claims) != len(spec.targets)):
         raise RowsError("claims and targets cover different rows")
+    spec.grammar_reject = None
+    if constraint is not None and spec.targets is not None:
+        spec.grammar_reject = constraint.first_reject(spec.targets[len(prompt) - 1:])
+    if spec.grammar_reject is not None:
+        # the forced targets end at the cutoff too (the first output token's kept when it is the one rejected: that
+        # walk runs without the grammar), on every rank (``share`` sends these): a drafted window's bonus row past
+        # the cutoff then keeps the engine's masked sample, which ``max_tokens`` never commits, instead of being
+        # forced to the rejected token and fed to the grammar (GrammarError)
+        cut = len(prompt) - 1 + max(1, spec.grammar_reject)
+        spec.targets = spec.targets[:cut]
+        if spec.claims is not None:
+            spec.claims = spec.claims[:cut]
     return spec
+
+
+def walk_tokens(spec: Spec | None, max_tokens: int) -> int:
+    """Rank 0, after ``take_armed``: the reply tokens the request runs, ``max_tokens`` unless its forced output has
+    a token the grammar rejects; then the tokens before it (at least one, the engine's least: with the first output
+    token rejected the request runs one token without the grammar, whose row the operator does not read)."""
+    if spec is None or spec.grammar_reject is None:
+        return max_tokens
+    return max(1, min(int(max_tokens), spec.grammar_reject))
 
 
 def share(engine, spec: Spec | None) -> Spec | None:
