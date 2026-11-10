@@ -13,7 +13,6 @@ from tensorfold.server.errors import RequestError
 
 EXTRA = "tensorfold[grammar]"             # the optional dependency that brings xgrammar
 KINDS = ("json", "json_schema", "regex", "choice", "grammar")
-CACHE_BYTES = 256 << 20                   # compiled grammars kept for repeated schemas
 OBJECT = '{"type": "object"}'             # json_object: any JSON object (OpenAI's contract), not an array
 BLANKS = 32                               # the most blank characters between JSON tokens: pretty-printing, not endless
 
@@ -106,7 +105,9 @@ def _message(exc: Exception) -> str:
 
 
 class Grammars:
-    """One tokenizer's grammar compiler (xgrammar), with compiled grammars cached by their text."""
+    """One tokenizer's grammar compiler (xgrammar). (patch sn46/no-grammar-cache) It keeps no compiled grammar: a
+    request's schema keys, enum values and patterns are its customer's content, which must not outlive the request
+    (no process-wide cache past its deadline), so each request compiles its own (some 15-30 ms on GLM's vocabulary)."""
 
     def __init__(self, info) -> None:
         import xgrammar as xgr
@@ -114,7 +115,7 @@ class Grammars:
         self.xgr = xgr
         self.info = info
         self.vocab_size = int(info.vocab_size)
-        self.compiler = xgr.GrammarCompiler(info, max_threads=8, cache_limit_bytes=CACHE_BYTES)
+        self.compiler = xgr.GrammarCompiler(info, max_threads=8, cache_enabled=False)
         self.lock = threading.Lock()              # requests compile on their own HTTP threads
 
     @classmethod
@@ -235,7 +236,7 @@ def refusal(body: dict[str, Any], owner=None) -> str | None:
         if spec is not None and body.get("tools") and tool_choice_requires_call(body.get("tool_choice")):
             return f'{spec.field} cannot be combined with tool_choice "required" or a named function: send one'
         if spec is not None and getattr(owner, "model_dir", None) is not None:
-            compiler(owner, owner.model_dir, owner.stop_ids).compile(spec)   # cached for the request's own compile
+            compiler(owner, owner.model_dir, owner.stop_ids).compile(spec)   # compiled again, uncached, to run
     except RequestError as exc:
         return str(exc)
     return None
