@@ -492,3 +492,39 @@ def test_an_engine_refusing_structured_output_says_why_before_generating(tmp_pat
         status, text = post(port, _body(stream), True)
         assert status == 200 and _content(stream, text) == "Hello"
     assert engine.calls == [{"draft": True, "constraint": None}]
+
+
+class ThinkTokenizer(TextTokenizer):
+    """The toy tokenizer, with the toy vocabulary's </think>."""
+
+    def token_to_id(self, token):
+        return THINK_END if token == "</think>" else None
+
+
+def test_a_token_id_completion_with_sn46_think_starts_its_grammar_after_think_end(tmp_path, grammars):
+    """(patch sn46/grammar-think) A token-id prompt that opened a think block says so with ``"sn46_think": true``:
+    the grammar takes the reply from the token after </think>, as on the chat route with thinking on; without it the
+    grammar takes the reply from its first token."""
+
+    engine = GrammarEngine('{"k":3}')
+    app = _app(tmp_path, engine, grammars)
+    app.tok = ThinkTokenizer()
+    so = {"json": SCHEMA}
+    with http_server(app) as port:
+        for extra in ({"sn46_think": True}, {"sn46_think": False}, {}):
+            status, text = post(port, {"prompt": _ids("Hi"), "structured_outputs": so, **extra}, False)
+            assert status == 200, text
+        status, text = post(port, {"prompt": _ids("Hi"), "sn46_think": True}, False)       # no grammar: no effect
+        assert status == 200, text
+        status, text = post(port, {"prompt": _ids("Hi"), "structured_outputs": so, "sn46_think": "yes"}, False)
+        assert status == 400 and "sn46_think must be a boolean" in json.loads(text)["error"]["message"]
+    thinking, plain, absent, none = (call["constraint"] for call in engine.calls)
+    assert thinking.think_end == THINK_END and not thinking.active          # the reply's '{"k":3}' left unmasked
+    assert plain.think_end is None and plain.active and plain.finished
+    assert absent.think_end is None and absent.active and absent.finished
+    assert none is None and len(engine.calls) == 4
+    app.tok = TextTokenizer()                                                # no </think>: refused, never guessed
+    app.tok.token_to_id = lambda token: None
+    with http_server(app) as port:
+        status, text = post(port, {"prompt": _ids("Hi"), "structured_outputs": so, "sn46_think": True}, False)
+        assert status == 400 and "</think>" in json.loads(text)["error"]["message"]

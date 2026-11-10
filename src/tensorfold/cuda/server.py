@@ -57,6 +57,9 @@ class PreparedRequest:
     vision: Any = None
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
+    # (patch sn46/grammar-think) a token-id completion's ``"sn46_think": true``: the prompt opened a think block, so
+    # the grammar takes the reply from the token after </think> on, as the chat route's with thinking on
+    think_ids: bool = False
 
 
 def _native_context(model_dir: Path) -> int:
@@ -276,6 +279,7 @@ class App:
             if not hasattr(self, "_probability_decoder"):
                 self._probability_decoder = TokenBytes(self.tok)
         compiled = (spec, self._grammars().compile(spec)) if spec is not None else None
+        think_ids = False
         if chat:
             if not isinstance(body.get("messages"), list):
                 raise RequestError("messages must be a list")
@@ -300,11 +304,12 @@ class App:
             prompt = self._encode(text, add_special_tokens=False)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
+            think_ids = self._think_ids(body, compiled)
             if body.get("images") is not None:           # (patch sn46/vision-rows) their pictures, ids expanded
                 vision = self._id_images(prompt, body["images"])
                 return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                        ignore_eos=ignore_eos, stop=stop, vision=vision, grammar=compiled,
-                                       think_budget=budget)
+                                       think_budget=budget, think_ids=think_ids)
         else:
             text = body.get("prompt")
             if not isinstance(text, str):
@@ -314,7 +319,18 @@ class App:
             raise RequestError("rendered prompt is empty")
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
-                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget,
+                               think_ids=think_ids)
+
+    def _think_ids(self, body: dict[str, Any], compiled) -> bool:
+        """(patch sn46/grammar-think) A token-id completion's ``sn46_think`` (default false): true says the prompt
+        opened a think block, so the request's grammar starts after the reply's </think>; RequestError when it is not
+        a boolean, or true with a grammar and a tokenizer without </think>."""
+
+        think = flag(body, "sn46_think", False)
+        if think and compiled is not None and self.tok.token_to_id("</think>") is None:
+            raise RequestError("sn46_think needs a tokenizer with a </think> token")
+        return think
 
     def _id_images(self, prompt: list[int], images: Any):
         """(patch sn46/vision-rows) A token-id prompt's pictures (``images``: data URLs, or https URLs under
@@ -568,7 +584,8 @@ class App:
         if takes_stop_eos:
             options["stop_eos"] = not prepared.ignore_eos
         shaped = prepared.grammar is not None or prepared.think_budget > 0
-        think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
+        think_end = (self.tok.token_to_id("</think>") if ((chat and thinking) or prepared.think_ids) and shaped
+                     else None)
         budget = self._think_budget(prepared, think_end)
         # background: the request's own priority, else --name-priority's default for its id; title requests always
         by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
