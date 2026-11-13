@@ -34,6 +34,7 @@ class Segment:
 class Verified:
     logits: list[torch.Tensor]              # per segment [rows, V / world] (this rank's vocabulary columns)
     taps: list[torch.Tensor | None]         # per segment [rows, taps * D] (DFlash2's inputs), or None
+    hidden: list[torch.Tensor] | None = None   # per segment [rows, D]: the final-normed rows (the MTP head's inputs)
 
 
 class SerialVerify:
@@ -46,16 +47,17 @@ class SerialVerify:
 
     def forward(self, segments: Sequence[Segment]) -> Verified:
         e = self.e
-        logits, taps = [], []
+        logits, taps, hidden = [], [], []
         for seg in segments:
             prev = e.use(seg.st)
             try:
                 R = len(seg.tokens)
                 logits.append(e.forward(seg.tokens)[:R].clone())
                 taps.append(e.tap_rows(R).clone() if self.taps else None)
+                hidden.append(e.buf.fnormed[:R].clone())
             finally:
                 e.use(prev)
-        return Verified(logits, taps)
+        return Verified(logits, taps, hidden)
 
     def commit(self, segments: Sequence[Segment], keeps: Sequence[int]) -> None:
         from .forward import commit
@@ -290,17 +292,18 @@ class BatchedVerify:
                 logits = b.logits[:R]
             else:
                 logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
-        out, taps, at = [], [], 0
+        out, taps, hidden, at = [], [], [], 0
         whole = torch.cat([t[:R] for t in b.taps], dim=1) if self.one_cat else None     # views of one copy, the same rows
         for seg in segments:
             n = len(seg.tokens)
             out.append(logits[at:at + n])
+            hidden.append(b.fnormed[at:at + n])
             if whole is not None:
                 taps.append(whole[at:at + n])
             else:
                 taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
             at += n
-        return Verified(out, taps)
+        return Verified(out, taps, hidden)
 
     def _mixer(self, layer, R: int, select: bool):
         """A layer's KDA or DSA block over the whole window, each segment on its own stream's state."""

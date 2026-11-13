@@ -151,11 +151,19 @@ def _ids_array(c) -> np.ndarray:
     return arr
 
 
-def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
-    """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
-    policy its DFlash2 twin; without a draft model, serial."""
+MTP_AUTO = [2, 3, 800000, 900000]     # an auto policy under --parallel with the MTP head: adaptive, up to 3 drafts
+
+
+def multi_code(code: list[int], dflash: bool, dflash_policy: list[int], mtp: bool = False) -> list[int]:
+    """A request's policy code under --parallel: serial stays serial; with a DFlash2 draft model auto becomes
+    TF_GLM_DFLASH_POLICY and an MTP policy its DFlash2 twin; else with the MTP head (``mtp_multi``) an MTP policy stays
+    (auto: ``MTP_AUTO``, a DFlash2 policy its MTP twin, the noise-aware ones ``MTP_AUTO``); else serial."""
 
     kind = code[0]
+    if kind != 0 and not dflash and mtp:
+        if kind in (4, 5) or kind % 10 not in (1, 2, 3):
+            return list(MTP_AUTO)
+        return [kind % 10] + list(code[1:])
     if kind == 0 or not dflash:
         return [0, 0, 0, 0]
     if kind in (4, 5):
@@ -346,6 +354,13 @@ class Lane:
     copy_rounds: int = 0
     copy_drafted: int = 0
     copy_accepted: int = 0
+    mtp: bool = False                  # the stream drafts with the MTP head (``mtp_multi``)
+    carry: Any = None                  # mtp_multi.Carry: committed rows its MTP cache has not absorbed
+    pending: Any = None                # the prompt's last normed row [1, D], absorbed with the first token
+    # what resuming a kept prompt still owes that gathers over the ranks (the MTP head's pending row): run at the
+    # lane's first prompt chunk, which every rank runs in step, never in ``_admitted`` (rank 0 runs that before the
+    # other ranks hear of the ADMIT)
+    owed: Any = None
 
 
 class NoRoom(RuntimeError):
@@ -417,6 +432,14 @@ class MultiDecoder:
             else:
                 verify = SerialVerify(e, taps=self.drafts is not None)
         self.verify = verify
+        # TF_GLM_MULTI_MTP (mtp_multi): the MTP head drafts for streams without DFlash2, on the batched window's buffers
+        self.mtp = None
+        if getattr(engine, "mtp_on", False) and e.w.mtp is not None and isinstance(verify, BatchedVerify):
+            from .mtp_multi import BatchedMTP
+
+            self.mtp = BatchedMTP(e, verify)
+            if os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0" and torch.cuda.is_available():
+                self.mtp.capture()                       # a graph a step width, both ranks (the greedy pick gathers)
         # speed settings (multi_tune): the sampler's gathers, the drafts' depth, async messages, the profile
         self.tune = tune if tune is not None else MultiSettings.from_env()
         self.profiles = None
@@ -665,7 +688,7 @@ class MultiDecoder:
         info = getattr(s, "glm", None) or {}
         draft = bool(s.draft) and not g.serial_only
         code = multi_code(info.get("code") or [0, 0, 0, 0], self.drafts is not None and draft,
-                          self.dflash_code) if draft else [0, 0, 0, 0]
+                          self.dflash_code, mtp=self.mtp is not None) if draft else [0, 0, 0, 0]
         positions: list[int] = []
         feed = None
         if s.vision is not None:              # encoded before anything is decided or sent: a failure stops here
@@ -776,6 +799,7 @@ class MultiDecoder:
         policy = decode_policy(code, g.costs) if code[0] else None
         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
                     constraint=constraint)
+        lane.mtp = not dflash and self.mtp is not None and policy is not None and code[0] in (1, 2, 3)
         self.next_sid = max(self.next_sid, a["sid"] + 1)
         self.next_order += 1
         s.sid, s.cached = a["sid"], cut
@@ -790,6 +814,7 @@ class MultiDecoder:
             st.conv.copy_(hit.conv)
             put_ring_tail(st, hit)          # the index rows of its pools still filling, into this slot's rings
             st.set_pos(cut)
+            lane.owed = (hit, cut)                       # ``_settle_owed``, at the first prompt chunk
             if dflash:
                 if hit.drafter_end != cut or hit.drafter_rows is None:
                     raise RuntimeError("a kept prompt without DFlash2's window was chosen for a DFlash2 stream")
@@ -810,6 +835,41 @@ class MultiDecoder:
         lane.t0 = s.started
         lane.since = self.clock()
         self.lanes[lane.sid] = lane
+
+    def _settle_owed(self, lane: Lane) -> None:
+        """Both ranks, at a resumed lane's first prompt chunk: the kept prompt's MTP rows (their gathers run here,
+        every rank in step)."""
+        if lane.owed is None:
+            return
+        hit, cut = lane.owed
+        lane.owed = None
+        if lane.mtp:
+            self._mtp_resume(lane, hit, cut, lane.s.prompt)
+
+    def _mtp_resume(self, lane: Lane, hit, cut: int, prompt) -> None:
+        """Both ranks: an MTP stream resumed from a kept prompt of ``cut`` tokens: its MTP rows came with the extent;
+        a kept prompt's end row (absorbed with the first token) is absorbed with the prompt's next token, or, for a
+        replay of the whole prompt, waits for its first token."""
+
+        from .mtp import mtp_forward
+
+        st = lane.st
+        st.mtp_drafted = 0
+        if hit.mtp_len == cut:
+            st.set_mtp_len(cut)
+            return
+        if hit.mtp_len != cut - 1 or hit.pending is None:
+            raise RuntimeError(f"stream {lane.sid}: a kept prompt without the MTP head's rows")
+        st.set_mtp_len(cut - 1)
+        if cut == len(prompt):
+            lane.pending = hit.pending.clone()
+            return
+        prev = self.e.use(st)
+        try:
+            mtp_forward(self.w, st, self.e.mbuf, [int(prompt[cut])], hit.pending)
+            st.set_mtp_len(cut)
+        finally:
+            self.e.use(prev)
 
     def _ctx(self, lane: Lane):
         """The lane's slot's DFlash2 context."""
@@ -838,6 +898,8 @@ class MultiDecoder:
         for c in self.kept:
             n = len(c.ids)
             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
+            if self.mtp is not None and self.drafts is None:     # an MTP stream resumes with the head's rows too
+                fits = fits and (c.mtp_len == n or c.mtp_len == n - 1 and c.pending is not None)
             fits = fits and not (self.grid and n % self.grid)
             short = n < len(prompt) or (n == len(prompt) and c.head is not None)
             if not (fits and short and (best is None or n > len(best.ids))):
@@ -853,17 +915,26 @@ class MultiDecoder:
     def _touch(self, c) -> None:
         self.kept = [k for k in self.kept if k is not c] + [c]
 
-    def _keep(self, lane: Lane, n: int, head=None) -> None:
+    def _keep(self, lane: Lane, n: int, head=None, last=None) -> None:
         """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent;
-        ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay)."""
+        ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay); ``last``:
+        the normed row n - 1 (an MTP stream's, short of its prompt's end; else ``e.last_hidden``)."""
 
         from .decode import take_snapshot
 
         prev = self.e.use(lane.st)
         try:
-            snap = take_snapshot(self.e, lane.s.prompt[:n], None, mtp=False, drafter=None)
+            m = (lane.st.mtp_len - lane.st.mtp_drafted) if lane.mtp else -1
+            if m == n and n < len(lane.s.prompt):
+                # short of the prompt's end, row n - 1 was absorbed with this prompt's token n, which a resuming
+                # prompt may not share: kept as an end row, absorbed again with the resuming prompt's next token
+                m = n - 1
+            snap = take_snapshot(self.e, lane.s.prompt[:n], None, mtp=False, drafter=None, mtp_len=m)
         finally:
             self.e.use(prev)
+        if lane.mtp and m == n - 1:              # a prompt's end: its last row waits for the first token
+            src = last if last is not None else self.e.last_hidden if lane.pending is None else lane.pending
+            snap.pending = src.clone()
         snap.drafter_end = -1
         if lane.dflash:
             snap.drafter_end = n
@@ -1169,6 +1240,8 @@ class MultiDecoder:
         st = State(self.w, lane.extent.size, e.rows, caches=e.caches, base=lane.extent.base, slots=e.slots, slot=slot)
         st.set_pos(lane.st.pos)
         st.cur = list(lane.st.cur)
+        st.set_mtp_len(lane.st.mtp_len)                  # the MTP head's rows stay in the extent; its counters move
+        st.mtp_drafted = lane.st.mtp_drafted
         lane.st, lane.slot = st, slot
 
     def _chunk_rows(self, lane: Lane) -> int:
@@ -1254,6 +1327,7 @@ class MultiDecoder:
         if not (start < stop <= n or replay and start == stop == n) or stop - start > e.prefill_rows:
             raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
         t = time.perf_counter()
+        self._settle_owed(lane)
         prev = e.use(lane.st)
         try:
             if replay:
@@ -1261,9 +1335,15 @@ class MultiDecoder:
             else:
                 _prefill_prof.active = _prefill_prof.ENABLED     # TF_GLM_PROFILE: the prompt chunks of --parallel too
                 try:
+                    if lane.mtp:
+                        from .mtp_multi import sync
+
+                        sync(lane.st)
                     out = prefill_chunk(e, prompt, start, stop - start,
                                         drafter=self._ctx(lane) if lane.dflash else None, reads=self._reads(lane),
-                                        feed=lane.feed, mtp=False, head=stop == n)
+                                        feed=lane.feed, mtp=lane.mtp, head=stop == n)
+                    if lane.mtp and stop == n:
+                        lane.pending = e.last_hidden.clone()
                 finally:
                     _prefill_prof.active = False
                 if _prefill_prof.ENABLED:
@@ -1306,6 +1386,12 @@ class MultiDecoder:
                                      reply_match=c.reply_match, miss_most=c.miss_most)
         if lane.policy is not None:
             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
+        if lane.mtp:
+            from .mtp_multi import Carry
+
+            if lane.pending is None:
+                raise RuntimeError(f"stream {lane.sid}: an MTP stream started without its prompt's last row")
+            lane.carry, lane.pending = Carry(lane.pending, [first]), None
 
     @torch.no_grad()
     def _fill_many(self, group: Sequence[tuple[Lane, int]]) -> list[int | None]:
@@ -1315,6 +1401,8 @@ class MultiDecoder:
         first tokens sampled together, each as alone: ``sample_streams``). Returns each lane's first token or None."""
 
         e = self.e
+        for lane, _ in group:
+            self._settle_owed(lane)
         pieces = []
         for lane, stop in group:
             start, n = lane.st.pos, len(lane.s.prompt)
@@ -1322,17 +1410,22 @@ class MultiDecoder:
                 raise RuntimeError(f"stream {lane.sid} cannot join a multi-prompt chunk")
             if not start < stop <= n or stop - start > e.prefill_rows:
                 raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
-            pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
-                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n,
-                                              reads=self._reads(lane)))
+            piece = multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+                                        drafter=self._ctx(lane) if lane.dflash else None, head=stop == n,
+                                        reads=self._reads(lane))
+            if lane.mtp:                         # the next tokens its rows are absorbed with (the prompt's)
+                piece.mtp = [int(t) for t in lane.s.prompt[start + 1:stop + 1]]
+            pieces.append(piece)
         t = time.perf_counter()
         heads = multi_prefill.prefill_pieces(e, pieces)
         parts, who = [], []
         for k, ((lane, stop), out) in enumerate(zip(group, heads)):
             n = len(lane.s.prompt)
+            if lane.mtp and stop == n:
+                lane.pending = pieces[k].last
             if stop < n:
                 if stop in lane.stops:
-                    self._keep(lane, stop)
+                    self._keep(lane, stop, last=pieces[k].last)
                 continue
             if _digest.ON:                                # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
                 _digest.prompt_digest(self.w, lane.st, n, out[:1], self._ctx(lane) if lane.dflash else None)
@@ -1390,6 +1483,20 @@ class MultiDecoder:
             got = self.drafts.propose([a for _, a in asks])
             for (k, _), d in zip(asks, got):
                 drafts[k] = list(d)
+        if self.mtp is not None:                 # mtp_multi: every MTP stream's carry absorbed, its chain drafted
+            from .mtp_multi import Ask
+
+            mk, mask = [], []
+            for k, l in enumerate(lanes):
+                if l.mtp and l.carry is not None:
+                    depth = l.depth if (not copied[k] and room > 0) else 0
+                    mk.append(k)
+                    mask.append(Ask(l.st, l.carry, depth, l.s.sampling, l.st.pos + 1))
+                    l.carry = None
+            if mask:
+                for k, d in zip(mk, self.mtp.draft(mask)):
+                    if d:
+                        drafts[k] = list(d)
         drafts = trim(drafts, MAX_WINDOW)
         if prof is not None:
             prof.mark("propose")
@@ -1445,6 +1552,12 @@ class MultiDecoder:
             items = [(self._ctx(l), v.taps[k][:keep]) for k, (l, keep) in enumerate(zip(lanes, keeps)) if l.dflash]
             if items:
                 self.drafts.commit(items)
+        if self.mtp is not None:                 # the kept rows the MTP head absorbs next round (copies: the window's
+            from .mtp_multi import Carry         # buffers are the head's next)
+
+            for k, (l, rows, keep) in enumerate(zip(lanes, sampled, keeps)):
+                if l.mtp:
+                    l.carry = Carry(v.hidden[k][:keep].clone(), [int(t) for t in rows[:keep]])
         if prof is not None:
             prof.mark("taps")
         for k, (l, seg, rows, keep, was_copy) in enumerate(zip(lanes, segments, sampled, keeps, copied)):

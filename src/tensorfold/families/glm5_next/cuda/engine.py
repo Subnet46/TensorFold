@@ -416,6 +416,21 @@ def mtp_head(drafter: bool, serial_only: bool, layers: int, value: str | None = 
     return value == "1" and bool(layers)
 
 
+def check_drafts(mtp_on: bool, drafter: bool, serial_only: bool, parallel: int, layers: int,
+                 multi: str | None = None) -> None:
+    """Refuse a start whose every round would decode one token by accident: no MTP head, no DFlash2 draft model and
+    no --no-drafts. Under --parallel an explicit TF_GLM_MULTI_MTP=0 (``multi``) asks for exactly that (its documented
+    one-row-a-round fallback), so it starts."""
+
+    from .mtp_multi import enabled as multi_mtp
+
+    if mtp_on or drafter or serial_only or (parallel > 1 and not multi_mtp(multi)):
+        return
+    raise ValueError(("TF_GLM_MTP=0 leaves" if layers else "this checkpoint has") + " no MTP head and "
+                     "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
+                     "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
+
+
 def without_mtp(transform, layers: int):
     """A startup weight transform that leaves out the MTP layer's tensors (``layers.<num_hidden_layers>.``)."""
 
@@ -575,7 +590,11 @@ class GlmEngine:
             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
         self.kv = kv
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
-        self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
+        # --parallel: the MTP head drafts for the streams too (mtp_multi, TF_GLM_MULTI_MTP), unless DFlash2 does
+        from .mtp_multi import enabled as multi_mtp
+
+        self.mtp_on = (mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+                       and (parallel == 1 or (drafter is None and multi_mtp())))
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         # rows a prompt chunk runs at once: TF_GLM_PREFILL_ROWS (both ranks alike), more amortizes each chunk's expert
@@ -796,10 +815,7 @@ class GlmEngine:
         if rank == 0 and self.cache_bytes < wanted and parallel == 1:
             print(f"[tensorfold] other conversations' prompts are kept in {self.cache_bytes / 2 ** 30:.1f} GiB, what "
                   f"the {self.limit}-token window leaves (TF_GLM_CACHE_GIB asks {wanted / 2 ** 30:.1f})", flush=True)
-        if not self.mtp_on and drafter is None and not serial_only:
-            raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
-                             "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
-                             "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
+        check_drafts(self.mtp_on, drafter is not None, serial_only, parallel, cfg.mtp_layers)
         w = load(model_dir, rank=rank, world=world, mtp=self.mtp_on)
         w.comm = self.comm
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL

@@ -74,7 +74,9 @@ class Piece:
     drafter: Any = None
     head: bool = False
     reads: Any = None                            # where its DFlash2 context is read later (default: the piece's end)
+    mtp: Any = None                              # the tokens after its rows (the MTP head absorbs them), or None
     lo: int = field(default=0, init=False)       # its first row in the chunk
+    last: Any = field(default=None, init=False)  # with ``mtp``: its last normed row [1, D] (a copy)
 
     @property
     def rows(self) -> int:
@@ -188,6 +190,25 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
                 p.drafter.skip_taps(k)
             if k < p.rows:
                 p.drafter.add_taps(torch.cat([t[p.lo + k:p.lo + p.rows] for t in b.taps], dim=1))
+    if any(p.mtp is not None for p in pieces):   # the MTP head's rows (mtp_multi): a copy, each piece's absorb reuses b
+        from .mtp import mtp_forward
+        from .mtp_multi import sync
+
+        hidden = b.fnormed[:R].clone()
+        for p in pieces:
+            if p.mtp is None:
+                continue
+            p.last = hidden[p.lo + p.rows - 1:p.lo + p.rows].clone()     # an end row, or a kept state's (``_keep``)
+            nxt = list(p.mtp)
+            if not nxt:
+                continue
+            prev = e.use(p.st)
+            try:
+                sync(p.st)
+                mtp_forward(w, p.st, b, nxt, hidden[p.lo:p.lo + len(nxt)])
+                p.st.set_mtp_len(p.st.mtp_len + len(nxt))
+            finally:
+                e.use(prev)
     for p in pieces:
         commit(w, p.st, b, p.rows, p.rows)
     return heads
