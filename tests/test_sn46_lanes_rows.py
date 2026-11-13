@@ -101,6 +101,38 @@ def test_hidden_rows_must_follow_each_other(active):
         job.close_hidden()
 
 
+def test_the_one_pass_check_keeps_only_the_answers_hidden_rows(active):
+    """A verifier's one-pass prompt is the miner's prompt and answer: rows hidden_from .. len - 2 are the answer's
+    forwards (the last is nobody's input); nothing is reduced."""
+    import types
+
+    spec = rows.Spec(record=True, hidden_from=5)
+    packed = rows.pack_spec(spec)
+    assert rows.unpack_spec(packed, 0)[0].hidden_from == 5
+    lane = rows.start(spec, list(range(9)), 0)                 # prompt 5 + answer 4: rows 5, 6, 7 are wanted
+    hidden = torch.arange(8 * 4, dtype=torch.float32).view(8, 4).to(torch.bfloat16)
+    b = types.SimpleNamespace(hidden=hidden, fnormed=None, fxs=None)
+    e = types.SimpleNamespace(w=None)
+    with rows.use(lane):
+        rows.prompt(e, b, list(range(9)), 0, 4)                 # chunk rows 0..3 at b rows 0..3: none wanted
+        rows.prompt(e, b, list(range(9)), 4, 5, lo_row=3)       # rows 4..8 at b rows 3..7: rows 5..7
+    rows.finish(lane)
+    job = spec.job
+    assert job.hidden_from == 5 and job.hidden.shape == (3, 4)
+    assert (job.hidden == hidden[4:7].view(torch.int16).numpy().view(np.uint16)).all()
+    assert (job.top1 < 0).all()                                 # nothing reduced
+
+
+def test_a_one_pass_check_with_cache_on_is_refused_before_dispatch(active):
+    """It reduces no row, so a state it kept could not carry its rows' numbers (``rows.kept`` would fail mid-run)."""
+    rows.arm(rows.Spec(record=True, prompt=list(range(9)), cache=True, hidden_from=5))
+    with pytest.raises(rows.RowsError, match="cache off"):
+        rows.take_armed(list(range(9)), True)
+    assert rows.disarm() is None                                # refused specs are cleared
+    rows.arm(rows.Spec(record=True, prompt=list(range(9)), hidden_from=5))
+    assert rows.take_armed(list(range(9)), True).hidden_from == 5
+
+
 def test_a_replay_keeps_the_requests_retention_cutoff(active, monkeypatch):
     spec = rows.Spec(record=True, cache=True, keep_for_ms=1000)
     monkeypatch.setattr(rows.time, "monotonic", lambda: 100.0)

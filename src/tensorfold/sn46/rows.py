@@ -93,23 +93,29 @@ class Spec:
     # skips is one the check would pass
     claim_logprobs: "np.ndarray | object | None" = field(default=None, repr=False, compare=False)
     logprob_eps: float | None = None
+    # the one-pass check (a verifier's): the prompt is the miner's prompt and answer, and only the hidden rows of the
+    # answer's forwards are wanted (rows hidden_from .. len(prompt) - 2); nothing is reduced. None: not one
+    hidden_from: int | None = None
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
     claims_array: "np.ndarray | None" = field(default=None, repr=False, compare=False)   # ``admits``' cache
 
     def header(self) -> list[int]:
-        """Seven ints for ``share`` (int32 each: the keep duration travels as two 31-bit halves, 0 for none)."""
+        """Eight ints for ``share`` (int32 each: the keep duration travels as two 31-bit halves, 0 for none; the
+        one-pass row, -1 for none)."""
         keep = self.keep_for_ms or 0
         return [1, int(self.record), -1 if self.targets is None else len(self.targets),
-                -1 if self.claims is None else len(self.claims), int(self.cache), keep & 0x7FFFFFFF, keep >> 31]
+                -1 if self.claims is None else len(self.claims), int(self.cache), keep & 0x7FFFFFFF, keep >> 31,
+                -1 if self.hidden_from is None else int(self.hidden_from)]
 
     @classmethod
     def from_header(cls, header: list[int], targets: list[int] | None, claims: list[int] | None) -> "Spec":
         """A follower's spec from rank 0's ``header`` and the targets and claims sent after it."""
         keep = (int(header[6]) << 31) | int(header[5])
-        return cls(record=False, targets=targets, claims=claims, cache=bool(header[4]), keep_for_ms=keep or None)
+        return cls(record=False, targets=targets, claims=claims, cache=bool(header[4]), keep_for_ms=keep or None,
+                   hidden_from=None if int(header[7]) < 0 else int(header[7]))
 
 
-NO_SPEC = [0, 0, -1, -1, 0, 0, 0]
+NO_SPEC = [0, 0, -1, -1, 0, 0, 0, -1]
 
 
 @dataclass
@@ -241,6 +247,8 @@ def take_armed(prompt: list[int], supported: bool, images: bool = False, job: st
         raise RowsError("row statistics run on prompts without a grammar")
     if images and spec.cache:                # an image prompt's rows are not its ids' rows: nothing is kept
         raise RowsError("an image prompt keeps no prompt state; measure it with cache off")
+    if spec.hidden_from is not None and spec.cache:     # it reduces no row, so no kept state could carry its rows
+        raise RowsError("a one-pass check keeps no prompt state; measure it with cache off")
     if spec.prompt is not None and list(prompt) != list(spec.prompt):
         raise RowsError("the request's prompt differs from the measured one")
     if spec.targets is not None and len(spec.targets) < len(prompt):
@@ -287,7 +295,10 @@ def end() -> None:
     if spec is not None:
         spec.claims_array = None
     if spec is not None and spec.job is not None:
-        spec.job.done.set()
+        try:
+            spec.job.close_hidden()
+        finally:
+            spec.job.done.set()
 
 
 def keeps() -> bool:
@@ -381,6 +392,11 @@ def prompt(e, b, prompt_ids, start: int, R: int, lo_row: int = 0) -> None:
     from tensorfold.families.glm5_next.cuda.forward import mm
 
     w = e.w
+    if spec.hidden_from is not None:          # the one-pass check: the answer's hidden rows, nothing reduced
+        first, last = max(start, spec.hidden_from), min(start + R, len(prompt_ids) - 1)
+        if spec.job is not None and first < last:
+            spec.job.keep_hidden(first, b.hidden[lo_row + first - start:lo_row + last - start].clone())
+        return
     if _scratch is None or _scratch.device != b.fnormed.device:
         _scratch = torch.empty((SUB, w.head.n), dtype=b.fnormed.dtype, device=b.fnormed.device)
     global _last

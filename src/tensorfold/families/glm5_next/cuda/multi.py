@@ -714,9 +714,10 @@ class MultiDecoder:
             raise NoRoom(f"every one of the {self.count} stream slots is taken")
         measure = getattr(s, "sn46", None)
         self._expire()                           # no kept prompt past its TTL or cutoff is resumed, between sweeps too
-        if measure is not None and (measure.targets is not None or measure.claims is not None):
-            # a verifier's walk: the one-stream engine commits its targets (``rows.forced``); the streams' rounds
-            # here commit their own samples
+        if measure is not None and (measure.targets is not None or measure.claims is not None
+                                    or measure.hidden_from is not None):
+            # a verifier's walk or one-pass check: the one-stream engine commits its targets (``rows.forced``);
+            # the streams' rounds here commit their own samples
             raise ValueError("a scoring measurement runs on the one-stream engine (--parallel 1)")
         hit = (self._resume(prompt, measure) if draft and feed is None and (measure is None or measure.cache)
                else None)
