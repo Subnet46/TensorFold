@@ -29,8 +29,10 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import hashlib
+import heapq
 import json
 import os
 import queue
@@ -55,6 +57,7 @@ from .pool import ALIGN, Pool, align_up
 from .round_cap import RoundCap
 from .segments import window_rows
 from .verify import BatchedVerify, Segment, SerialVerify, Verified
+from tensorfold.sn46 import rows as sn46_rows
 
 _NULL = contextlib.nullcontext()                    # TF_GLM_SEGPROF off, or not a profiled round's span
 
@@ -357,9 +360,10 @@ class Lane:
     mtp: bool = False                  # the stream drafts with the MTP head (``mtp_multi``)
     carry: Any = None                  # mtp_multi.Carry: committed rows its MTP cache has not absorbed
     pending: Any = None                # the prompt's last normed row [1, D], absorbed with the first token
-    # what resuming a kept prompt still owes that gathers over the ranks (the MTP head's pending row): run at the
-    # lane's first prompt chunk, which every rank runs in step, never in ``_admitted`` (rank 0 runs that before the
-    # other ranks hear of the ADMIT)
+    sn46: Any = None                   # TENSORFOLD_SN46: the measured request's rows (``sn46.rows.LaneRows``), or None
+    # what resuming a kept prompt still owes that gathers over the ranks (the kept rows' numbers, the MTP head's pending
+    # row): run at the lane's first prompt chunk, which every rank runs in step, never in ``_admitted`` (rank 0 runs
+    # that before the other ranks hear of the ADMIT)
     owed: Any = None
 
 
@@ -708,7 +712,14 @@ class MultiDecoder:
         slot = next((k for k in range(self.count) if k not in {l.slot for l in self.lanes.values()}), None)
         if slot is None:
             raise NoRoom(f"every one of the {self.count} stream slots is taken")
-        hit = self._resume(prompt) if draft and feed is None else None
+        measure = getattr(s, "sn46", None)
+        self._expire()                           # no kept prompt past its TTL or cutoff is resumed, between sweeps too
+        if measure is not None and (measure.targets is not None or measure.claims is not None):
+            # a verifier's walk: the one-stream engine commits its targets (``rows.forced``); the streams' rounds
+            # here commit their own samples
+            raise ValueError("a scoring measurement runs on the one-stream engine (--parallel 1)")
+        hit = (self._resume(prompt, measure) if draft and feed is None and (measure is None or measure.cache)
+               else None)
         need = self._need(len(prompt))
         # placement: take a kept extent over in place, or copy its rows into a new one while a stream writes in it
         copy = 0
@@ -744,6 +755,7 @@ class MultiDecoder:
 
         packed = pack(s.constraint)
         payload += [len(packed), *packed, len(positions), *positions]
+        payload += sn46_rows.pack_spec(measure)           # TENSORFOLD_SN46: the measurement, to every rank
         self._emit(ADMIT, payload)
         try:
             self._admitted(self._parse_admit(payload), s, feed, s.constraint, info.get("spec", ""))
@@ -766,9 +778,11 @@ class MultiDecoder:
         i += 1 + n
         n = p[i]
         positions = p[i + 1:i + 1 + n]
+        i += 1 + n
+        spec, i = sn46_rows.unpack_spec(p, i)
         return dict(sid=sid, slot=slot, base=base, size=size, kid=kid, copy=copy, count=count, stop_eos=bool(stop_eos),
                     draft=bool(draft), sampling=sampling, shared=shared, code=code, prompt=prompt, packed=packed,
-                    positions=positions)
+                    positions=positions, spec=spec)
 
     def _admitted(self, a: dict, s: Stream, feed, constraint, spec: str = "") -> None:
         """Both ranks: an ADMIT's stream in its slot and extent, resumed from its kept prompt if it names one."""
@@ -800,6 +814,11 @@ class MultiDecoder:
         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
                     constraint=constraint)
         lane.mtp = not dflash and self.mtp is not None and policy is not None and code[0] in (1, 2, 3)
+        # TENSORFOLD_SN46: rank 0 measures with the operator's spec (its record), the others with rank 0's copy
+        spec = getattr(s, "sn46", None) if self.rank == 0 else a["spec"]
+        if (spec is None) != (a["spec"] is None):
+            raise RuntimeError(f"stream {a['sid']}: rank {self.rank}'s measurement differs from the ADMIT's")
+        lane.sn46 = sn46_rows.start(spec, list(prompt), self.rank)
         self.next_sid = max(self.next_sid, a["sid"] + 1)
         self.next_order += 1
         s.sid, s.cached = a["sid"], cut
@@ -826,7 +845,7 @@ class MultiDecoder:
                 lane.head = hit.head.clone()
             self._touch(hit)
         # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
-        if a["draft"] and feed is None:
+        if a["draft"] and feed is None and (lane.sn46 is None or lane.sn46.spec.cache):
             lane.point = grid_point(len(prompt), cut, self.grid)
             lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
             lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
@@ -837,14 +856,18 @@ class MultiDecoder:
         self.lanes[lane.sid] = lane
 
     def _settle_owed(self, lane: Lane) -> None:
-        """Both ranks, at a resumed lane's first prompt chunk: the kept prompt's MTP rows (their gathers run here,
-        every rank in step)."""
+        """Both ranks, at a resumed lane's first prompt chunk: the kept prompt's MTP rows and row numbers (their
+        gathers run here, every rank in step)."""
         if lane.owed is None:
             return
         hit, cut = lane.owed
         lane.owed = None
+        prompt = lane.s.prompt
         if lane.mtp:
-            self._mtp_resume(lane, hit, cut, lane.s.prompt)
+            self._mtp_resume(lane, hit, cut, prompt)
+        if lane.sn46 is not None:                       # the kept rows' numbers, row cut - 1 against the next token
+            with sn46_rows.use(lane.sn46):
+                sn46_rows.resume(self.w, hit.sn46, cut, list(prompt))
 
     def _mtp_resume(self, lane: Lane, hit, cut: int, prompt) -> None:
         """Both ranks: an MTP stream resumed from a kept prompt of ``cut`` tokens: its MTP rows came with the extent;
@@ -888,7 +911,7 @@ class MultiDecoder:
                 return c
         raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
 
-    def _resume(self, prompt: list[int]):
+    def _resume(self, prompt: list[int], measure=None):
         """The longest kept strict prefix of ``prompt``, or the whole prompt when it kept its head's logits row (a
         replay of an earlier prompt), whose DFlash2 window came along. The prompt is compared as one int64 array
         against each kept prompt's cached array (``_ids_array``): the same answer as comparing the id lists, without
@@ -900,6 +923,8 @@ class MultiDecoder:
             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
             if self.mtp is not None and self.drafts is None:     # an MTP stream resumes with the head's rows too
                 fits = fits and (c.mtp_len == n or c.mtp_len == n - 1 and c.pending is not None)
+            if measure is not None:              # a measured request: a state with its rows' numbers, admitting it
+                fits = fits and c.sn46 is not None and sn46_rows.admits(c.sn46, measure)
             fits = fits and not (self.grid and n % self.grid)
             short = n < len(prompt) or (n == len(prompt) and c.head is not None)
             if not (fits and short and (best is None or n > len(best.ids))):
@@ -914,6 +939,18 @@ class MultiDecoder:
 
     def _touch(self, c) -> None:
         self.kept = [k for k in self.kept if k is not c] + [c]
+        c.kept_at = time.monotonic()                 # TF_GLM_CACHE_TTL counts from its last use (``_expire``)
+
+    def _expire(self) -> bool:
+        """Rank 0: kept prompts past TF_GLM_CACHE_TTL since their last use, or past their measured request's cutoff
+        (``sn46.rows.Spec.keep_by``), dropped on every rank (EVICT). Whether any was."""
+        ttl = float(getattr(self.g, "cache_ttl", 0) or 0)
+        now = time.monotonic()
+        stale = [c for c in self.kept if (getattr(c, "keep_by", None) is not None and now > c.keep_by)
+                 or (ttl > 0 and now - (getattr(c, "kept_at", 0.0) or now) > ttl)]
+        for c in stale:
+            self._evict(c)
+        return bool(stale)
 
     def _keep(self, lane: Lane, n: int, head=None, last=None) -> None:
         """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent;
@@ -930,6 +967,10 @@ class MultiDecoder:
                 # prompt may not share: kept as an end row, absorbed again with the resuming prompt's next token
                 m = n - 1
             snap = take_snapshot(self.e, lane.s.prompt[:n], None, mtp=False, drafter=None, mtp_len=m)
+            with sn46_rows.use(lane.sn46):                # TENSORFOLD_SN46: the state carries its rows' numbers
+                snap.sn46 = sn46_rows.kept(n)
+            snap.keep_by = lane.sn46.spec.keep_by if lane.sn46 is not None else None
+            snap.kept_at = time.monotonic()
         finally:
             self.e.use(prev)
         if lane.mtp and m == n - 1:              # a prompt's end: its last row waits for the first token
@@ -1339,9 +1380,10 @@ class MultiDecoder:
                         from .mtp_multi import sync
 
                         sync(lane.st)
-                    out = prefill_chunk(e, prompt, start, stop - start,
-                                        drafter=self._ctx(lane) if lane.dflash else None, reads=self._reads(lane),
-                                        feed=lane.feed, mtp=lane.mtp, head=stop == n)
+                    with sn46_rows.use(lane.sn46):        # TENSORFOLD_SN46: the chunk's rows reduced
+                        out = prefill_chunk(e, prompt, start, stop - start,
+                                            drafter=self._ctx(lane) if lane.dflash else None, reads=self._reads(lane),
+                                            feed=lane.feed, mtp=lane.mtp, head=stop == n)
                     if lane.mtp and stop == n:
                         lane.pending = e.last_hidden.clone()
                 finally:
@@ -1363,6 +1405,8 @@ class MultiDecoder:
             if lane.constraint is not None:             # the first token's row, under the reply's grammar
                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
             first = sample_streams(self.w, [(logits, [n], s.sampling)])[0][0]
+            if lane.sn46 is not None:                   # the prompt's last row, against the first token
+                sn46_rows.decode(self.w, [(lane.sn46, logits, [n - 1], [first], None)])
             if lane.constraint is not None:
                 lane.constraint.advance([first])
         finally:
@@ -1415,6 +1459,7 @@ class MultiDecoder:
                                         reads=self._reads(lane))
             if lane.mtp:                         # the next tokens its rows are absorbed with (the prompt's)
                 piece.mtp = [int(t) for t in lane.s.prompt[start + 1:stop + 1]]
+            piece.sn46, piece.prompt_ids = lane.sn46, lane.s.prompt
             pieces.append(piece)
         t = time.perf_counter()
         heads = multi_prefill.prefill_pieces(e, pieces)
@@ -1438,11 +1483,16 @@ class MultiDecoder:
             who.append(k)
         firsts: list[int | None] = [None] * len(group)
         if parts:
+            measured = []
             for k, rows in zip(who, sample_streams(self.w, parts)):
                 lane = group[k][0]
                 firsts[k] = rows[0]
+                if lane.sn46 is not None:               # the prompt's last row, against the first token
+                    n = len(lane.s.prompt)
+                    measured.append((lane.sn46, parts[who.index(k)][0], [n - 1], [rows[0]], None))
                 if lane.constraint is not None:
                     lane.constraint.advance([rows[0]])
+            sn46_rows.decode(self.w, measured)
         dt = time.perf_counter() - t
         for (lane, _), first in zip(group, firsts):
             lane.s.prefill_s += dt
@@ -1544,6 +1594,16 @@ class MultiDecoder:
             keeps.append(keep)
         if prof is not None:
             prof.mark("accept")
+        measured = []                                    # TENSORFOLD_SN46: the measured streams' committed rows
+        for k, (l, rows, keep) in enumerate(zip(lanes, sampled, keeps)):
+            if l.sn46 is not None:
+                n = min(keep, max(0, l.s.count - len(l.s.out)))   # the rows of tokens the reply takes, no more
+                if n == 0:
+                    continue
+                raw = v.raw[k][:n] if v.raw is not None and self.rank == 0 else None
+                measured.append((l.sn46, v.logits[k][:n], [l.st.pos + i for i in range(n)],
+                                 [int(t) for t in rows[:n]], raw))
+        sn46_rows.decode(self.w, measured)
         with sp.span("commit") if sp is not None else _NULL:
             verify.commit(segments, keeps)
         if prof is not None:
@@ -1680,6 +1740,7 @@ class MultiDecoder:
         """Both ranks: the stream's slot frees; its extent stays for its kept prompts (shrunk to them) or goes."""
 
         lane = self.lanes.pop(sid)
+        sn46_rows.finish(lane.sn46)
         x = lane.extent
         x.owner = None
         self._settle(x)
@@ -1714,6 +1775,9 @@ class MultiDecoder:
         """After an error in an iteration: forget every stream (the ranks can no longer be trusted to agree)."""
 
         live = [l.s for l in self.lanes.values()]
+        for l in self.lanes.values():                    # a measured request's record ends (its operator sees no rows)
+            if l.sn46 is not None and l.sn46.spec.job is not None:
+                l.sn46.spec.job.done.set()
         self.lanes = {}
         if self.broken is None:
             self.broken = RuntimeError("an iteration failed")
@@ -1818,6 +1882,20 @@ class MultiDecoder:
         return min(stop, nxt)
 
 
+def _job_aborted() -> Exception:
+    from tensorfold.server.cancellation import RequestCancelled
+
+    return RequestCancelled("the job was aborted")
+
+
+def _carry_job(old: Any, new: Any) -> None:
+    """A replayed stream stays its request's: the job it names and the flag an abort of that job sets."""
+
+    new.sn46_job = getattr(old, "sn46_job", None)
+    new.abort_flag = getattr(old, "abort_flag", None)
+    new.sn46_since = getattr(old, "sn46_since", 0.0)
+
+
 # -- the scheduler ----------------------------------------------------------------------------------------------------
 class GlmScheduler(Scheduler):
     """``cuda.scheduler.Scheduler`` for the GLM decoder: a request's GLM settings ride on its stream (``glm``); a
@@ -1835,6 +1913,8 @@ class GlmScheduler(Scheduler):
         decoder's, else ``time.monotonic``); ``start``: run the worker thread (tests step ``_iteration``)."""
 
         self.held = None
+        self._abort_lock = threading.Lock()
+        self._aborted_jobs: "collections.OrderedDict[str, float]" = collections.OrderedDict()
         # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
         # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
         self.gather_s = multi_prefill.wait_ms() / 1000.0 if getattr(decoder, "group", False) else 0.0
@@ -1884,12 +1964,115 @@ class GlmScheduler(Scheduler):
         live = [getattr(l.s, "admitted_as", l.s.priority) for l in self.decoder.lanes.values()]
         return self.prio.short(self.waiting.rank(stream), live, self.max_streams, self._active())
 
+    # -- TENSORFOLD_SN46: the operator's abort of a job ends its stream (patch sn46/abort-stream) ---------------------
+    ABORTED_TTL_S = 120.0
+
+    def cancel_job(self, job: str) -> None:
+        """The operator aborted ``job`` (its client already left): its stream, waiting, filling, decoding or being
+        given back, ends at the scheduler's next iteration instead of when the engine next writes to the closed
+        connection, and from now on ``running_streams`` no longer counts it. The abort is remembered with its time,
+        so a stream that sat in no container at that instant (a give-back's replay) is still known as aborted,
+        while a request for the same job submitted after it (a verifier's job given again) is not."""
+
+        now = time.monotonic()
+        with self._abort_lock:
+            self._aborted_jobs[job] = now
+            self._aborted_jobs.move_to_end(job)
+            while self._aborted_jobs and (len(self._aborted_jobs) > 4096
+                                          or now - next(iter(self._aborted_jobs.values())) > self.ABORTED_TTL_S):
+                self._aborted_jobs.popitem(last=False)
+        for stream in self._streams():
+            self._aborted(stream)                     # latches the flag of the streams it finds
+
+    def _streams(self) -> list:
+        """Every stream the engine holds: live, held and waiting (a snapshot; another thread may read it)."""
+
+        out = [lane.s for lane in list(self.decoder.lanes.values())]
+        held = self.held
+        if held is not None:
+            out.append(held[0])
+        out += [item[0] for item in self._waiting_items()]
+        return out
+
+    def _waiting_items(self) -> list:
+        w = self.waiting
+        if isinstance(w, prio.PriorityWaiting):
+            with w.cv:
+                return [entry[1] for entry in w.items]
+        with w.mutex:
+            return [entry[2] for entry in w.queue if entry[2] is not None]
+
+    def _aborted(self, stream: Any) -> bool:
+        """Whether ``stream``'s request was aborted: its job's abort came after the request was submitted. Latched on
+        the request's flag, which its replays share."""
+
+        flag = getattr(stream, "abort_flag", None)
+        if flag is None:
+            return False
+        if not flag[0]:
+            job = getattr(stream, "sn46_job", None)
+            if job is not None:
+                with self._abort_lock:
+                    at = self._aborted_jobs.get(job)
+                if at is not None and getattr(stream, "sn46_since", at) <= at:
+                    flag[0] = True
+        return flag[0]
+
+    def running_streams(self) -> int:
+        """Requests the engine serves or will: live, held and waiting, an aborted job's excluded."""
+
+        # one request once: a snapshot taken across a give-back or an admission may hold it twice (its stream and
+        # its replay, or one item in two containers); the flag is the request's, shared by its replays
+        return len({id(s.abort_flag) if getattr(s, "abort_flag", None) is not None else id(s)
+                    for s in self._streams() if not self._aborted(s)})
+
+    def _drop_aborted(self) -> None:
+        """Rank 0's scheduler thread, between rounds: the streams of aborted jobs leave. Waiting and held ones without
+        a prefill; filling and decoding ones are finished now (a filling lane emits nothing until its last chunk).
+        Each request ends cancelled exactly once: every entry is judged once."""
+
+        from tensorfold.server.cancellation import RequestCancelled
+
+        gone = []
+        if self.held is not None and self._aborted(self.held[0]):
+            gone.append(self.held)
+            self.held = None
+        w = self.waiting
+        if isinstance(w, prio.PriorityWaiting):
+            with w.cv:
+                keep, drop = [], []
+                for e in w.items:
+                    (drop if self._aborted(e[1][0]) else keep).append(e)
+                w.items = keep
+                gone += [e[1] for e in drop]
+        else:
+            with w.mutex:
+                keep, drop = [], []
+                for e in w.queue:
+                    (drop if e[2] is not None and self._aborted(e[2][0]) else keep).append(e)
+                if drop:
+                    w.queue[:] = keep
+                    heapq.heapify(w.queue)
+                    gone += [e[2] for e in drop]
+        cancelled = RequestCancelled("the job was aborted")
+        for _stream, box in gone:
+            box.put(("error", cancelled))
+        live = [lane.s for lane in list(self.decoder.lanes.values()) if self._aborted(lane.s)]
+        if live:
+            boxes = [self.boxes.pop(id(s), None) for s in live]
+            try:
+                self.decoder.finish(live)
+            finally:                                  # a failed cleanup strands no caller
+                for box in boxes:
+                    if box is not None:
+                        box.put(("error", cancelled))
+
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
                constraint: Any = None, background: bool = False, glm: dict | None = None,
-               priority: int | None = None) -> dict:
+               priority: int | None = None, sn46: Any = None, sn46_job: str | None = None) -> dict:
         """``priority``: the request's class (``cuda.priority``; None: background if ``background`` else the
-        default class)."""
+        default class); ``sn46_job``: the job the request names (TENSORFOLD_SN46), which ``cancel_job`` ends."""
 
         box: queue.Queue = queue.Queue()
         if priority is None:
@@ -1897,9 +2080,11 @@ class GlmScheduler(Scheduler):
         stream = Stream(copy_prompt(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
                         constraint=constraint, background=background, priority=int(priority), arrived=self.clock())
         stream.glm = dict(glm or {})
+        stream.sn46 = sn46                               # TENSORFOLD_SN46: rank 0's measurement of it, or None
         self.saw(stream.priority)
-        cancel = [False]
-        stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
+        stream.sn46_job, stream.abort_flag, stream.sn46_since = sn46_job, [False], time.monotonic()
+        cancel, aborted = [False], stream.abort_flag
+        stream.emit = lambda new: (box.put(("tokens", new)), cancel[0] or aborted[0])[1]
         self.waiting.put((stream, box))
         while True:
             kind, value = box.get()
@@ -1930,6 +2115,9 @@ class GlmScheduler(Scheduler):
                 except queue.Empty:
                     break
             stream, box = item
+            if self._aborted(stream):                # aborted while it waited: it leaves without a prefill
+                box.put(("error", _job_aborted()))
+                continue
             if not self.decoder.fits(stream):
                 self.held = item                     # waits, first in line, for room
                 break
@@ -1961,6 +2149,10 @@ class GlmScheduler(Scheduler):
                     continue
                 break
             stream, box = item
+            if self._aborted(stream):                # aborted while it waited: it leaves without a prefill
+                self.waiting.remove(item)
+                box.put(("error", _job_aborted()))
+                continue
             if self._short(stream):
                 break                                # no slot for its class: it waits (``_yield`` may free one)
             if not self.decoder.fits(stream):
@@ -2002,6 +2194,8 @@ class GlmScheduler(Scheduler):
                 self.preempted += 1
                 again = stream.continued()
                 again.glm = getattr(stream, "glm", {})
+                again.sn46 = getattr(stream, "sn46", None)   # TENSORFOLD_SN46: the replay is measured as the request
+                _carry_job(stream, again)
                 again.yields = stream.yields + 1
                 again.arrived = self.clock()     # waits as a new arrival: it never outranks the request it yielded to
                 self.waiting.put((again, box))
@@ -2018,6 +2212,8 @@ class GlmScheduler(Scheduler):
         self.yields += 1
         again = stream.continued()
         again.glm = getattr(stream, "glm", {})
+        again.sn46 = getattr(stream, "sn46", None)
+        _carry_job(stream, again)
         self.waiting.put((again, box))
 
     def _requeue(self) -> None:
@@ -2027,6 +2223,8 @@ class GlmScheduler(Scheduler):
                 continue
             again = stream.continued()
             again.glm = getattr(stream, "glm", {})
+            again.sn46 = getattr(stream, "sn46", None)
+            _carry_job(stream, again)
             self.yields += 1
             self.waiting.put((again, box))
         self.decoder.requeue = []
@@ -2044,16 +2242,39 @@ class GlmScheduler(Scheduler):
                 for s in self.decoder.drop():
                     self._reply(s, "error", exc)
 
+    EXPIRE_S = 5.0                       # how often kept prompts are checked against TF_GLM_CACHE_TTL, idle or not
+
+    def _expire_tick(self) -> None:
+        """Rank 0: stale kept prompts dropped on every rank; an idle engine tells rank 1 at once (the doorbell, then
+        IDLE again), a busy one with the next round's message."""
+        now = time.monotonic()
+        if now - getattr(self, "_expired_at", 0.0) < self.EXPIRE_S:
+            return
+        self._expired_at = now
+        d = self.decoder
+        if d._expire() and not d.lanes and d.broken is None:
+            d._flush()
+            d.finish([])
+
     def _iteration(self) -> None:
+        self._drop_aborted()
         self._yield()
+        self._expire_tick()
         idle = not self.decoder.live() and self.held is None
         if self.prio.enabled:                                       # idle: wait for a request (left in the queue)
             first = None
             if idle:
-                self.waiting.wait()
+                while not self.waiting.wait(self.EXPIRE_S):
+                    self._expire_tick()
             until = self.clock() + self.gather_s if idle and self.gather_s > 0 else None
         else:
-            first = self.waiting.get() if idle else None            # idle: wait for a request
+            first = None
+            while idle:                                             # idle: wait for a request
+                try:
+                    first = self.waiting.get(timeout=self.EXPIRE_S)
+                    break
+                except queue.Empty:
+                    self._expire_tick()
             until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
         done = self._admit(first, until)
         try:

@@ -1420,15 +1420,17 @@ class GlmEngine:
         # TENSORFOLD_SN46: the row statistics the operator armed for this request, checked against it here, before
         # any other rank hears of the request
         # (patch sn46/vision-rows) image prompts too: their feature rows are injected before the rows are read
-        measure = sn46_rows.take_armed(list(prompt), self.scheduler is None and constraint is None,
-                                       images=vision is not None)
+        measure = sn46_rows.take_armed(list(prompt), constraint is None, images=vision is not None,
+                                       job=getattr(self.request, "sn46_job", None) if self.scheduler is not None
+                                       else None)
         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
             if vision is not None and self.vision is None:
                 raise ValueError("image inputs require starting this server with --vision")
             stats = self.scheduler.submit(copy_prompt(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
                                           background=background, glm={"code": code, "spec": spec},
-                                          priority=priority)
+                                          priority=priority, sn46=measure,
+                                          sn46_job=getattr(self.request, "sn46_job", None))
             stats.update(policy=spec, drafts=draft)
             return stats
         positions: list[int] = []

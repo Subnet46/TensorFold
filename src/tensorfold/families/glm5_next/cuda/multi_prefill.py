@@ -75,6 +75,8 @@ class Piece:
     head: bool = False
     reads: Any = None                            # where its DFlash2 context is read later (default: the piece's end)
     mtp: Any = None                              # the tokens after its rows (the MTP head absorbs them), or None
+    sn46: Any = None                             # TENSORFOLD_SN46: its stream's ``rows.LaneRows``, or None
+    prompt_ids: Any = None                       # with ``sn46``: the stream's whole prompt
     lo: int = field(default=0, init=False)       # its first row in the chunk
     last: Any = field(default=None, init=False)  # with ``mtp``: its last normed row [1, D] (a copy)
 
@@ -173,6 +175,12 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
     R = layout(pieces, b.rows)
     _stage(w, b, pieces, R)
     compute(w, None, b, R, head=False, mixer=PieceMixer(w, b, pieces, R))     # leaves b.fnormed's rows
+    from tensorfold.sn46 import rows as sn46_rows
+
+    for p in pieces:                     # TENSORFOLD_SN46: each measured piece's rows, read before b is reused
+        if p.sn46 is not None:
+            with sn46_rows.use(p.sn46):
+                sn46_rows.prompt(e, b, p.prompt_ids, p.st.pos, p.rows, lo_row=p.lo)
     heads: list[torch.Tensor | None] = []
     for p in pieces:
         if p.head:                       # the head on the piece's last row: the one-row matmul a chunk of its own runs
