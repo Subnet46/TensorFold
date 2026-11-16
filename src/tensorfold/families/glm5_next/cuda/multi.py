@@ -8,7 +8,9 @@ window scratch; a DFlash2 context, ``dflash2_multi.DraftContext``; host side its
 
 Iterations (``GlmScheduler``, one worker thread on rank 0): admissions, then either one prompt chunk of the oldest
 filling stream (FIFO, at most TF_GLM_FILL_ROWS rows while others decode, the engine's prompt chunk alone) or one
-decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. With
+decode round, alternating by TF_GLM_FILL_SHARE (with priority lanes, ``_ranked_fill`` asks ``prio.Arbiter``, whose
+decode time share, TENSORFOLD_PRIORITY_DECODE_SHARE, keeps rounds their share of the time under prompt overload, even
+against starving prompts); a prompt chunk never shares a forward with decode rows. With
 TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling streams (``multi_prefill``: each
 stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
 budget). A round: each

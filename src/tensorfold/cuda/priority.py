@@ -25,6 +25,11 @@ the arithmetic of any request):
   one that has not advanced for TENSORFOLD_PRIORITY_STARVE_MS (the longest waiting first; never two such chunks in a
   row), else the soonest class, then the fewest prompt rows left (a short prompt never waits behind a long one), then
   admission order.
+- decode time share: while streams decode, decode rounds get at least TENSORFOLD_PRIORITY_DECODE_SHARE of the time
+  (default 0.35; 0: off), measured in time, not iterations: every second a prompt chunk takes owes the rounds
+  share / (1 - share) seconds, which they get before the next chunk, whatever its class (realtime excepted) and
+  however long it waited (starving does not override it; at most TENSORFOLD_PRIORITY_DECODE_DEBT_MS is owed at once). Under prompt overload
+  decoding otherwise got one round per 0.65 s chunk, ~4 tok/s a stream (sn46 lanes-diag 2026-11-16: 135 -> 4).
 - chunk or round: while streams decode, a prompt chunk of a sooner class than every decoding stream goes before the
   rounds (a round still runs at least every TENSORFOLD_PRIORITY_ROUND_GAP_MS), one of a later class takes
   TENSORFOLD_PRIORITY_DOWN_SHARE of the iterations, equal classes alternate by the engine's own share as before, and
@@ -130,6 +135,8 @@ class Settings:
     tier_hold_s: float = 900.0          # _TIER_HOLD_S: a tier holds while its class arrived this recently
     rt_head: int = 32                   # _REALTIME_HEAD: a realtime reply's tokens decoded in rounds of its own
     rt_rows: int = 2048                 # _REALTIME_ROWS: later classes' chunk rows while realtime arrives (0: off)
+    decode_share: float = 0.35          # _DECODE_SHARE: the time decode rounds keep under prompt chunks (0: off)
+    decode_debt_s: float = 2.0          # _DECODE_DEBT_MS: the most round time owed at once
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -160,7 +167,9 @@ class Settings:
                    max_yields=int(_number(env, "TENSORFOLD_PRIORITY_MAX_YIELDS", 2, 0, 100)),
                    tier_hold_s=_number(env, "TENSORFOLD_PRIORITY_TIER_HOLD_S", 900, 0, 31536000),
                    rt_head=int(_number(env, "TENSORFOLD_PRIORITY_REALTIME_HEAD", 32, 0, 1 << 20)),
-                   rt_rows=int(_number(env, "TENSORFOLD_PRIORITY_REALTIME_ROWS", 2048, 0, 1 << 20)))
+                   rt_rows=int(_number(env, "TENSORFOLD_PRIORITY_REALTIME_ROWS", 2048, 0, 1 << 20)),
+                   decode_share=_number(env, "TENSORFOLD_PRIORITY_DECODE_SHARE", 0.35, 0, 0.95),
+                   decode_debt_s=_number(env, "TENSORFOLD_PRIORITY_DECODE_DEBT_MS", 2000, 20, 600000) / 1000.0)
 
     def tiers(self, max_streams: int, active: tuple[bool, bool] = (True, True)) -> tuple[int, int]:
         """(slots only realtime takes, more slots only realtime and interactive take):
@@ -210,7 +219,8 @@ class Settings:
                 f"{self.short_rows} rows, shares up {self.up_share:g} / down {self.down_share:g}, admission age "
                 f"{self.admit_age_s:g} s, at most {self.max_yields} yields a request, tiers hold "
                 f"{self.tier_hold_s:g} s, realtime head {self.rt_head} tokens, chunks of later classes at most "
-                f"{self.rt_rows or 'any'} rows while realtime requests arrive")
+                f"{self.rt_rows or 'any'} rows while realtime requests arrive, decode keeps "
+                f"{self.decode_share:g} of the time (at most {self.decode_debt_s * 1e3:.0f} ms owed)")
 
 
 def enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -271,14 +281,37 @@ class Arbiter:
         self.s, self.share, self.clock = settings, float(share), clock
         self.credit = 0.0
         self.last_round: float | None = None
-        self.counts = {"chunks": 0, "rounds": 0, "starved": 0, "overdue": 0, "short": 0, "held": 0}
+        # The decode time share: the round time owed (``debt``, seconds), and since when the time is counted and for
+        # what (``mark``, and whether a chunk has been running since: ``chunking``).
+        self.debt = 0.0
+        self.mark: float | None = None
+        self.chunking = False
+        self.counts = {"chunks": 0, "rounds": 0, "starved": 0, "overdue": 0, "short": 0, "held": 0, "owed": 0}
+
+    def _account(self, now: float) -> None:
+        """Count the time since the last mark: a chunk's adds share / (1 - share) of it to the round time owed, a
+        round's pays it back."""
+
+        share = self.s.decode_share
+        if self.mark is not None and share > 0:
+            elapsed = max(0.0, now - self.mark)
+            if self.chunking:
+                self.debt = min(self.debt + elapsed * share / (1.0 - share), self.s.decode_debt_s)
+            else:
+                self.debt = max(0.0, self.debt - elapsed)
+        self.mark = now
 
     def choose(self, fill_class: int, fill_rows: int, starving: bool, round_class: int, hold: bool = False) -> bool:
         """True: the chunk goes now; False: a decode round. ``round_class``: the soonest decoding stream's class;
-        ``hold``: a realtime reply's head decodes (no chunk of a later class unless starving)."""
+        ``hold``: a realtime reply's head decodes (no chunk of a later class unless starving). Rounds owed by the
+        decode time share go first, starving or not."""
 
         s = self.s
         now = self.clock()
+        self._account(now)
+        if self.debt > 0 and fill_class > REALTIME:    # a realtime prompt never waits behind owed rounds
+            self.counts["owed"] += 1
+            return self._round()
         if self.last_round is not None and now - self.last_round >= s.round_gap_s:
             self.counts["overdue"] += 1
             return self._round()
@@ -301,16 +334,24 @@ class Arbiter:
 
     def _chunk(self) -> bool:
         self.counts["chunks"] += 1
+        self.chunking = True
         return True
 
     def _round(self) -> bool:
         self.counts["rounds"] += 1
+        self.chunking = False
         return False
 
     def rounded(self) -> None:
-        """A decode round just ran."""
+        """A decode round just ran (also one that ran without being chosen, while no prompt filled): its time pays
+        back the round time owed."""
 
-        self.last_round = self.clock()
+        now = self.clock()
+        if self.chunking:
+            self._account(now)          # the chunk before it ends where this round's time is not known: count it
+        self.chunking = False
+        self._account(now)
+        self.last_round = now
 
 
 # -- admission ------------------------------------------------------------------------------------------------------
