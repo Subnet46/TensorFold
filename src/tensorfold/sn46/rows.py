@@ -93,23 +93,29 @@ class Spec:
     # skips is one the check would pass
     claim_logprobs: "np.ndarray | object | None" = field(default=None, repr=False, compare=False)
     logprob_eps: float | None = None
+    # the one-pass check (a verifier's): the prompt is the miner's prompt and answer, and only the hidden rows of the
+    # answer's forwards are wanted (rows hidden_from .. len(prompt) - 2); nothing is reduced. None: not one
+    hidden_from: int | None = None
     job: "Job | None" = None             # set when the request starts (rank 0's is the operator's)
     claims_array: "np.ndarray | None" = field(default=None, repr=False, compare=False)   # ``admits``' cache
 
     def header(self) -> list[int]:
-        """Seven ints for ``share`` (int32 each: the keep duration travels as two 31-bit halves, 0 for none)."""
+        """Eight ints for ``share`` (int32 each: the keep duration travels as two 31-bit halves, 0 for none; the
+        one-pass row, -1 for none)."""
         keep = self.keep_for_ms or 0
         return [1, int(self.record), -1 if self.targets is None else len(self.targets),
-                -1 if self.claims is None else len(self.claims), int(self.cache), keep & 0x7FFFFFFF, keep >> 31]
+                -1 if self.claims is None else len(self.claims), int(self.cache), keep & 0x7FFFFFFF, keep >> 31,
+                -1 if self.hidden_from is None else int(self.hidden_from)]
 
     @classmethod
     def from_header(cls, header: list[int], targets: list[int] | None, claims: list[int] | None) -> "Spec":
         """A follower's spec from rank 0's ``header`` and the targets and claims sent after it."""
         keep = (int(header[6]) << 31) | int(header[5])
-        return cls(record=False, targets=targets, claims=claims, cache=bool(header[4]), keep_for_ms=keep or None)
+        return cls(record=False, targets=targets, claims=claims, cache=bool(header[4]), keep_for_ms=keep or None,
+                   hidden_from=None if int(header[7]) < 0 else int(header[7]))
 
 
-NO_SPEC = [0, 0, -1, -1, 0, 0, 0]
+NO_SPEC = [0, 0, -1, -1, 0, 0, 0, -1]
 
 
 @dataclass
@@ -126,6 +132,11 @@ class Job:
     # the tokens the request resumed from a kept state (``resume``; 0: a fresh prefill): rows 0 .. resumed - 2 are the
     # state's record, which ``admits`` held to the request's claims, so an operator may leave them unread
     resumed: int = 0
+    # --parallel (``LaneRows``): the reply rows' final hidden rows (the one-pass check's input), (first row, [k, D]
+    # bf16) pieces in row order while the request runs, one host array [rows, D] uint16 once it ended (``hidden``)
+    pieces: list = field(default_factory=list)
+    hidden: np.ndarray | None = None
+    hidden_from: int = -1                # the row of ``hidden``'s first entry (the prompt's last row + 1)
 
     def put(self, rows: np.ndarray, got: np.ndarray, targets: list[int]) -> None:
         """``got`` [n, 5] (top1 id, top1 logit, lse, target logit, claim logit) for ``rows``, whose targets were
@@ -149,6 +160,26 @@ class Job:
             self.values = np.concatenate([self.values, np.full((more, 4), np.nan, np.float32)])
             self.drawn = np.concatenate([self.drawn, np.full(more, -1, np.int64)])
 
+    def keep_hidden(self, row: int, rows) -> None:
+        """A committed piece of reply rows' hidden rows (a GPU copy), from ``row`` on."""
+        self.pieces.append((int(row), rows))
+
+    def close_hidden(self) -> None:
+        """At the request's end: the pieces as one host array (rows in order, each once)."""
+        if not self.pieces:
+            return
+        import torch
+
+        first = self.pieces[0][0]
+        at = first
+        for row, t in self.pieces:
+            if row != at:
+                raise RowsError(f"hidden rows from {row}, expected {at}")
+            at += t.shape[0]
+        whole = torch.cat([t for _, t in self.pieces]).contiguous()
+        self.hidden = whole.view(torch.int16).cpu().numpy().view(np.uint16)
+        self.hidden_from, self.pieces = first, []
+
     def take(self, rows: int) -> dict[str, np.ndarray]:
         """Rows 0 .. rows - 1 (prompt + output - 1 for a reply), every one reduced."""
         if not self.done.is_set():
@@ -163,26 +194,35 @@ class Job:
 
 
 _armed: Spec | None = None
+_armed_by: dict[str, Spec] = {}          # --parallel: specs armed for named jobs (a request names its ``sn46_job``)
 _lock = threading.Lock()
 _req: Spec | None = None                 # the running request's spec (every rank)
 _scratch = None                          # [SUB, local vocab] bf16 for the prompt rows' head
 _last: tuple[int, object] | None = None  # (n, this rank's logits shard of row n - 1) of the latest prefill of n rows
 
 
-def arm(spec: Spec) -> None:
-    """Rank 0: the next request is measured with ``spec`` (the other ranks get it with the request)."""
+def arm(spec: Spec, job: str | None = None) -> None:
+    """Rank 0: the next request is measured with ``spec`` (the other ranks get it with the request); with ``job``
+    (--parallel, several requests at once) the request naming that job is."""
     global _armed
     if not ACTIVE:
         raise RowsError("this server was started without TENSORFOLD_SN46")
     with _lock:
+        if job is not None:
+            if job in _armed_by:
+                raise RowsError("a measurement is already armed for this job")
+            _armed_by[job] = spec
+            return
         if _armed is not None:
             raise RowsError("a measurement is already armed")
         _armed = spec
 
 
-def disarm() -> Spec | None:
+def disarm(job: str | None = None) -> Spec | None:
     global _armed
     with _lock:
+        if job is not None:
+            return _armed_by.pop(job, None)
         spec, _armed = _armed, None
     return spec
 
@@ -192,16 +232,23 @@ def measuring() -> bool:
     return _req is not None
 
 
-def take_armed(prompt: list[int], supported: bool, images: bool = False) -> Spec | None:
+def take_armed(prompt: list[int], supported: bool, images: bool = False, job: str | None = None) -> Spec | None:
     """Rank 0, at a request's start, before any other rank hears of it: the armed spec (then cleared), or None. A
-    spec that does not fit the request is cleared and refused here, so a refusal never strands the other ranks."""
-    spec = disarm() if ACTIVE else None
+    spec that does not fit the request is cleared and refused here, so a refusal never strands the other ranks.
+    ``job``: the request's ``sn46_job`` (--parallel: the spec armed for it)."""
+    spec = disarm(job) if ACTIVE else None
     if spec is None:
+        if ACTIVE and job is not None:
+            # --parallel: a request naming a job with nothing armed for it comes after that job's abort (or for a job
+            # never begun); unmeasured it would run as a stream nobody serves
+            raise RowsError("no measurement is armed for this job")
         return None
     if not supported:
-        raise RowsError("row statistics run on the one-stream engine, for prompts without a grammar")
+        raise RowsError("row statistics run on prompts without a grammar")
     if images and spec.cache:                # an image prompt's rows are not its ids' rows: nothing is kept
         raise RowsError("an image prompt keeps no prompt state; measure it with cache off")
+    if spec.hidden_from is not None and spec.cache:     # it reduces no row, so no kept state could carry its rows
+        raise RowsError("a one-pass check keeps no prompt state; measure it with cache off")
     if spec.prompt is not None and list(prompt) != list(spec.prompt):
         raise RowsError("the request's prompt differs from the measured one")
     if spec.targets is not None and len(spec.targets) < len(prompt):
@@ -248,7 +295,10 @@ def end() -> None:
     if spec is not None:
         spec.claims_array = None
     if spec is not None and spec.job is not None:
-        spec.job.done.set()
+        try:
+            spec.job.close_hidden()
+        finally:
+            spec.job.done.set()
 
 
 def keeps() -> bool:
@@ -330,8 +380,9 @@ def combine(g):
                         g[:, :, 3].max(0).values, g[:, :, 4].max(0).values], 1)
 
 
-def prompt(e, b, prompt_ids, start: int, R: int) -> None:
-    """``prefill_chunk``, after the chunk's forward: reduce its rows' heads (every rank)."""
+def prompt(e, b, prompt_ids, start: int, R: int, lo_row: int = 0) -> None:
+    """``prefill_chunk``, after the chunk's forward: reduce its rows' heads (every rank). ``lo_row``: the rows'
+    first row in ``b`` (a multi-prompt chunk's piece)."""
     spec = _req
     if spec is None:
         return
@@ -341,19 +392,24 @@ def prompt(e, b, prompt_ids, start: int, R: int) -> None:
     from tensorfold.families.glm5_next.cuda.forward import mm
 
     w = e.w
+    if spec.hidden_from is not None:          # the one-pass check: the answer's hidden rows, nothing reduced
+        first, last = max(start, spec.hidden_from), min(start + R, len(prompt_ids) - 1)
+        if spec.job is not None and first < last:
+            spec.job.keep_hidden(first, b.hidden[lo_row + first - start:lo_row + last - start].clone())
+        return
     if _scratch is None or _scratch.device != b.fnormed.device:
         _scratch = torch.empty((SUB, w.head.n), dtype=b.fnormed.dtype, device=b.fnormed.device)
     global _last
     for lo in range(0, R, SUB):
         hi = min(R, lo + SUB)
-        logits = mm(b, b.fnormed[lo:hi], w.head, b.fxs[lo:hi], _scratch[:hi - lo])
+        logits = mm(b, b.fnormed[lo_row + lo:lo_row + hi], w.head, b.fxs[lo_row + lo:lo_row + hi], _scratch[:hi - lo])
         rows = list(range(start + lo, start + hi))
         targets = [_target(spec, r, None) for r in rows]
         got = reduce(w, logits, targets, [_claim(spec, r) for r in rows])
         if spec.job is not None:
             spec.job.put(np.asarray(rows), got, targets)
-        if start + hi == len(prompt_ids):          # the prefill's last row: a kept state's ``Kept.last``
-            _last = (start + hi, logits[hi - lo - 1].clone())
+        if hi == R:                                # the chunk's last row: a kept state's ``Kept.last`` (states sit on
+            _last = (start + hi, logits[hi - lo - 1].clone())    # chunk ends: a prompt's, or a stop of --parallel's)
 
 
 @dataclass
@@ -527,3 +583,114 @@ def from_gathered(g, k: int, targets: list[int]) -> np.ndarray:
     hit = np.where(ids == want[:, None], values, np.float32(-np.inf)).max(1)
     target_logit = np.where(np.isinf(target_logit) & (want >= 0), hit, target_logit)
     return np.stack([top1.astype(np.float32), top1_logit, lse, target_logit, claim_logit], 1).astype(np.float32)
+
+
+# -- --parallel: several measured requests at once ---------------------------------------------------------------------
+@dataclass
+class LaneRows:
+    """A measured stream of the multi-stream engine (every rank): its spec and the last prefill row's logits (what
+    ``_req`` and ``_last`` hold for the one-stream engine's request). The multi-stream engine runs one stream's prompt
+    chunk at a time (``use``), and reduces its streams' decode rows together (``decode``)."""
+
+    spec: Spec
+    last: tuple | None = None
+
+
+def start(spec: Spec | None, prompt: list[int], rank: int) -> LaneRows | None:
+    """``begin`` for a stream of the multi-stream engine (every rank, at its ADMIT)."""
+    if spec is None:
+        return None
+    spec.job = Job(spec, list(prompt)) if spec.record and rank == 0 else None
+    spec.prompt = list(prompt)
+    if spec.keep_by is None:             # a replay (a requeued stream) keeps the request's own cutoff
+        spec.keep_by = None if spec.keep_for_ms is None else time.monotonic() + spec.keep_for_ms / 1000
+    return LaneRows(spec)
+
+
+class use:
+    """``with use(lane_rows):`` the one-stream hooks (``prompt``, ``kept``, ``resume``) act on that stream."""
+
+    def __init__(self, lane: LaneRows | None) -> None:
+        self.lane = lane
+
+    def __enter__(self):
+        global _req, _last
+        self.saved = (_req, _last)
+        _req = self.lane.spec if self.lane is not None else None
+        _last = self.lane.last if self.lane is not None else None
+        return self
+
+    def __exit__(self, *exc):
+        global _req, _last
+        if self.lane is not None:
+            self.lane.last = _last
+        _req, _last = self.saved
+        return False
+
+
+def decode(w, parts) -> None:
+    """Every rank, after a round's acceptance: the committed rows of the measured streams, ONE all-gather for all.
+    ``parts`` [(LaneRows, logits [k, V / world], rows, tokens, hidden [k, D] or None)]: row ``rows[i]`` predicted
+    ``tokens[i]`` (the sampled token; a miner's request has no targets); ``hidden``: the rows' final hidden rows, kept
+    on rank 0's record."""
+    import torch
+
+    if not parts:
+        return
+    logits = torch.cat([p[1] for p in parts]) if len(parts) > 1 else parts[0][1]
+    targets, claims = [], []
+    for lane, _, rows, tokens, _ in parts:
+        spec = lane.spec
+        for r, t in zip(rows, tokens):
+            targets.append(_target(spec, r, t))
+            claims.append(_claim(spec, r))
+    got = reduce(w, logits, targets, claims)
+    at = 0
+    for lane, _, rows, tokens, hidden in parts:
+        k = len(rows)
+        job = lane.spec.job
+        if job is not None:
+            job.put(np.asarray(rows), got[at:at + k], targets[at:at + k])
+            job.draw(np.asarray(rows), list(tokens))
+            if hidden is not None:
+                job.keep_hidden(rows[0], hidden.clone())
+        at += k
+
+
+def finish(lane: LaneRows | None) -> None:
+    """``end`` for a stream of the multi-stream engine (every rank, when it leaves)."""
+    if lane is None:
+        return
+    spec = lane.spec
+    spec.claims_array = None
+    lane.last = None
+    if spec.job is not None:
+        try:
+            spec.job.close_hidden()
+        finally:
+            spec.job.done.set()
+
+
+def pack_spec(spec: Spec | None) -> list[int]:
+    """Rank 0: a stream's spec as ints for its ADMIT (``unpack_spec``): the header, then the targets and claims."""
+    if spec is None:
+        return list(NO_SPEC)
+    out = spec.header()
+    for ids in (spec.targets, spec.claims):
+        if ids is not None:
+            out += [int(t) for t in ids]
+    return out
+
+
+def unpack_spec(p: list[int], i: int) -> tuple[Spec | None, int]:
+    """A follower's spec from an ADMIT at ``i`` (``pack_spec``), and the index after it."""
+    header = [int(v) for v in p[i:i + len(NO_SPEC)]]
+    i += len(NO_SPEC)
+    if header[0] == 0:
+        return None, i
+    targets = claims = None
+    if header[2] >= 0:
+        targets, i = [int(v) for v in p[i:i + header[2]]], i + header[2]
+    if header[3] >= 0:
+        claims, i = [int(v) for v in p[i:i + header[3]]], i + header[3]
+    return Spec.from_header(header, targets, claims), i

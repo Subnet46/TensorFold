@@ -402,12 +402,13 @@ def put_ring_tail(st, snap: Snapshot) -> None:
 
 
 def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
-                  drafter=None) -> Snapshot:
+                  drafter=None, mtp_len: int | None = None) -> Snapshot:
     """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring; so
     are the indexer rings' rows of the pools still filling (``_ring_tail``)."""
     st = e.st
     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
-    mtp_len = st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1
+    if mtp_len is None:                  # else the caller's (mtp_multi streams keep the head's rows without a pending row)
+        mtp_len = st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1
     snap = Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
                     mtp_len, drafter.context_end if drafter is not None else -1,
                     tail=_ring_tail(st, len(ids), max(mtp_len, 0)))

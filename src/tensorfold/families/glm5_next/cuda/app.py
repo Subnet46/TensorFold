@@ -90,6 +90,9 @@ class GlmApp(App):
         model = str(body.get("model") or "")
         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
+        # TENSORFOLD_SN46 --parallel: the job whose measurement the operator armed for this request (``rows.arm``)
+        job = body.get("sn46_job")
+        self.engine.request.sn46_job = job if isinstance(job, str) else None
         result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
         kept = getattr(self.template, "kept", None)
         if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":
